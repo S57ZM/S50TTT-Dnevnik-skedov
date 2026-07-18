@@ -1,0 +1,6 @@
+.env
+.initial-admin-password
+data/
+__pycache__/
+*.pyc
+.docker-config/

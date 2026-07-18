@@ -1,0 +1,588 @@
+import hmac
+import os
+import secrets
+import sqlite3
+from datetime import datetime
+from functools import wraps
+from zoneinfo import ZoneInfo
+
+from flask import (
+    Flask, abort, flash, g, redirect, render_template, request, session, url_for
+)
+from jinja2 import DictLoader
+from werkzeug.middleware.proxy_fix import ProxyFix
+from werkzeug.security import check_password_hash, generate_password_hash
+
+
+APP_NAME = "S50TTT Dnevnik skedov"
+DB_PATH = os.environ.get("DATABASE_PATH", "/app/data/skedi.db")
+TIMEZONE = ZoneInfo(os.environ.get("TZ", "Europe/Ljubljana"))
+
+app = Flask(__name__)
+app.secret_key = os.environ.get("SECRET_KEY") or secrets.token_hex(32)
+app.config.update(
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE="Lax",
+    MAX_CONTENT_LENGTH=1024 * 1024,
+)
+app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
+
+
+def now_local():
+    return datetime.now(TIMEZONE).replace(tzinfo=None)
+
+
+def now_db():
+    return now_local().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def get_db():
+    if "db" not in g:
+        os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+        g.db = sqlite3.connect(DB_PATH)
+        g.db.row_factory = sqlite3.Row
+        g.db.execute("PRAGMA foreign_keys = ON")
+        g.db.execute("PRAGMA journal_mode = WAL")
+    return g.db
+
+
+@app.teardown_appcontext
+def close_db(_error=None):
+    db = g.pop("db", None)
+    if db is not None:
+        db.close()
+
+
+def init_db():
+    db = get_db()
+    db.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT NOT NULL UNIQUE COLLATE NOCASE,
+            full_name TEXT NOT NULL,
+            callsign TEXT NOT NULL COLLATE NOCASE,
+            password_hash TEXT NOT NULL,
+            role TEXT NOT NULL CHECK(role IN ('admin', 'leader')),
+            active INTEGER NOT NULL DEFAULT 1,
+            created_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS nets (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            title TEXT NOT NULL,
+            net_date TEXT NOT NULL,
+            started_at TEXT NOT NULL,
+            ended_at TEXT,
+            status TEXT NOT NULL DEFAULT 'open' CHECK(status IN ('open', 'closed')),
+            leader_id INTEGER NOT NULL REFERENCES users(id),
+            created_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS participants (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            net_id INTEGER NOT NULL REFERENCES nets(id) ON DELETE CASCADE,
+            full_name TEXT NOT NULL,
+            callsign TEXT NOT NULL COLLATE NOCASE,
+            checkin_at TEXT NOT NULL,
+            created_by INTEGER NOT NULL REFERENCES users(id),
+            created_at TEXT NOT NULL,
+            updated_by INTEGER REFERENCES users(id),
+            updated_at TEXT,
+            UNIQUE(net_id, callsign)
+        );
+
+        CREATE TABLE IF NOT EXISTS audit_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER REFERENCES users(id),
+            action TEXT NOT NULL,
+            entity_type TEXT NOT NULL,
+            entity_id INTEGER,
+            details TEXT,
+            created_at TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_nets_date ON nets(net_date DESC);
+        CREATE INDEX IF NOT EXISTS idx_participants_net ON participants(net_id, checkin_at);
+        """
+    )
+    db.commit()
+
+    if db.execute("SELECT COUNT(*) AS n FROM users").fetchone()["n"] == 0:
+        username = os.environ.get("ADMIN_USERNAME", "S57ZM").strip()
+        password = os.environ.get("ADMIN_PASSWORD", "").strip()
+        if not password:
+            raise RuntimeError("ADMIN_PASSWORD mora biti nastavljen ob prvem zagonu.")
+        db.execute(
+            """INSERT INTO users
+               (username, full_name, callsign, password_hash, role, active, created_at)
+               VALUES (?, ?, ?, ?, 'admin', 1, ?)""",
+            (
+                username,
+                os.environ.get("ADMIN_NAME", "Marko Zidar").strip() or "Administrator",
+                os.environ.get("ADMIN_CALLSIGN", "S57ZM").strip().upper() or "S57ZM",
+                generate_password_hash(password),
+                now_db(),
+            ),
+        )
+        db.commit()
+
+
+def audit(action, entity_type, entity_id=None, details=None):
+    db = get_db()
+    db.execute(
+        """INSERT INTO audit_log(user_id, action, entity_type, entity_id, details, created_at)
+           VALUES (?, ?, ?, ?, ?, ?)""",
+        (session.get("user_id"), action, entity_type, entity_id, details, now_db()),
+    )
+    db.commit()
+
+
+@app.before_request
+def load_user_and_csrf():
+    g.user = None
+    if session.get("user_id"):
+        g.user = get_db().execute(
+            "SELECT * FROM users WHERE id = ? AND active = 1", (session["user_id"],)
+        ).fetchone()
+        if g.user is None:
+            session.clear()
+
+    if "csrf_token" not in session:
+        session["csrf_token"] = secrets.token_urlsafe(32)
+
+    if request.method == "POST":
+        submitted = request.form.get("csrf_token", "")
+        expected = session.get("csrf_token", "")
+        if not submitted or not expected or not hmac.compare_digest(submitted, expected):
+            abort(400, "Neveljaven varnostni žeton. Osveži stran in poskusi ponovno.")
+
+
+@app.context_processor
+def template_context():
+    return {"app_name": APP_NAME, "csrf_token": session.get("csrf_token", "")}
+
+
+def login_required(view):
+    @wraps(view)
+    def wrapped(*args, **kwargs):
+        if g.user is None:
+            return redirect(url_for("login", next=request.path))
+        return view(*args, **kwargs)
+    return wrapped
+
+
+def admin_required(view):
+    @wraps(view)
+    def wrapped(*args, **kwargs):
+        if g.user is None:
+            return redirect(url_for("login"))
+        if g.user["role"] != "admin":
+            abort(403)
+        return view(*args, **kwargs)
+    return wrapped
+
+
+def valid_password(password):
+    return len(password) >= 10
+
+
+@app.route("/health")
+def health():
+    return {"status": "ok"}
+
+
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    if g.user:
+        return redirect(url_for("dashboard"))
+    if request.method == "POST":
+        username = request.form.get("username", "").strip()
+        password = request.form.get("password", "")
+        user = get_db().execute(
+            "SELECT * FROM users WHERE username = ? AND active = 1", (username,)
+        ).fetchone()
+        if user and check_password_hash(user["password_hash"], password):
+            session.clear()
+            session["user_id"] = user["id"]
+            session["csrf_token"] = secrets.token_urlsafe(32)
+            return redirect(url_for("dashboard"))
+        flash("Napačno uporabniško ime ali geslo.", "danger")
+    return render_template("login.html")
+
+
+@app.post("/logout")
+@login_required
+def logout():
+    session.clear()
+    return redirect(url_for("login"))
+
+
+@app.route("/")
+@login_required
+def dashboard():
+    db = get_db()
+    open_nets = db.execute(
+        """SELECT n.*, u.full_name AS leader_name, u.callsign AS leader_callsign,
+                  COUNT(p.id) AS participant_count
+           FROM nets n JOIN users u ON u.id=n.leader_id
+           LEFT JOIN participants p ON p.net_id=n.id
+           WHERE n.status='open' GROUP BY n.id ORDER BY n.started_at DESC"""
+    ).fetchall()
+    recent = db.execute(
+        """SELECT n.*, u.full_name AS leader_name, u.callsign AS leader_callsign,
+                  COUNT(p.id) AS participant_count
+           FROM nets n JOIN users u ON u.id=n.leader_id
+           LEFT JOIN participants p ON p.net_id=n.id
+           WHERE n.status='closed' GROUP BY n.id ORDER BY n.started_at DESC LIMIT 15"""
+    ).fetchall()
+    return render_template("dashboard.html", open_nets=open_nets, recent=recent)
+
+
+@app.post("/nets/new")
+@login_required
+def new_net():
+    current = now_local()
+    net_date = request.form.get("net_date", current.strftime("%Y-%m-%d"))
+    started_time = request.form.get("started_time", current.strftime("%H:%M"))
+    try:
+        datetime.strptime(f"{net_date} {started_time}", "%Y-%m-%d %H:%M")
+    except ValueError:
+        flash("Datum ali ura nista veljavna.", "danger")
+        return redirect(url_for("dashboard"))
+    title = request.form.get("title", "").strip()
+    if not title:
+        title = f"Sked {datetime.strptime(net_date, '%Y-%m-%d').strftime('%d. %m. %Y')}"
+    db = get_db()
+    cur = db.execute(
+        """INSERT INTO nets(title, net_date, started_at, status, leader_id, created_at)
+           VALUES (?, ?, ?, 'open', ?, ?)""",
+        (title[:120], net_date, f"{net_date} {started_time}:00", g.user["id"], now_db()),
+    )
+    db.commit()
+    audit("create", "net", cur.lastrowid, title)
+    flash("Novi sked je odprt.", "success")
+    return redirect(url_for("net_detail", net_id=cur.lastrowid))
+
+
+def fetch_net(net_id):
+    row = get_db().execute(
+        """SELECT n.*, u.full_name AS leader_name, u.callsign AS leader_callsign
+           FROM nets n JOIN users u ON u.id=n.leader_id WHERE n.id=?""",
+        (net_id,),
+    ).fetchone()
+    if row is None:
+        abort(404)
+    return row
+
+
+@app.route("/nets/<int:net_id>")
+@login_required
+def net_detail(net_id):
+    net = fetch_net(net_id)
+    participants = get_db().execute(
+        """SELECT p.*, u.full_name AS entered_by_name
+           FROM participants p JOIN users u ON u.id=p.created_by
+           WHERE p.net_id=? ORDER BY p.checkin_at, p.id""",
+        (net_id,),
+    ).fetchall()
+    return render_template("net.html", net=net, participants=participants, now=now_local())
+
+
+@app.post("/nets/<int:net_id>/participants")
+@login_required
+def add_participant(net_id):
+    net = fetch_net(net_id)
+    if net["status"] != "open":
+        abort(409, "Zaključenega skeda ni mogoče spreminjati.")
+    full_name = request.form.get("full_name", "").strip()
+    callsign = request.form.get("callsign", "").strip().upper().replace(" ", "")
+    checkin_time = request.form.get("checkin_time", now_local().strftime("%H:%M"))
+    if not full_name or not callsign:
+        flash("Vpiši ime in klicni znak.", "danger")
+        return redirect(url_for("net_detail", net_id=net_id))
+    try:
+        datetime.strptime(checkin_time, "%H:%M")
+    except ValueError:
+        flash("Ura prijave ni veljavna.", "danger")
+        return redirect(url_for("net_detail", net_id=net_id))
+    db = get_db()
+    try:
+        cur = db.execute(
+            """INSERT INTO participants
+               (net_id, full_name, callsign, checkin_at, created_by, created_at)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (net_id, full_name[:120], callsign[:24], f"{net['net_date']} {checkin_time}:00", g.user["id"], now_db()),
+        )
+        db.commit()
+    except sqlite3.IntegrityError:
+        flash(f"Klicni znak {callsign} je v tem skedu že vpisan.", "warning")
+        return redirect(url_for("net_detail", net_id=net_id))
+    audit("create", "participant", cur.lastrowid, f"{callsign} – {full_name}")
+    flash(f"Dodan: {callsign} – {full_name}", "success")
+    return redirect(url_for("net_detail", net_id=net_id))
+
+
+def fetch_participant(participant_id):
+    row = get_db().execute("SELECT * FROM participants WHERE id=?", (participant_id,)).fetchone()
+    if row is None:
+        abort(404)
+    return row
+
+
+@app.route("/participants/<int:participant_id>/edit", methods=["GET", "POST"])
+@login_required
+def edit_participant(participant_id):
+    participant = fetch_participant(participant_id)
+    net = fetch_net(participant["net_id"])
+    if net["status"] != "open" and g.user["role"] != "admin":
+        abort(403)
+    if request.method == "POST":
+        full_name = request.form.get("full_name", "").strip()
+        callsign = request.form.get("callsign", "").strip().upper().replace(" ", "")
+        checkin_time = request.form.get("checkin_time", "")
+        if not full_name or not callsign:
+            flash("Vpiši ime in klicni znak.", "danger")
+            return redirect(request.url)
+        try:
+            datetime.strptime(checkin_time, "%H:%M")
+            db = get_db()
+            db.execute(
+                """UPDATE participants SET full_name=?, callsign=?, checkin_at=?,
+                   updated_by=?, updated_at=? WHERE id=?""",
+                (full_name[:120], callsign[:24], f"{net['net_date']} {checkin_time}:00", g.user["id"], now_db(), participant_id),
+            )
+            db.commit()
+        except ValueError:
+            flash("Ura prijave ni veljavna.", "danger")
+            return redirect(request.url)
+        except sqlite3.IntegrityError:
+            flash(f"Klicni znak {callsign} je v tem skedu že vpisan.", "warning")
+            return redirect(request.url)
+        audit("update", "participant", participant_id, f"{callsign} – {full_name}")
+        flash("Vnos je popravljen.", "success")
+        return redirect(url_for("net_detail", net_id=net["id"]))
+    return render_template("participant_edit.html", participant=participant, net=net)
+
+
+@app.post("/participants/<int:participant_id>/delete")
+@login_required
+def delete_participant(participant_id):
+    participant = fetch_participant(participant_id)
+    net = fetch_net(participant["net_id"])
+    if net["status"] != "open" and g.user["role"] != "admin":
+        abort(403)
+    get_db().execute("DELETE FROM participants WHERE id=?", (participant_id,))
+    get_db().commit()
+    audit("delete", "participant", participant_id, f"{participant['callsign']} – {participant['full_name']}")
+    flash("Vnos je izbrisan.", "success")
+    return redirect(url_for("net_detail", net_id=net["id"]))
+
+
+@app.post("/nets/<int:net_id>/close")
+@login_required
+def close_net(net_id):
+    net = fetch_net(net_id)
+    if net["status"] == "open":
+        get_db().execute(
+            "UPDATE nets SET status='closed', ended_at=? WHERE id=?", (now_db(), net_id)
+        )
+        get_db().commit()
+        audit("close", "net", net_id, net["title"])
+        flash("Sked je zaključen in shranjen v arhiv.", "success")
+    return redirect(url_for("net_detail", net_id=net_id))
+
+
+@app.post("/nets/<int:net_id>/reopen")
+@admin_required
+def reopen_net(net_id):
+    net = fetch_net(net_id)
+    get_db().execute("UPDATE nets SET status='open', ended_at=NULL WHERE id=?", (net_id,))
+    get_db().commit()
+    audit("reopen", "net", net_id, net["title"])
+    flash("Sked je ponovno odprt.", "warning")
+    return redirect(url_for("net_detail", net_id=net_id))
+
+
+@app.route("/archive")
+@login_required
+def archive():
+    rows = get_db().execute(
+        """SELECT n.*, u.full_name AS leader_name, u.callsign AS leader_callsign,
+                  COUNT(p.id) AS participant_count
+           FROM nets n JOIN users u ON u.id=n.leader_id
+           LEFT JOIN participants p ON p.net_id=n.id
+           GROUP BY n.id ORDER BY n.started_at DESC"""
+    ).fetchall()
+    return render_template("archive.html", nets=rows)
+
+
+@app.route("/users")
+@admin_required
+def users():
+    rows = get_db().execute("SELECT * FROM users ORDER BY active DESC, full_name").fetchall()
+    return render_template("users.html", users=rows)
+
+
+@app.route("/users/new", methods=["GET", "POST"])
+@admin_required
+def new_user():
+    if request.method == "POST":
+        username = request.form.get("username", "").strip()
+        full_name = request.form.get("full_name", "").strip()
+        callsign = request.form.get("callsign", "").strip().upper().replace(" ", "")
+        password = request.form.get("password", "")
+        role = request.form.get("role", "leader")
+        if not username or not full_name or not callsign or role not in {"admin", "leader"}:
+            flash("Izpolni vsa zahtevana polja.", "danger")
+        elif not valid_password(password):
+            flash("Geslo mora imeti najmanj 10 znakov.", "danger")
+        else:
+            try:
+                cur = get_db().execute(
+                    """INSERT INTO users(username, full_name, callsign, password_hash, role, active, created_at)
+                       VALUES (?, ?, ?, ?, ?, 1, ?)""",
+                    (username, full_name[:120], callsign[:24], generate_password_hash(password), role, now_db()),
+                )
+                get_db().commit()
+                audit("create", "user", cur.lastrowid, username)
+                flash("Uporabnik je ustvarjen.", "success")
+                return redirect(url_for("users"))
+            except sqlite3.IntegrityError:
+                flash("To uporabniško ime že obstaja.", "danger")
+    return render_template("user_form.html", edit_user=None)
+
+
+@app.route("/users/<int:user_id>/edit", methods=["GET", "POST"])
+@admin_required
+def edit_user(user_id):
+    edit_user_row = get_db().execute("SELECT * FROM users WHERE id=?", (user_id,)).fetchone()
+    if edit_user_row is None:
+        abort(404)
+    if request.method == "POST":
+        full_name = request.form.get("full_name", "").strip()
+        callsign = request.form.get("callsign", "").strip().upper().replace(" ", "")
+        role = request.form.get("role", "leader")
+        active = 1 if request.form.get("active") == "1" else 0
+        password = request.form.get("password", "")
+        if user_id == g.user["id"] and not active:
+            flash("Svojega računa ne moreš onemogočiti.", "danger")
+        elif not full_name or not callsign or role not in {"admin", "leader"}:
+            flash("Izpolni vsa zahtevana polja.", "danger")
+        elif password and not valid_password(password):
+            flash("Novo geslo mora imeti najmanj 10 znakov.", "danger")
+        else:
+            if password:
+                get_db().execute(
+                    """UPDATE users SET full_name=?, callsign=?, role=?, active=?, password_hash=?
+                       WHERE id=?""",
+                    (full_name[:120], callsign[:24], role, active, generate_password_hash(password), user_id),
+                )
+            else:
+                get_db().execute(
+                    "UPDATE users SET full_name=?, callsign=?, role=?, active=? WHERE id=?",
+                    (full_name[:120], callsign[:24], role, active, user_id),
+                )
+            get_db().commit()
+            audit("update", "user", user_id, edit_user_row["username"])
+            flash("Uporabnik je posodobljen.", "success")
+            return redirect(url_for("users"))
+    return render_template("user_form.html", edit_user=edit_user_row)
+
+
+@app.route("/change-password", methods=["GET", "POST"])
+@login_required
+def change_password():
+    if request.method == "POST":
+        current = request.form.get("current_password", "")
+        new = request.form.get("new_password", "")
+        confirm = request.form.get("confirm_password", "")
+        if not check_password_hash(g.user["password_hash"], current):
+            flash("Trenutno geslo ni pravilno.", "danger")
+        elif not valid_password(new):
+            flash("Novo geslo mora imeti najmanj 10 znakov.", "danger")
+        elif new != confirm:
+            flash("Novi gesli se ne ujemata.", "danger")
+        else:
+            get_db().execute(
+                "UPDATE users SET password_hash=? WHERE id=?",
+                (generate_password_hash(new), g.user["id"]),
+            )
+            get_db().commit()
+            audit("password_change", "user", g.user["id"], g.user["username"])
+            flash("Geslo je spremenjeno.", "success")
+            return redirect(url_for("dashboard"))
+    return render_template("change_password.html")
+
+
+@app.template_filter("date_si")
+def date_si(value):
+    if not value:
+        return ""
+    return datetime.strptime(value[:10], "%Y-%m-%d").strftime("%d. %m. %Y")
+
+
+@app.template_filter("time_si")
+def time_si(value):
+    return value[11:16] if value and len(value) >= 16 else ""
+
+
+@app.template_filter("datetime_si")
+def datetime_si(value):
+    if not value:
+        return ""
+    return datetime.strptime(value[:19], "%Y-%m-%d %H:%M:%S").strftime("%d. %m. %Y ob %H:%M")
+
+
+TEMPLATES = {
+"base.html": r'''<!doctype html>
+<html lang="sl"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{% block title %}{{ app_name }}{% endblock %}</title>
+<style>
+:root{--blue:#145da0;--blue2:#0d477d;--light:#eef5fb;--line:#d7e0e8;--danger:#b42318;--success:#117a43;--text:#17202a}
+*{box-sizing:border-box}body{margin:0;font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;color:var(--text);background:#f5f7f9}
+header{background:linear-gradient(135deg,var(--blue2),var(--blue));color:white;box-shadow:0 2px 8px #0003}.nav{max-width:1100px;margin:auto;padding:14px 18px;display:flex;align-items:center;gap:18px;flex-wrap:wrap}.brand{font-weight:800;font-size:1.12rem;margin-right:auto}.nav a,.link-button{color:white;text-decoration:none;font-weight:650;background:none;border:0;padding:0;cursor:pointer;font:inherit}.user{font-size:.9rem;opacity:.9}
+main{max-width:1100px;margin:24px auto;padding:0 16px}.card{background:white;border:1px solid var(--line);border-radius:14px;padding:20px;margin-bottom:18px;box-shadow:0 2px 10px #1020300c}.card h1,.card h2{margin-top:0}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:16px}.actions{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+label{display:block;font-weight:700;margin:0 0 6px}.field{margin-bottom:14px}input,select{width:100%;padding:11px 12px;border:1px solid #aebdca;border-radius:9px;background:white;font:inherit}input:focus,select:focus{outline:3px solid #bddcff;border-color:var(--blue)}
+.btn{display:inline-block;border:0;border-radius:9px;padding:10px 15px;font-weight:750;cursor:pointer;text-decoration:none;font:inherit}.btn-primary{background:var(--blue);color:white}.btn-primary:hover{background:var(--blue2)}.btn-secondary{background:#e6edf3;color:#1d2b36}.btn-danger{background:#fee4e2;color:var(--danger)}.btn-success{background:#daf5e6;color:#075f34}.btn-small{padding:7px 10px;font-size:.9rem}
+table{width:100%;border-collapse:collapse}th,td{text-align:left;padding:11px 9px;border-bottom:1px solid var(--line)}th{background:var(--light);font-size:.88rem}tr:last-child td{border-bottom:0}.table-wrap{overflow-x:auto}.badge{display:inline-block;padding:4px 9px;border-radius:999px;font-size:.8rem;font-weight:750}.open{background:#d8f3e5;color:#075f34}.closed{background:#e7ebef;color:#45525d}.admin{background:#e5ddff;color:#4f2c90}.leader{background:#ddebfa;color:#164f7c}
+.flash{padding:12px 14px;border-radius:9px;margin-bottom:14px;background:#e7edf2}.flash.success{background:#dff5e9;color:#075f34}.flash.danger{background:#fee4e2;color:#8f1d14}.flash.warning{background:#fff1c7;color:#704b00}.muted{color:#65717c}.big-number{font-size:2rem;font-weight:850}.login{max-width:430px;margin:8vh auto}.inline{display:inline}.right{margin-left:auto}.empty{text-align:center;padding:30px;color:#65717c}.nowrap{white-space:nowrap}
+@media(max-width:700px){main{margin-top:14px}.card{padding:15px}.nav{gap:12px}.user{width:100%;order:3}th,td{padding:9px 6px}.hide-mobile{display:none}.btn{width:100%;text-align:center}.actions form{width:100%}.actions .btn-small{width:auto}.brand{width:100%}}
+@media print{header,.no-print,.flash{display:none!important}body{background:white}main{max-width:none;margin:0;padding:0}.card{border:0;box-shadow:none;padding:0}table{font-size:11pt}a{color:black;text-decoration:none}}
+</style></head><body>
+{% if g.user %}<header><nav class="nav"><span class="brand">📻 S50TTT Skedi</span><a href="{{ url_for('dashboard') }}">Domov</a><a href="{{ url_for('archive') }}">Arhiv</a>{% if g.user['role']=='admin' %}<a href="{{ url_for('users') }}">Uporabniki</a>{% endif %}<span class="user">{{ g.user['full_name'] }} · {{ g.user['callsign'] }}</span><a href="{{ url_for('change_password') }}">Geslo</a><form class="inline" method="post" action="{{ url_for('logout') }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="link-button">Odjava</button></form></nav></header>{% endif %}
+<main>{% with msgs=get_flashed_messages(with_categories=true) %}{% for category,msg in msgs %}<div class="flash {{ category }}">{{ msg }}</div>{% endfor %}{% endwith %}{% block content %}{% endblock %}</main>
+</body></html>''',
+"login.html": r'''{% extends "base.html" %}{% block title %}Prijava · {{ app_name }}{% endblock %}{% block content %}<div class="card login"><h1>📻 S50TTT</h1><h2>Dnevnik skedov</h2><p class="muted">Prijava za vodje skeda</p><form method="post"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><div class="field"><label>Uporabniško ime</label><input name="username" autocomplete="username" required autofocus></div><div class="field"><label>Geslo</label><input type="password" name="password" autocomplete="current-password" required></div><button class="btn btn-primary" type="submit">Prijava</button></form></div>{% endblock %}''',
+"dashboard.html": r'''{% extends "base.html" %}{% block content %}
+<div class="card"><h1>Dnevnik skedov</h1><p class="muted">Odpri nov dnevnik za današnji sked.</p><form method="post" action="{{ url_for('new_net') }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><div class="grid"><div class="field"><label>Naslov (neobvezno)</label><input name="title" placeholder="Samodejno: Sked DD. MM. LLLL"></div><div class="field"><label>Datum</label><input type="date" name="net_date" value="{{ now_local_value if now_local_value else '' }}" required></div><div class="field"><label>Začetna ura</label><input type="time" name="started_time" value="{{ current_time if current_time else '' }}" required></div></div><button class="btn btn-primary">＋ Novi sked</button></form></div>
+{% if open_nets %}<h2>Odprti skedi</h2><div class="grid">{% for n in open_nets %}<div class="card"><span class="badge open">Odprt</span><h2>{{ n['title'] }}</h2><p><b>{{ n['net_date']|date_si }}</b> ob {{ n['started_at']|time_si }}<br>Vodja: {{ n['leader_name'] }} ({{ n['leader_callsign'] }})</p><p><span class="big-number">{{ n['participant_count'] }}</span> prijavljenih</p><a class="btn btn-primary" href="{{ url_for('net_detail',net_id=n['id']) }}">Odpri dnevnik</a></div>{% endfor %}</div>{% endif %}
+<div class="card"><div class="actions"><h2>Zadnji zaključeni skedi</h2><a class="btn btn-secondary right" href="{{ url_for('archive') }}">Celoten arhiv</a></div>{% if recent %}<div class="table-wrap"><table><thead><tr><th>Sked</th><th>Vodja</th><th>Prijavljeni</th><th></th></tr></thead><tbody>{% for n in recent %}<tr><td><b>{{ n['title'] }}</b><br><span class="muted">{{ n['net_date']|date_si }} ob {{ n['started_at']|time_si }}</span></td><td>{{ n['leader_callsign'] }}</td><td>{{ n['participant_count'] }}</td><td><a class="btn btn-secondary btn-small" href="{{ url_for('net_detail',net_id=n['id']) }}">Pregled</a></td></tr>{% endfor %}</tbody></table></div>{% else %}<p class="empty">V arhivu še ni skedov.</p>{% endif %}</div>
+{% endblock %}''',
+"net.html": r'''{% extends "base.html" %}{% block title %}{{ net['title'] }} · {{ app_name }}{% endblock %}{% block content %}
+<div class="card"><div class="actions"><div><span class="badge {{ net['status'] }}">{{ 'Odprt' if net['status']=='open' else 'Zaključen' }}</span><h1>{{ net['title'] }}</h1><p>{{ net['net_date']|date_si }} · začetek {{ net['started_at']|time_si }}{% if net['ended_at'] %} · konec {{ net['ended_at']|time_si }}{% endif %}<br>Vodja: <b>{{ net['leader_name'] }} ({{ net['leader_callsign'] }})</b></p></div><div class="actions right no-print"><button class="btn btn-secondary" onclick="window.print()">🖨 Natisni / PDF</button>{% if net['status']=='open' %}<form method="post" action="{{ url_for('close_net',net_id=net['id']) }}" onsubmit="return confirm('Zaključim ta sked?')"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="btn btn-success">✓ Zaključi sked</button></form>{% elif g.user['role']=='admin' %}<form method="post" action="{{ url_for('reopen_net',net_id=net['id']) }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="btn btn-secondary">Ponovno odpri</button></form>{% endif %}</div></div></div>
+{% if net['status']=='open' %}<div class="card no-print"><h2>Dodaj prijavljenega</h2><form method="post" action="{{ url_for('add_participant',net_id=net['id']) }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><div class="grid"><div class="field"><label>Ime in priimek</label><input name="full_name" required autofocus autocomplete="off"></div><div class="field"><label>Klicni znak</label><input name="callsign" required autocomplete="off" style="text-transform:uppercase"></div><div class="field"><label>Ura prijave</label><input type="time" name="checkin_time" value="{{ now.strftime('%H:%M') }}" required></div></div><button class="btn btn-primary">＋ Dodaj v dnevnik</button></form></div>{% endif %}
+<div class="card"><h2>Prijavljeni: {{ participants|length }}</h2>{% if participants %}<div class="table-wrap"><table><thead><tr><th>Št.</th><th>Ura</th><th>Klicni znak</th><th>Ime in priimek</th><th class="no-print">Vnesel</th><th class="no-print"></th></tr></thead><tbody>{% for p in participants %}<tr><td>{{ loop.index }}</td><td class="nowrap">{{ p['checkin_at']|time_si }}</td><td><b>{{ p['callsign'] }}</b></td><td>{{ p['full_name'] }}</td><td class="no-print">{{ p['entered_by_name'] }}</td><td class="no-print"><div class="actions"><a class="btn btn-secondary btn-small" href="{{ url_for('edit_participant',participant_id=p['id']) }}">Uredi</a><form method="post" action="{{ url_for('delete_participant',participant_id=p['id']) }}" onsubmit="return confirm('Izbrišem {{ p['callsign'] }}?')"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="btn btn-danger btn-small">Izbriši</button></form></div></td></tr>{% endfor %}</tbody></table></div>{% else %}<p class="empty">V tem skedu še ni prijavljenih.</p>{% endif %}</div>
+{% endblock %}''',
+"participant_edit.html": r'''{% extends "base.html" %}{% block content %}<div class="card"><h1>Uredi prijavo</h1><p>{{ net['title'] }}</p><form method="post"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><div class="field"><label>Ime in priimek</label><input name="full_name" value="{{ participant['full_name'] }}" required></div><div class="field"><label>Klicni znak</label><input name="callsign" value="{{ participant['callsign'] }}" required style="text-transform:uppercase"></div><div class="field"><label>Ura prijave</label><input type="time" name="checkin_time" value="{{ participant['checkin_at']|time_si }}" required></div><div class="actions"><button class="btn btn-primary">Shrani</button><a class="btn btn-secondary" href="{{ url_for('net_detail',net_id=net['id']) }}">Prekliči</a></div></form></div>{% endblock %}''',
+"archive.html": r'''{% extends "base.html" %}{% block content %}<div class="card"><h1>Arhiv skedov</h1>{% if nets %}<div class="table-wrap"><table><thead><tr><th>Datum</th><th>Sked</th><th>Status</th><th>Vodja</th><th>Prijavljeni</th><th></th></tr></thead><tbody>{% for n in nets %}<tr><td class="nowrap">{{ n['net_date']|date_si }}</td><td><b>{{ n['title'] }}</b><br><span class="muted">{{ n['started_at']|time_si }}{% if n['ended_at'] %}–{{ n['ended_at']|time_si }}{% endif %}</span></td><td><span class="badge {{ n['status'] }}">{{ 'Odprt' if n['status']=='open' else 'Zaključen' }}</span></td><td>{{ n['leader_name'] }} ({{ n['leader_callsign'] }})</td><td>{{ n['participant_count'] }}</td><td><a class="btn btn-secondary btn-small" href="{{ url_for('net_detail',net_id=n['id']) }}">Pregled</a></td></tr>{% endfor %}</tbody></table></div>{% else %}<p class="empty">Arhiv je prazen.</p>{% endif %}</div>{% endblock %}''',
+"users.html": r'''{% extends "base.html" %}{% block content %}<div class="card"><div class="actions"><h1>Uporabniki</h1><a class="btn btn-primary right" href="{{ url_for('new_user') }}">＋ Novi uporabnik</a></div><div class="table-wrap"><table><thead><tr><th>Uporabnik</th><th>Ime</th><th>Klicni znak</th><th>Vloga</th><th>Status</th><th></th></tr></thead><tbody>{% for u in users %}<tr><td><b>{{ u['username'] }}</b></td><td>{{ u['full_name'] }}</td><td>{{ u['callsign'] }}</td><td><span class="badge {{ u['role'] }}">{{ 'Administrator' if u['role']=='admin' else 'Vodja skeda' }}</span></td><td>{{ 'Aktiven' if u['active'] else 'Onemogočen' }}</td><td><a class="btn btn-secondary btn-small" href="{{ url_for('edit_user',user_id=u['id']) }}">Uredi</a></td></tr>{% endfor %}</tbody></table></div></div>{% endblock %}''',
+"user_form.html": r'''{% extends "base.html" %}{% block content %}<div class="card"><h1>{{ 'Uredi uporabnika' if edit_user else 'Novi uporabnik' }}</h1><form method="post"><input type="hidden" name="csrf_token" value="{{ csrf_token }}">{% if not edit_user %}<div class="field"><label>Uporabniško ime</label><input name="username" required autocomplete="off"></div>{% else %}<p>Uporabniško ime: <b>{{ edit_user['username'] }}</b></p>{% endif %}<div class="grid"><div class="field"><label>Ime in priimek</label><input name="full_name" value="{{ edit_user['full_name'] if edit_user else '' }}" required></div><div class="field"><label>Klicni znak</label><input name="callsign" value="{{ edit_user['callsign'] if edit_user else '' }}" required style="text-transform:uppercase"></div><div class="field"><label>Vloga</label><select name="role"><option value="leader" {% if edit_user and edit_user['role']=='leader' %}selected{% endif %}>Vodja skeda</option><option value="admin" {% if edit_user and edit_user['role']=='admin' %}selected{% endif %}>Administrator</option></select></div></div><div class="field"><label>{{ 'Novo geslo (pusti prazno, če ga ne spreminjaš)' if edit_user else 'Začasno geslo (najmanj 10 znakov)' }}</label><input type="password" name="password" {% if not edit_user %}required{% endif %} autocomplete="new-password"></div>{% if edit_user %}<div class="field"><label><input style="width:auto" type="checkbox" name="active" value="1" {% if edit_user['active'] %}checked{% endif %}> Aktiven uporabnik</label></div>{% endif %}<div class="actions"><button class="btn btn-primary">Shrani</button><a class="btn btn-secondary" href="{{ url_for('users') }}">Prekliči</a></div></form></div>{% endblock %}''',
+"change_password.html": r'''{% extends "base.html" %}{% block content %}<div class="card" style="max-width:520px"><h1>Spremeni geslo</h1><form method="post"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><div class="field"><label>Trenutno geslo</label><input type="password" name="current_password" required></div><div class="field"><label>Novo geslo (najmanj 10 znakov)</label><input type="password" name="new_password" required></div><div class="field"><label>Ponovi novo geslo</label><input type="password" name="confirm_password" required></div><button class="btn btn-primary">Spremeni geslo</button></form></div>{% endblock %}'''
+}
+
+app.jinja_loader = DictLoader(TEMPLATES)
+
+
+@app.context_processor
+def current_defaults():
+    current = now_local()
+    return {"now_local_value": current.strftime("%Y-%m-%d"), "current_time": current.strftime("%H:%M")}
+
+
+with app.app_context():
+    init_db()
+
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=8000)
