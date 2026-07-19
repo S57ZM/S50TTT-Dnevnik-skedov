@@ -2,6 +2,8 @@
 
 Ločen spletni portal Radiokluba Sevnica S50TTT za vodenje skedov.
 
+Trenutna različica: **1.2.0**
+
 ## Funkcije
 
 - več uporabnikov z vlogama administrator in vodja skeda;

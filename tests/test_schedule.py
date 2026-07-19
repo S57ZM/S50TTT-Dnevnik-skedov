@@ -10,8 +10,10 @@ os.environ["ADMIN_PASSWORD"] = "test-password-123"
 os.environ["SECRET_KEY"] = "test-secret-key"
 
 from app import (  # noqa: E402
+    APP_VERSION,
     SCHEDULE_MONTHLY,
     SCHEDULE_SATURDAY,
+    app as flask_app,
     next_countdown_net,
     next_scheduled_nets,
     saturday_net_number,
@@ -21,6 +23,12 @@ from app import (  # noqa: E402
 
 
 class ScheduleTests(unittest.TestCase):
+    def test_health_reports_application_version(self):
+        response = flask_app.test_client().get("/health")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()["version"], APP_VERSION)
+
     def test_next_summer_saturday_and_monthly_net(self):
         scheduled = next_scheduled_nets(datetime(2026, 7, 19, 12, 0))
         by_type = {item["schedule_type"]: item for item in scheduled}
