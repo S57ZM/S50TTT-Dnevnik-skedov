@@ -2,6 +2,7 @@ import os
 import tempfile
 import unittest
 from datetime import date, datetime, timedelta
+from unittest.mock import patch
 
 
 TEST_DATA = tempfile.TemporaryDirectory()
@@ -19,6 +20,7 @@ from app import (  # noqa: E402
     next_scheduled_nets,
     next_saturday_net,
     now_db,
+    regular_net_open_date,
     saturday_net_number,
     saturday_start_time,
     scheduled_net_for_date,
@@ -197,6 +199,80 @@ class ScheduleTests(unittest.TestCase):
         self.assertIsNotNone(valid)
         self.assertEqual(valid["time"], "19:00")
         self.assertIsNone(invalid)
+
+    def test_regular_net_unlocks_on_friday_or_after_five_presses(self):
+        reference = datetime(2026, 7, 19, 12, 0)
+        saturday = scheduled_net_for_date(SCHEDULE_SATURDAY, date(2026, 7, 25))
+        monthly = scheduled_net_for_date(SCHEDULE_MONTHLY, date(2026, 8, 6))
+
+        self.assertEqual(regular_net_open_date(saturday["date"]), date(2026, 7, 24))
+        self.assertEqual(regular_net_open_date(monthly["date"]), date(2026, 7, 31))
+
+        with flask_app.app_context():
+            db = get_db()
+            db.execute(
+                """DELETE FROM nets WHERE schedule_type IS NOT NULL
+                   AND net_date IN ('2026-07-25', '2026-08-06')"""
+            )
+            admin_id = db.execute(
+                "SELECT id FROM users WHERE role='admin' ORDER BY id LIMIT 1"
+            ).fetchone()["id"]
+            db.commit()
+
+        client = self.authenticated_client(admin_id)
+        with patch("app.now_local", return_value=reference):
+            dashboard_response = client.get("/")
+            dashboard_html = dashboard_response.get_data(as_text=True)
+
+            self.assertEqual(
+                dashboard_html.count("data-early-open aria-disabled=\"true\""), 2
+            )
+            self.assertIn("Na voljo od petka, 24. 07. 2026", dashboard_html)
+            self.assertIn("Na voljo od petka, 31. 07. 2026", dashboard_html)
+            self.assertIn("Ti si pravi Heker", dashboard_html)
+
+            locked_response = client.post(
+                "/nets/new",
+                data={
+                    "csrf_token": "test-csrf-token",
+                    "schedule_type": monthly["schedule_type"],
+                    "net_date": monthly["date"],
+                    "started_time": monthly["time"],
+                },
+            )
+            self.assertEqual(locked_response.status_code, 302)
+
+            with flask_app.app_context():
+                self.assertIsNone(
+                    get_db().execute(
+                        "SELECT id FROM nets WHERE schedule_type=? AND net_date=?",
+                        (SCHEDULE_MONTHLY, monthly["date"]),
+                    ).fetchone()
+                )
+
+            unlocked_response = client.post(
+                "/nets/new",
+                data={
+                    "csrf_token": "test-csrf-token",
+                    "schedule_type": monthly["schedule_type"],
+                    "net_date": monthly["date"],
+                    "started_time": monthly["time"],
+                    "early_unlock": "1",
+                },
+            )
+            self.assertEqual(unlocked_response.status_code, 302)
+
+        with flask_app.app_context():
+            created = get_db().execute(
+                "SELECT id FROM nets WHERE schedule_type=? AND net_date=?",
+                (SCHEDULE_MONTHLY, monthly["date"]),
+            ).fetchone()
+            audit_row = get_db().execute(
+                """SELECT details FROM audit_log
+                   WHERE action='create' AND entity_type='net' AND entity_id=?""",
+                (created["id"],),
+            ).fetchone()
+            self.assertIn("predčasno odprtje", audit_row["details"])
 
     def test_saturday_net_uses_s55usx(self):
         scheduled = scheduled_net_for_date(SCHEDULE_SATURDAY, date(2026, 7, 25))

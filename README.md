@@ -2,12 +2,14 @@
 
 Ločen spletni portal Radiokluba Sevnica S50TTT za vodenje skedov.
 
-Trenutna različica: **1.7.0**
+Trenutna različica: **1.8.1**
 
 ## Funkcije
 
 - več uporabnikov z vlogama administrator in vodja skeda;
 - samodejni izračun naslednjega mesečnega in sobotnega rednega skeda;
+- zaklenjeno odpiranje rednega dnevnika do petka pred skedom, s predčasnim
+  odklepom po petih hitrih pritiskih;
 - živ odštevalnik, številka sobotnega skeda in skupno število prijavljenih na
   prijavni strani;
 - zaporedna številka in število prijavljenih za zadnja dva zaključena sobotna
@@ -52,6 +54,12 @@ termina:
 Upravna postaja rednega skeda je `S50TTT`, operater pa prijavljeni član kluba, ki
 odpre dnevnik. Portal prepreči, da bi bil za isti redni termin odprt podvojen
 dnevnik. Drug ali izredni sked je še vedno mogoče odpreti ročno.
+
+Gumb za odpiranje rednega dnevnika je do petka pred terminom siv. Sobotni sked
+se običajno odklene dan prej, mesečni četrtkov sked pa v petek prejšnjega tedna.
+Če je treba dnevnik izjemoma pripraviti prej, ga pet hitrih zaporednih pritiskov
+na sivi gumb predčasno odpre. Ob petem pritisku se prikaže sporočilo »Ti si
+pravi Heker«, dogodek pa se zabeleži v revizijsko sled.
 
 Sobotni skedi se številčijo neprekinjeno od prve sobote leta 2019: sked 5.
 januarja 2019 je št. 1. Po tem pravilu je sobotni sked 25. julija 2026 št. 395.
