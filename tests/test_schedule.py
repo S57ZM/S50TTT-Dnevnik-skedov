@@ -88,9 +88,99 @@ class ScheduleTests(unittest.TestCase):
         self.assertEqual(response.get_json()["version"], APP_VERSION)
         self.assertEqual(response.get_json()["channel"], "stable")
 
+    def test_new_participant_is_learned_and_suggested_from_directory(self):
+        net_id, admin_id = self.create_open_net("Test imenika klicnih znakov")
+        client = self.authenticated_client(admin_id)
+
+        response = client.post(
+            f"/nets/{net_id}/participants",
+            data={
+                "csrf_token": "test-csrf-token",
+                "callsign": "S56DIR",
+                "full_name": "Janez Imenik",
+                "checkin_time": "20:10",
+            },
+        )
+
+        self.assertEqual(response.status_code, 302)
+        with flask_app.app_context():
+            entry = get_db().execute(
+                "SELECT * FROM callsign_directory WHERE callsign='S56DIR'"
+            ).fetchone()
+            self.assertEqual(entry["full_name"], "Janez Imenik")
+            self.assertEqual(entry["use_count"], 1)
+
+        detail_response = client.get(f"/nets/{net_id}")
+        detail_html = detail_response.get_data(as_text=True)
+        self.assertIn('value="S56DIR"', detail_html)
+        self.assertIn('data-full-name="Janez Imenik"', detail_html)
+        self.assertIn("Imenik", detail_html)
+
+        second_net_id, _ = self.create_open_net("Drugi test imenika")
+        client.post(
+            f"/nets/{second_net_id}/participants",
+            data={
+                "csrf_token": "test-csrf-token",
+                "callsign": "S56DIR",
+                "full_name": "Drugače vpisano ime",
+                "checkin_time": "20:20",
+            },
+        )
+        with flask_app.app_context():
+            entry = get_db().execute(
+                "SELECT * FROM callsign_directory WHERE callsign='S56DIR'"
+            ).fetchone()
+            self.assertEqual(entry["full_name"], "Janez Imenik")
+            self.assertEqual(entry["use_count"], 2)
+
+    def test_admin_can_create_edit_and_hide_directory_entry(self):
+        with flask_app.app_context():
+            admin_id = get_db().execute(
+                "SELECT id FROM users WHERE role='admin' ORDER BY id LIMIT 1"
+            ).fetchone()["id"]
+        client = self.authenticated_client(admin_id)
+
+        create_response = client.post(
+            "/callsigns/new",
+            data={
+                "csrf_token": "test-csrf-token",
+                "callsign": "S50BOOK",
+                "full_name": "Ročni Vnos",
+            },
+        )
+        self.assertEqual(create_response.status_code, 302)
+
+        with flask_app.app_context():
+            entry = get_db().execute(
+                "SELECT * FROM callsign_directory WHERE callsign='S50BOOK'"
+            ).fetchone()
+            entry_id = entry["id"]
+
+        edit_response = client.post(
+            f"/callsigns/{entry_id}/edit",
+            data={
+                "csrf_token": "test-csrf-token",
+                "callsign": "S50BOOK",
+                "full_name": "Popravljen Ročni Vnos",
+            },
+        )
+        self.assertEqual(edit_response.status_code, 302)
+
+        directory_response = client.get("/callsigns?q=S50BOOK")
+        directory_html = directory_response.get_data(as_text=True)
+        self.assertIn("Popravljen Ročni Vnos", directory_html)
+        self.assertIn("Skrit", directory_html)
+
+        with flask_app.app_context():
+            entry = get_db().execute(
+                "SELECT * FROM callsign_directory WHERE id=?", (entry_id,)
+            ).fetchone()
+            self.assertEqual(entry["active"], 0)
+            self.assertEqual(entry["full_name"], "Popravljen Ročni Vnos")
+
     def test_alpha_channel_has_visible_warning(self):
         with patch("app.RELEASE_CHANNEL", "alpha"), patch(
-            "app.APP_VERSION", "1.9.0-alpha"
+            "app.APP_VERSION", "1.10.0-alpha"
         ):
             response = flask_app.test_client().get("/login")
             health_response = flask_app.test_client().get("/health")
@@ -98,7 +188,7 @@ class ScheduleTests(unittest.TestCase):
         html = response.get_data(as_text=True)
         self.assertIn("ALPHA TESTNA RAZLIČICA", html)
         self.assertIn("podatki niso produkcijski", html)
-        self.assertIn("različica 1.9.0-alpha", html)
+        self.assertIn("različica 1.10.0-alpha", html)
         self.assertEqual(health_response.get_json()["channel"], "alpha")
 
     def test_login_shows_countdown_and_next_saturday_number(self):

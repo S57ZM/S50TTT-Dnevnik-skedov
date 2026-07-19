@@ -16,7 +16,7 @@ from werkzeug.security import check_password_hash, generate_password_hash
 
 
 APP_NAME = "S50TTT Dnevnik skedov"
-BASE_VERSION = "1.9.0"
+BASE_VERSION = "1.10.0"
 RELEASE_CHANNEL = os.environ.get("RELEASE_CHANNEL", "stable").strip().lower()
 if RELEASE_CHANNEL not in {"stable", "alpha"}:
     RELEASE_CHANNEL = "stable"
@@ -271,10 +271,25 @@ def init_db():
             deleted_at TEXT NOT NULL
         );
 
+        CREATE TABLE IF NOT EXISTS callsign_directory (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            callsign TEXT NOT NULL UNIQUE COLLATE NOCASE,
+            full_name TEXT NOT NULL,
+            active INTEGER NOT NULL DEFAULT 1,
+            use_count INTEGER NOT NULL DEFAULT 0,
+            last_used_at TEXT,
+            created_by INTEGER NOT NULL REFERENCES users(id),
+            created_at TEXT NOT NULL,
+            updated_by INTEGER REFERENCES users(id),
+            updated_at TEXT
+        );
+
         CREATE INDEX IF NOT EXISTS idx_nets_date ON nets(net_date DESC);
         CREATE INDEX IF NOT EXISTS idx_participants_net ON participants(net_id, checkin_at);
         CREATE INDEX IF NOT EXISTS idx_net_deletions_date
             ON net_deletions(deleted_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_callsign_directory_active
+            ON callsign_directory(active, callsign);
         """
     )
 
@@ -315,6 +330,22 @@ def init_db():
         )
         db.commit()
 
+    db.execute(
+        """INSERT OR IGNORE INTO callsign_directory
+           (callsign, full_name, active, use_count, last_used_at,
+            created_by, created_at)
+           SELECT UPPER(TRIM(p.callsign)), p.full_name, 1,
+                  (SELECT COUNT(*) FROM participants counted
+                   WHERE counted.callsign=p.callsign COLLATE NOCASE),
+                  p.checkin_at, p.created_by, p.created_at
+           FROM participants p
+           WHERE TRIM(p.callsign)<>''
+             AND p.id=(SELECT newest.id FROM participants newest
+                       WHERE newest.callsign=p.callsign COLLATE NOCASE
+                       ORDER BY newest.checkin_at DESC, newest.id DESC LIMIT 1)"""
+    )
+    db.commit()
+
 
 def audit(action, entity_type, entity_id=None, details=None):
     db = get_db()
@@ -324,6 +355,28 @@ def audit(action, entity_type, entity_id=None, details=None):
         (session.get("user_id"), action, entity_type, entity_id, details, now_db()),
     )
     db.commit()
+
+
+def learn_callsign(db, callsign, full_name, user_id, used_at):
+    existing = db.execute(
+        "SELECT id FROM callsign_directory WHERE callsign=?", (callsign,)
+    ).fetchone()
+    if existing:
+        db.execute(
+            """UPDATE callsign_directory
+               SET use_count=use_count+1, last_used_at=? WHERE id=?""",
+            (used_at, existing["id"]),
+        )
+        return existing["id"], False
+
+    cursor = db.execute(
+        """INSERT INTO callsign_directory
+           (callsign, full_name, active, use_count, last_used_at,
+            created_by, created_at)
+           VALUES (?, ?, 1, 1, ?, ?, ?)""",
+        (callsign[:24], full_name[:120], used_at, user_id, now_db()),
+    )
+    return cursor.lastrowid, True
 
 
 @app.before_request
@@ -573,11 +626,16 @@ def fetch_net(net_id):
 @login_required
 def net_detail(net_id):
     net = fetch_net(net_id)
-    participants = get_db().execute(
+    db = get_db()
+    participants = db.execute(
         """SELECT p.*, u.full_name AS entered_by_name
            FROM participants p JOIN users u ON u.id=p.created_by
            WHERE p.net_id=? ORDER BY p.checkin_at, p.id""",
         (net_id,),
+    ).fetchall()
+    directory_entries = db.execute(
+        """SELECT callsign, full_name FROM callsign_directory
+           WHERE active=1 ORDER BY callsign"""
     ).fetchall()
     can_delete_net = (
         net["status"] == "open"
@@ -590,6 +648,7 @@ def net_detail(net_id):
         participants=participants,
         now=now_local(),
         can_delete_net=can_delete_net,
+        directory_entries=directory_entries,
     )
 
 
@@ -707,18 +766,31 @@ def add_participant(net_id):
         flash("Ura prijave ni veljavna.", "danger")
         return redirect(url_for("net_detail", net_id=net_id))
     db = get_db()
+    checkin_at = f"{net['net_date']} {checkin_time}:00"
     try:
         cur = db.execute(
             """INSERT INTO participants
                (net_id, full_name, callsign, checkin_at, created_by, created_at)
                VALUES (?, ?, ?, ?, ?, ?)""",
-            (net_id, full_name[:120], callsign[:24], f"{net['net_date']} {checkin_time}:00", g.user["id"], now_db()),
+            (
+                net_id,
+                full_name[:120],
+                callsign[:24],
+                checkin_at,
+                g.user["id"],
+                now_db(),
+            ),
+        )
+        directory_id, directory_created = learn_callsign(
+            db, callsign, full_name, g.user["id"], checkin_at
         )
         db.commit()
     except sqlite3.IntegrityError:
         flash(f"Klicni znak {callsign} je v tem skedu že vpisan.", "warning")
         return redirect(url_for("net_detail", net_id=net_id))
     audit("create", "participant", cur.lastrowid, f"{callsign} – {full_name}")
+    if directory_created:
+        audit("learn", "callsign", directory_id, f"{callsign} – {full_name}")
     flash(f"Dodan: {callsign} – {full_name}", "success")
     return redirect(url_for("net_detail", net_id=net_id))
 
@@ -932,6 +1004,94 @@ def archive():
     return render_template("archive.html", nets=rows)
 
 
+@app.route("/callsigns")
+@login_required
+def callsigns():
+    query = request.args.get("q", "").strip()
+    parameters = []
+    where = ""
+    if query:
+        where = "WHERE callsign LIKE ? OR full_name LIKE ?"
+        search = f"%{query}%"
+        parameters = [search, search]
+    rows = get_db().execute(
+        f"""SELECT * FROM callsign_directory {where}
+            ORDER BY active DESC, callsign""",
+        parameters,
+    ).fetchall()
+    return render_template("callsigns.html", entries=rows, query=query)
+
+
+def fetch_callsign_entry(entry_id):
+    row = get_db().execute(
+        "SELECT * FROM callsign_directory WHERE id=?", (entry_id,)
+    ).fetchone()
+    if row is None:
+        abort(404)
+    return row
+
+
+@app.route("/callsigns/new", methods=["GET", "POST"])
+@admin_required
+def new_callsign():
+    if request.method == "POST":
+        callsign = request.form.get("callsign", "").strip().upper().replace(" ", "")
+        full_name = request.form.get("full_name", "").strip()
+        if not callsign or not full_name:
+            flash("Vpiši klicni znak in ime.", "danger")
+        else:
+            try:
+                cursor = get_db().execute(
+                    """INSERT INTO callsign_directory
+                       (callsign, full_name, active, use_count, created_by, created_at)
+                       VALUES (?, ?, 1, 0, ?, ?)""",
+                    (callsign[:24], full_name[:120], g.user["id"], now_db()),
+                )
+                get_db().commit()
+                audit("create", "callsign", cursor.lastrowid, f"{callsign} – {full_name}")
+                flash("Klicni znak je dodan v imenik.", "success")
+                return redirect(url_for("callsigns"))
+            except sqlite3.IntegrityError:
+                get_db().rollback()
+                flash("Ta klicni znak je že v imeniku.", "warning")
+    return render_template("callsign_form.html", entry=None)
+
+
+@app.route("/callsigns/<int:entry_id>/edit", methods=["GET", "POST"])
+@admin_required
+def edit_callsign(entry_id):
+    entry = fetch_callsign_entry(entry_id)
+    if request.method == "POST":
+        callsign = request.form.get("callsign", "").strip().upper().replace(" ", "")
+        full_name = request.form.get("full_name", "").strip()
+        active = 1 if request.form.get("active") == "1" else 0
+        if not callsign or not full_name:
+            flash("Vpiši klicni znak in ime.", "danger")
+        else:
+            try:
+                get_db().execute(
+                    """UPDATE callsign_directory
+                       SET callsign=?, full_name=?, active=?, updated_by=?, updated_at=?
+                       WHERE id=?""",
+                    (
+                        callsign[:24],
+                        full_name[:120],
+                        active,
+                        g.user["id"],
+                        now_db(),
+                        entry_id,
+                    ),
+                )
+                get_db().commit()
+                audit("update", "callsign", entry_id, f"{callsign} – {full_name}")
+                flash("Vnos v imeniku je posodobljen.", "success")
+                return redirect(url_for("callsigns"))
+            except sqlite3.IntegrityError:
+                get_db().rollback()
+                flash("Ta klicni znak je že v imeniku.", "warning")
+    return render_template("callsign_form.html", entry=entry)
+
+
 @app.route("/users")
 @admin_required
 def users():
@@ -1069,7 +1229,7 @@ table{width:100%;border-collapse:collapse}th,td{text-align:left;padding:11px 9px
 @media print{header,.no-print,.flash,.footer{display:none!important}body{background:white}main{max-width:none;margin:0;padding:0}.card{border:0;box-shadow:none;padding:0}table{font-size:11pt}a{color:black;text-decoration:none}}
 </style></head><body>
 {% if release_channel=='alpha' %}<div class="alpha-banner">⚠ ALPHA TESTNA RAZLIČICA · podatki niso produkcijski</div>{% endif %}
-{% if g.user %}<header><nav class="nav"><span class="brand">📻 S50TTT Skedi</span><a href="{{ url_for('dashboard') }}">Domov</a><a href="{{ url_for('archive') }}">Arhiv</a>{% if g.user['role']=='admin' %}<a href="{{ url_for('users') }}">Uporabniki</a>{% endif %}<span class="user">{{ g.user['full_name'] }} · {{ g.user['callsign'] }}</span><a href="{{ url_for('change_password') }}">Geslo</a><form class="inline" method="post" action="{{ url_for('logout') }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="link-button">Odjava</button></form></nav></header>{% endif %}
+{% if g.user %}<header><nav class="nav"><span class="brand">📻 S50TTT Skedi</span><a href="{{ url_for('dashboard') }}">Domov</a><a href="{{ url_for('archive') }}">Arhiv</a><a href="{{ url_for('callsigns') }}">Imenik</a>{% if g.user['role']=='admin' %}<a href="{{ url_for('users') }}">Uporabniki</a>{% endif %}<span class="user">{{ g.user['full_name'] }} · {{ g.user['callsign'] }}</span><a href="{{ url_for('change_password') }}">Geslo</a><form class="inline" method="post" action="{{ url_for('logout') }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="link-button">Odjava</button></form></nav></header>{% endif %}
 <main>{% with msgs=get_flashed_messages(with_categories=true) %}{% for category,msg in msgs %}<div class="flash {{ category }}">{{ msg }}</div>{% endfor %}{% endwith %}{% block content %}{% endblock %}</main>
 <footer class="footer">{{ app_name }} · različica {{ app_version }}</footer>
 </body></html>''',
@@ -1085,13 +1245,15 @@ table{width:100%;border-collapse:collapse}th,td{text-align:left;padding:11px 9px
 {% endblock %}''',
 "net.html": r'''{% extends "base.html" %}{% block title %}{{ net['title'] }} · {{ app_name }}{% endblock %}{% block content %}{% set can_edit_participants=net['status']=='open' or g.user['role']=='admin' %}
 <div class="card"><div class="actions"><div><span class="badge {{ net['status'] }}">{{ 'Odprt' if net['status']=='open' else 'Zaključen' }}</span>{% if net['schedule_type'] %} <span class="badge leader">Redni sked</span>{% endif %}<h1>{{ net['title'] }}</h1><p>{{ net['net_date']|date_si }} · začetek {{ net['started_at']|time_si }}{% if net['ended_at'] %} · konec {{ net['ended_at']|time_si }}{% endif %}{% if net['control_callsign'] %}<br>Upravna postaja: <b>{{ net['control_callsign'] }}</b>{% endif %}{% if net['repeater'] %}<br>Repetitor: <b>{{ net['repeater'] }}</b>{% endif %}<br>Operater: <b>{{ net['leader_name'] }} ({{ net['leader_callsign'] }})</b></p></div><div class="actions right no-print"><button class="btn btn-secondary" onclick="window.print()">🖨 Natisni / PDF</button>{% if net['status']=='open' %}{% if can_delete_net %}<form method="post" action="{{ url_for('delete_net',net_id=net['id']) }}" onsubmit="return confirm('Izbrišem ta prazen odprt sked? Tega dejanja ni mogoče razveljaviti.')"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="btn btn-danger">Izbriši prazen sked</button></form>{% endif %}<form method="post" action="{{ url_for('close_net',net_id=net['id']) }}" onsubmit="return confirm('Zaključim ta sked?')"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="btn btn-success">✓ Zaključi sked</button></form>{% elif g.user['role']=='admin' %}<a class="btn btn-primary" href="{{ url_for('edit_net',net_id=net['id']) }}">Uredi podatke</a><form method="post" action="{{ url_for('reopen_net',net_id=net['id']) }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="btn btn-secondary">Ponovno odpri</button></form><a class="btn btn-danger" href="{{ url_for('delete_closed_net',net_id=net['id']) }}">Izbriši sked</a>{% endif %}</div></div></div>
-{% if net['status']=='open' %}<div class="card no-print"><h2>Dodaj prijavljenega</h2><form method="post" action="{{ url_for('add_participant',net_id=net['id']) }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><div class="grid"><div class="field"><label>Ime in priimek</label><input name="full_name" required autofocus autocomplete="off"></div><div class="field"><label>Klicni znak</label><input name="callsign" required autocomplete="off" style="text-transform:uppercase"></div><div class="field"><label>Ura prijave</label><input type="time" name="checkin_time" value="{{ now.strftime('%H:%M') }}" required></div></div><button class="btn btn-primary">＋ Dodaj v dnevnik</button></form></div>{% endif %}
+{% if net['status']=='open' %}<div class="card no-print"><h2>Dodaj prijavljenega</h2><form method="post" action="{{ url_for('add_participant',net_id=net['id']) }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><div class="grid"><div class="field"><label>Klicni znak</label><input id="participant-callsign" name="callsign" list="callsign-options" required autofocus autocomplete="off" style="text-transform:uppercase"><datalist id="callsign-options">{% for entry in directory_entries %}<option value="{{ entry['callsign'] }}" data-full-name="{{ entry['full_name'] }}">{{ entry['full_name'] }}</option>{% endfor %}</datalist><small class="muted">Začni tipkati; znani klicni znak bo izpolnil ime.</small></div><div class="field"><label>Ime in priimek</label><input id="participant-full-name" name="full_name" required autocomplete="off"></div><div class="field"><label>Ura prijave</label><input type="time" name="checkin_time" value="{{ now.strftime('%H:%M') }}" required></div></div><button class="btn btn-primary">＋ Dodaj v dnevnik</button></form></div><script>(function(){const callsign=document.getElementById('participant-callsign');const fullName=document.getElementById('participant-full-name');const options=document.querySelectorAll('#callsign-options option');if(!callsign||!fullName)return;const directory={};options.forEach(function(option){directory[option.value.toUpperCase()]=option.dataset.fullName});let lastAutofill='';function suggest(){const value=callsign.value.trim().toUpperCase().replace(/\s+/g,'');callsign.value=value;const knownName=directory[value];if(knownName&&(!fullName.value||fullName.value===lastAutofill)){fullName.value=knownName;lastAutofill=knownName}}callsign.addEventListener('input',suggest);callsign.addEventListener('change',suggest)})();</script>{% endif %}
 <div class="card"><h2>Prijavljeni: {{ participants|length }}</h2>{% if participants %}<div class="table-wrap"><table><thead><tr><th>Št.</th><th>Ura</th><th>Klicni znak</th><th>Ime in priimek</th><th class="no-print">Vnesel</th>{% if can_edit_participants %}<th class="no-print"></th>{% endif %}</tr></thead><tbody>{% for p in participants %}<tr><td>{{ loop.index }}</td><td class="nowrap">{{ p['checkin_at']|time_si }}</td><td><b>{{ p['callsign'] }}</b></td><td>{{ p['full_name'] }}</td><td class="no-print">{{ p['entered_by_name'] }}</td>{% if can_edit_participants %}<td class="no-print"><div class="actions"><a class="btn btn-secondary btn-small" href="{{ url_for('edit_participant',participant_id=p['id']) }}">Uredi</a><form method="post" action="{{ url_for('delete_participant',participant_id=p['id']) }}" onsubmit="return confirm('Izbrišem {{ p['callsign'] }}?')"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="btn btn-danger btn-small">Izbriši</button></form></div></td>{% endif %}</tr>{% endfor %}</tbody></table></div>{% else %}<p class="empty">V tem skedu še ni prijavljenih.</p>{% endif %}</div>
 {% endblock %}''',
 "participant_edit.html": r'''{% extends "base.html" %}{% block content %}<div class="card"><h1>Uredi prijavo</h1><p>{{ net['title'] }}</p><form method="post"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><div class="field"><label>Ime in priimek</label><input name="full_name" value="{{ participant['full_name'] }}" required></div><div class="field"><label>Klicni znak</label><input name="callsign" value="{{ participant['callsign'] }}" required style="text-transform:uppercase"></div><div class="field"><label>Ura prijave</label><input type="time" name="checkin_time" value="{{ participant['checkin_at']|time_si }}" required></div><div class="actions"><button class="btn btn-primary">Shrani</button><a class="btn btn-secondary" href="{{ url_for('net_detail',net_id=net['id']) }}">Prekliči</a></div></form></div>{% endblock %}''',
 "net_edit.html": r'''{% extends "base.html" %}{% block content %}<div class="card" style="max-width:760px"><h1>Uredi zaključeni sked</h1><p class="muted">Vsak popravek se zabeleži v revizijsko sled podatkovne baze.</p><form method="post"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><div class="field"><label>Naslov skeda</label><input name="title" value="{{ net['title'] }}" required></div><div class="grid"><div class="field"><label>Datum</label><input type="date" name="net_date" value="{{ net['net_date'] }}" required></div><div class="field"><label>Začetna ura</label><input type="time" name="started_time" value="{{ net['started_at']|time_si }}" required></div><div class="field"><label>Končna ura</label><input type="time" name="ended_time" value="{{ net['ended_at']|time_si }}" required></div></div><div class="field"><label>Operater</label><select name="leader_id" required>{% for user in users %}<option value="{{ user['id'] }}" {% if user['id']==net['leader_id'] %}selected{% endif %}>{{ user['full_name'] }} ({{ user['callsign'] }}){% if not user['active'] %} – neaktiven{% endif %}</option>{% endfor %}</select></div><div class="actions"><button class="btn btn-primary">Shrani popravke</button><a class="btn btn-secondary" href="{{ url_for('net_detail',net_id=net['id']) }}">Prekliči</a></div></form><div class="danger-zone"><h2>Izbris skeda</h2><p class="muted">Izbris je dovoljen samo z navedenim razlogom. Kopija skeda in vseh prijav ostane shranjena v revizijski tabeli.</p><form method="post" action="{{ url_for('delete_closed_net',net_id=net['id']) }}" onsubmit="return confirm('Res trajno izbrišem ta zaključeni sked?')"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><div class="field"><label>Razlog brisanja</label><textarea name="reason" minlength="10" maxlength="1000" required placeholder="Na primer: podvojen dnevnik, odprt za napačen datum …"></textarea><small class="muted">Najmanj 10 znakov.</small></div><button class="btn btn-danger">Trajno izbriši sked</button></form></div></div>{% endblock %}''',
 "net_delete.html": r'''{% extends "base.html" %}{% block content %}<div class="card" style="max-width:680px"><h1>Izbriši zaključeni sked</h1><p><b>{{ net['title'] }}</b><br>{{ net['net_date']|date_si }} · {{ participant_count }} prijavljenih</p><div class="flash warning">Sked bo odstranjen iz arhiva. Razlog, podatki skeda in kopija vseh prijav bodo trajno shranjeni v revizijski tabeli.</div><form method="post" onsubmit="return confirm('Res izbrišem ta zaključeni sked?')"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><div class="field"><label>Razlog brisanja</label><textarea name="reason" minlength="10" maxlength="1000" required placeholder="Na primer: podvojen dnevnik, odprt za napačen datum …">{{ reason }}</textarea><small class="muted">Najmanj 10 znakov. Razlog se zabeleži skupaj z administratorjem in časom brisanja.</small></div><div class="actions"><button class="btn btn-danger">Trajno izbriši sked</button><a class="btn btn-secondary" href="{{ url_for('net_detail',net_id=net['id']) }}">Prekliči</a></div></form></div>{% endblock %}''',
 "archive.html": r'''{% extends "base.html" %}{% block content %}<div class="card"><h1>Arhiv skedov</h1>{% if nets %}<div class="table-wrap"><table><thead><tr><th>Datum</th><th>Sked</th><th>Status</th><th>Operater</th><th>Prijavljeni</th><th></th></tr></thead><tbody>{% for n in nets %}<tr><td class="nowrap">{{ n['net_date']|date_si }}</td><td><b>{{ n['title'] }}</b><br><span class="muted">{{ n['started_at']|time_si }}{% if n['ended_at'] %}–{{ n['ended_at']|time_si }}{% endif %}{% if n['repeater'] %} · {{ n['repeater'] }}{% endif %}</span></td><td><span class="badge {{ n['status'] }}">{{ 'Odprt' if n['status']=='open' else 'Zaključen' }}</span></td><td>{{ n['leader_name'] }} ({{ n['leader_callsign'] }})</td><td>{{ n['participant_count'] }}</td><td><div class="actions"><a class="btn btn-secondary btn-small" href="{{ url_for('net_detail',net_id=n['id']) }}">Pregled</a>{% if g.user['role']=='admin' and n['status']=='closed' %}<a class="btn btn-primary btn-small" href="{{ url_for('edit_net',net_id=n['id']) }}">Uredi</a>{% endif %}</div></td></tr>{% endfor %}</tbody></table></div>{% else %}<p class="empty">Arhiv je prazen.</p>{% endif %}</div>{% endblock %}''',
+"callsigns.html": r'''{% extends "base.html" %}{% block content %}<div class="card"><div class="actions"><div><h1>Imenik klicnih znakov</h1><p class="muted">Imenik se samodejno dopolnjuje z novimi prijavljenimi.</p></div>{% if g.user['role']=='admin' %}<a class="btn btn-primary right" href="{{ url_for('new_callsign') }}">＋ Novi vnos</a>{% endif %}</div><form method="get" class="actions no-print" style="margin-bottom:18px"><input name="q" value="{{ query }}" placeholder="Išči po klicnem znaku ali imenu" style="max-width:360px"><button class="btn btn-secondary">Išči</button>{% if query %}<a class="btn btn-secondary" href="{{ url_for('callsigns') }}">Počisti</a>{% endif %}</form>{% if entries %}<div class="table-wrap"><table><thead><tr><th>Klicni znak</th><th>Ime in priimek</th><th>Uporab</th><th>Zadnja prijava</th><th>Status</th>{% if g.user['role']=='admin' %}<th></th>{% endif %}</tr></thead><tbody>{% for entry in entries %}<tr><td><b>{{ entry['callsign'] }}</b></td><td>{{ entry['full_name'] }}</td><td>{{ entry['use_count'] }}</td><td>{{ entry['last_used_at']|datetime_si if entry['last_used_at'] else '–' }}</td><td><span class="badge {{ 'open' if entry['active'] else 'closed' }}">{{ 'Aktiven' if entry['active'] else 'Skrit' }}</span></td>{% if g.user['role']=='admin' %}<td><a class="btn btn-secondary btn-small" href="{{ url_for('edit_callsign',entry_id=entry['id']) }}">Uredi</a></td>{% endif %}</tr>{% endfor %}</tbody></table></div>{% else %}<p class="empty">V imeniku ni zadetkov.</p>{% endif %}</div>{% endblock %}''',
+"callsign_form.html": r'''{% extends "base.html" %}{% block content %}<div class="card" style="max-width:620px"><h1>{{ 'Uredi vnos v imeniku' if entry else 'Novi vnos v imeniku' }}</h1><form method="post"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><div class="field"><label>Klicni znak</label><input name="callsign" value="{{ entry['callsign'] if entry else '' }}" required autofocus style="text-transform:uppercase"></div><div class="field"><label>Ime in priimek</label><input name="full_name" value="{{ entry['full_name'] if entry else '' }}" required></div>{% if entry %}<div class="field"><label><input style="width:auto" type="checkbox" name="active" value="1" {% if entry['active'] %}checked{% endif %}> Aktiven vnos in prikaz med predlogi</label></div><p class="muted">Število uporab: {{ entry['use_count'] }}{% if entry['last_used_at'] %} · zadnja prijava {{ entry['last_used_at']|datetime_si }}{% endif %}</p>{% endif %}<div class="actions"><button class="btn btn-primary">Shrani</button><a class="btn btn-secondary" href="{{ url_for('callsigns') }}">Prekliči</a></div></form></div>{% endblock %}''',
 "users.html": r'''{% extends "base.html" %}{% block content %}<div class="card"><div class="actions"><h1>Uporabniki</h1><a class="btn btn-primary right" href="{{ url_for('new_user') }}">＋ Novi uporabnik</a></div><div class="table-wrap"><table><thead><tr><th>Uporabnik</th><th>Ime</th><th>Klicni znak</th><th>Vloga</th><th>Status</th><th></th></tr></thead><tbody>{% for u in users %}<tr><td><b>{{ u['username'] }}</b></td><td>{{ u['full_name'] }}</td><td>{{ u['callsign'] }}</td><td><span class="badge {{ u['role'] }}">{{ 'Administrator' if u['role']=='admin' else 'Vodja skeda' }}</span></td><td>{{ 'Aktiven' if u['active'] else 'Onemogočen' }}</td><td><a class="btn btn-secondary btn-small" href="{{ url_for('edit_user',user_id=u['id']) }}">Uredi</a></td></tr>{% endfor %}</tbody></table></div></div>{% endblock %}''',
 "user_form.html": r'''{% extends "base.html" %}{% block content %}<div class="card"><h1>{{ 'Uredi uporabnika' if edit_user else 'Novi uporabnik' }}</h1><form method="post"><input type="hidden" name="csrf_token" value="{{ csrf_token }}">{% if not edit_user %}<div class="field"><label>Uporabniško ime</label><input name="username" required autocomplete="off"></div>{% else %}<p>Uporabniško ime: <b>{{ edit_user['username'] }}</b></p>{% endif %}<div class="grid"><div class="field"><label>Ime in priimek</label><input name="full_name" value="{{ edit_user['full_name'] if edit_user else '' }}" required></div><div class="field"><label>Klicni znak</label><input name="callsign" value="{{ edit_user['callsign'] if edit_user else '' }}" required style="text-transform:uppercase"></div><div class="field"><label>Vloga</label><select name="role"><option value="leader" {% if edit_user and edit_user['role']=='leader' %}selected{% endif %}>Vodja skeda</option><option value="admin" {% if edit_user and edit_user['role']=='admin' %}selected{% endif %}>Administrator</option></select></div></div><div class="field"><label>{{ 'Novo geslo (pusti prazno, če ga ne spreminjaš)' if edit_user else 'Začasno geslo (najmanj 10 znakov)' }}</label><input type="password" name="password" {% if not edit_user %}required{% endif %} autocomplete="new-password"></div>{% if edit_user %}<div class="field"><label><input style="width:auto" type="checkbox" name="active" value="1" {% if edit_user['active'] %}checked{% endif %}> Aktiven uporabnik</label></div>{% endif %}<div class="actions"><button class="btn btn-primary">Shrani</button><a class="btn btn-secondary" href="{{ url_for('users') }}">Prekliči</a></div></form></div>{% endblock %}''',
 "change_password.html": r'''{% extends "base.html" %}{% block content %}<div class="card" style="max-width:520px"><h1>Spremeni geslo</h1><form method="post"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><div class="field"><label>Trenutno geslo</label><input type="password" name="current_password" required></div><div class="field"><label>Novo geslo (najmanj 10 znakov)</label><input type="password" name="new_password" required></div><div class="field"><label>Ponovi novo geslo</label><input type="password" name="confirm_password" required></div><button class="btn btn-primary">Spremeni geslo</button></form></div>{% endblock %}'''

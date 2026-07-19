@@ -9,7 +9,10 @@ veja alpha ──> s50ttt-skedi-alpha  ──> port 8024 ──> data-alpha/sked
 ```
 
 Alpha na vsaki strani prikaže rumeno opozorilo in različico, na primer
-`1.9.0-alpha`. Vpisani testni podatki nikoli ne končajo v produkcijski bazi.
+`1.10.0-alpha`. Vpisani testni podatki nikoli ne končajo v produkcijski bazi.
+
+Trenutna prva alpha funkcija je lokalni imenik klicnih znakov s samodejnim
+dopolnjevanjem in predlogi pri vnosu prijavljenega.
 
 ## 1. Ustvarjanje veje alpha
 
@@ -74,7 +77,7 @@ curl -s http://127.0.0.1:8024/health
 Pričakovani odgovor vsebuje kanal `alpha`:
 
 ```json
-{"channel":"alpha","status":"ok","version":"1.9.0-alpha"}
+{"channel":"alpha","status":"ok","version":"1.10.0-alpha"}
 ```
 
 ## 5. Prenos preverjene funkcije v produkcijo
