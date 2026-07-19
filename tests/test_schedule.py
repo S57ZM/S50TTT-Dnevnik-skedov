@@ -16,6 +16,8 @@ from app import (  # noqa: E402
     SCHEDULE_SATURDAY,
     app as flask_app,
     get_db,
+    next_effective_countdown_net,
+    next_effective_saturday_net,
     next_countdown_net,
     next_scheduled_nets,
     next_saturday_net,
@@ -180,7 +182,7 @@ class ScheduleTests(unittest.TestCase):
 
     def test_alpha_channel_has_visible_warning(self):
         with patch("app.RELEASE_CHANNEL", "alpha"), patch(
-            "app.APP_VERSION", "1.11.0-alpha"
+            "app.APP_VERSION", "1.12.0-alpha"
         ):
             response = flask_app.test_client().get("/login")
             health_response = flask_app.test_client().get("/health")
@@ -188,7 +190,7 @@ class ScheduleTests(unittest.TestCase):
         html = response.get_data(as_text=True)
         self.assertIn("ALPHA TESTNA RAZLIČICA", html)
         self.assertIn("podatki niso produkcijski", html)
-        self.assertIn("različica 1.11.0-alpha", html)
+        self.assertIn("različica 1.12.0-alpha", html)
         self.assertEqual(health_response.get_json()["channel"], "alpha")
 
     def test_login_shows_countdown_and_next_saturday_number(self):
@@ -609,6 +611,136 @@ class ScheduleTests(unittest.TestCase):
             self.assertEqual(deletion["participant_count"], 1)
             self.assertIn("S58TEST", deletion["snapshot"])
             self.assertIn(reason, audit_row["details"])
+
+
+    def test_admin_can_cancel_and_restore_regular_net(self):
+        original_date = "2027-01-02"
+        with flask_app.app_context():
+            db = get_db()
+            db.execute(
+                "DELETE FROM schedule_exceptions WHERE schedule_type=? AND scheduled_date=?",
+                (SCHEDULE_SATURDAY, original_date),
+            )
+            db.execute(
+                """DELETE FROM nets WHERE schedule_type=?
+                   AND COALESCE(scheduled_date,net_date)=?""",
+                (SCHEDULE_SATURDAY, original_date),
+            )
+            admin_id = db.execute(
+                "SELECT id FROM users WHERE role='admin' ORDER BY id LIMIT 1"
+            ).fetchone()["id"]
+            db.commit()
+
+        client = self.authenticated_client(admin_id)
+        response = client.post(
+            f"/schedule/{SCHEDULE_SATURDAY}/{original_date}/exception",
+            data={
+                "csrf_token": "test-csrf-token",
+                "action": "canceled",
+                "reason": "Repetitor zaradi vzdrževanja ne bo dosegljiv.",
+            },
+        )
+        self.assertEqual(response.status_code, 302)
+
+        with flask_app.app_context():
+            next_saturday = next_effective_saturday_net(datetime(2027, 1, 1, 12, 0))
+            self.assertEqual(next_saturday["date"], "2027-01-09")
+            audit_row = get_db().execute(
+                """SELECT details FROM audit_log
+                   WHERE action='create' AND entity_type='schedule_exception'
+                   ORDER BY id DESC LIMIT 1"""
+            ).fetchone()
+            self.assertIn("vzdrževanja", audit_row["details"])
+
+        with patch("app.now_local", return_value=datetime(2027, 1, 1, 12, 0)):
+            dashboard = client.get("/").get_data(as_text=True)
+        self.assertIn("Odpovedan", dashboard)
+        self.assertIn("Repetitor zaradi vzdrževanja", dashboard)
+        self.assertNotIn(
+            f'name="scheduled_date" value="{original_date}"', dashboard
+        )
+
+        restore_response = client.post(
+            f"/schedule/{SCHEDULE_SATURDAY}/{original_date}/exception/delete",
+            data={"csrf_token": "test-csrf-token"},
+        )
+        self.assertEqual(restore_response.status_code, 302)
+        with flask_app.app_context():
+            self.assertIsNone(
+                get_db().execute(
+                    """SELECT id FROM schedule_exceptions
+                       WHERE schedule_type=? AND scheduled_date=?""",
+                    (SCHEDULE_SATURDAY, original_date),
+                ).fetchone()
+            )
+
+    def test_postponed_net_keeps_original_saturday_number(self):
+        original_date = "2027-01-02"
+        new_date = "2027-01-03"
+        with flask_app.app_context():
+            db = get_db()
+            db.execute(
+                "DELETE FROM schedule_exceptions WHERE schedule_type=? AND scheduled_date=?",
+                (SCHEDULE_SATURDAY, original_date),
+            )
+            db.execute(
+                """DELETE FROM nets WHERE schedule_type=?
+                   AND COALESCE(scheduled_date,net_date)=?""",
+                (SCHEDULE_SATURDAY, original_date),
+            )
+            admin_id = db.execute(
+                "SELECT id FROM users WHERE role='admin' ORDER BY id LIMIT 1"
+            ).fetchone()["id"]
+            db.commit()
+
+        client = self.authenticated_client(admin_id)
+        response = client.post(
+            f"/schedule/{SCHEDULE_SATURDAY}/{original_date}/exception",
+            data={
+                "csrf_token": "test-csrf-token",
+                "action": "postponed",
+                "new_date": new_date,
+                "new_time": "20:30",
+                "reason": "Termin je prestavljen zaradi klubskega dogodka.",
+            },
+        )
+        self.assertEqual(response.status_code, 302)
+
+        with flask_app.app_context():
+            countdown = next_effective_countdown_net(datetime(2027, 1, 2, 20, 1))
+            self.assertEqual(countdown["date"], new_date)
+            self.assertEqual(countdown["time"], "20:30")
+            self.assertEqual(
+                countdown["sequence_number"],
+                saturday_net_number(date.fromisoformat(original_date)),
+            )
+
+        with patch("app.now_local", return_value=datetime(2027, 1, 2, 12, 0)):
+            open_response = client.post(
+                "/nets/new",
+                data={
+                    "csrf_token": "test-csrf-token",
+                    "schedule_type": SCHEDULE_SATURDAY,
+                    "scheduled_date": original_date,
+                    "net_date": new_date,
+                    "started_time": "20:30",
+                },
+            )
+        self.assertEqual(open_response.status_code, 302)
+
+        with flask_app.app_context():
+            created = get_db().execute(
+                """SELECT * FROM nets WHERE schedule_type=?
+                   AND scheduled_date=?""",
+                (SCHEDULE_SATURDAY, original_date),
+            ).fetchone()
+            self.assertEqual(created["net_date"], new_date)
+            self.assertEqual(created["started_at"], f"{new_date} 20:30:00")
+            self.assertIn(
+                f"št. {saturday_net_number(date.fromisoformat(original_date))}",
+                created["title"],
+            )
+            self.assertIn("prestavljen", created["title"])
 
 
 if __name__ == "__main__":

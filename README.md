@@ -2,12 +2,13 @@
 
 Ločen spletni portal Radiokluba Sevnica S50TTT za vodenje skedov.
 
-Trenutna alpha različica: **1.11.0-alpha**
+Trenutna alpha različica: **1.12.0-alpha**
 
 ## Funkcije
 
 - več uporabnikov z vlogama administrator in vodja skeda;
 - samodejni izračun naslednjega mesečnega in sobotnega rednega skeda;
+- administratorska odpoved ali prestavitev rednega skeda z obveznim razlogom;
 - zaklenjeno odpiranje rednega dnevnika do petka pred skedom, s predčasnim
   odklepom po petih hitrih pritiskih;
 - živ odštevalnik, številka sobotnega skeda in skupno število prijavljenih na
@@ -69,6 +70,12 @@ termina:
 Upravna postaja rednega skeda je `S50TTT`, operater pa prijavljeni član kluba, ki
 odpre dnevnik. Portal prepreči, da bi bil za isti redni termin odprt podvojen
 dnevnik. Drug ali izredni sked je še vedno mogoče odpreti ročno.
+
+Administrator lahko prihodnji redni sked odpove ali prestavi na drug datum in
+uro. Odpovedani termin se odstrani iz odštevalnika in ga ni mogoče odpreti.
+Prestavljenemu sobotnemu skedu ostane zaporedna številka prvotnega termina,
+odštevalnik pa sledi novemu terminu. Obvezen razlog, sprememba in morebitna
+razveljavitev se shranijo v revizijsko sled.
 
 Gumb za odpiranje rednega dnevnika je do petka pred terminom siv. Sobotni sked
 se običajno odklene dan prej, mesečni četrtkov sked pa v petek prejšnjega tedna.

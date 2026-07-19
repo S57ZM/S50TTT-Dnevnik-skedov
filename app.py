@@ -16,7 +16,7 @@ from werkzeug.security import check_password_hash, generate_password_hash
 
 
 APP_NAME = "S50TTT Dnevnik skedov"
-BASE_VERSION = "1.11.0"
+BASE_VERSION = "1.12.0"
 RELEASE_CHANNEL = os.environ.get("RELEASE_CHANNEL", "stable").strip().lower()
 if RELEASE_CHANNEL not in {"stable", "alpha"}:
     RELEASE_CHANNEL = "stable"
@@ -152,6 +152,112 @@ def next_saturday_net(reference=None):
     )
 
 
+def get_schedule_exception(schedule_type, scheduled_date, db=None):
+    db = db or get_db()
+    return db.execute(
+        """SELECT * FROM schedule_exceptions
+           WHERE schedule_type=? AND scheduled_date=?""",
+        (schedule_type, scheduled_date),
+    ).fetchone()
+
+
+def apply_schedule_exception(scheduled, db=None):
+    """Return a scheduled slot with an optional cancellation/postponement applied."""
+    result = dict(scheduled)
+    result["original_date"] = scheduled["date"]
+    result["original_time"] = scheduled["time"]
+    result["exception_action"] = None
+    result["exception_reason"] = None
+    exception = get_schedule_exception(
+        scheduled["schedule_type"], scheduled["date"], db
+    )
+    if not exception:
+        return result
+
+    result["exception_action"] = exception["action"]
+    result["exception_reason"] = exception["reason"]
+    if exception["action"] == "postponed":
+        result["date"] = exception["new_date"]
+        result["time"] = exception["new_time"]
+    return result
+
+
+def upcoming_effective_scheduled_nets(reference=None, horizon_days=100):
+    """Return future regular nets, including postponed slots from recent weeks."""
+    reference = reference or now_local()
+    db = get_db()
+    candidates = {}
+    start_date = reference.date() - timedelta(days=31)
+    end_date = reference.date() + timedelta(days=horizon_days)
+    current_date = start_date
+    while current_date <= end_date:
+        schedule_types = []
+        if current_date.weekday() == 5:
+            schedule_types.append(SCHEDULE_SATURDAY)
+        if current_date == first_weekday_of_month(
+            current_date.year, current_date.month, 3
+        ):
+            schedule_types.append(SCHEDULE_MONTHLY)
+        for schedule_type in schedule_types:
+            scheduled = scheduled_net_for_date(schedule_type, current_date)
+            effective = apply_schedule_exception(scheduled, db)
+            if effective["exception_action"] == "canceled":
+                continue
+            if schedule_start_datetime(effective) > reference:
+                candidates[(schedule_type, effective["original_date"])] = effective
+        current_date += timedelta(days=1)
+
+    # A long postponement must remain visible even after its original date is
+    # outside the scan window.
+    for exception in db.execute(
+        """SELECT * FROM schedule_exceptions
+           WHERE action='postponed' AND new_date IS NOT NULL AND new_time IS NOT NULL"""
+    ).fetchall():
+        try:
+            original_date = date.fromisoformat(exception["scheduled_date"])
+        except ValueError:
+            continue
+        scheduled = scheduled_net_for_date(exception["schedule_type"], original_date)
+        if scheduled is None:
+            continue
+        effective = apply_schedule_exception(scheduled, db)
+        if schedule_start_datetime(effective) > reference:
+            candidates[(exception["schedule_type"], exception["scheduled_date"])] = effective
+    return sorted(candidates.values(), key=schedule_start_datetime)
+
+
+def dashboard_scheduled_nets(reference=None):
+    reference = reference or now_local()
+    db = get_db()
+    scheduled = [
+        apply_schedule_exception(item, db)
+        for item in next_scheduled_nets(reference)
+    ]
+    known = {(item["schedule_type"], item["original_date"]) for item in scheduled}
+    for item in upcoming_effective_scheduled_nets(reference):
+        key = (item["schedule_type"], item["original_date"])
+        if item["exception_action"] == "postponed" and key not in known:
+            scheduled.append(item)
+            known.add(key)
+    return sorted(scheduled, key=schedule_start_datetime)
+
+
+def next_effective_countdown_net(reference=None):
+    scheduled = upcoming_effective_scheduled_nets(reference)[0]
+    scheduled["starts_at_iso"] = (
+        schedule_start_datetime(scheduled).replace(tzinfo=TIMEZONE).isoformat()
+    )
+    return scheduled
+
+
+def next_effective_saturday_net(reference=None):
+    return next(
+        scheduled
+        for scheduled in upcoming_effective_scheduled_nets(reference)
+        if scheduled["schedule_type"] == SCHEDULE_SATURDAY
+    )
+
+
 def regular_net_open_date(net_date):
     if isinstance(net_date, str):
         net_date = date.fromisoformat(net_date)
@@ -163,14 +269,15 @@ def scheduled_net_participant_count(schedule_type, net_date):
     return get_db().execute(
         """SELECT COUNT(p.id) AS n
            FROM nets n LEFT JOIN participants p ON p.net_id=n.id
-           WHERE n.schedule_type=? AND n.net_date=?""",
+           WHERE n.schedule_type=? AND COALESCE(n.scheduled_date,n.net_date)=?""",
         (schedule_type, net_date),
     ).fetchone()["n"]
 
 
 def recent_closed_saturday_summaries(limit=2):
     rows = get_db().execute(
-        """SELECT n.net_date, COUNT(p.id) AS participant_count
+        """SELECT n.net_date, COALESCE(n.scheduled_date,n.net_date) AS scheduled_date,
+                  COUNT(p.id) AS participant_count
            FROM nets n LEFT JOIN participants p ON p.net_id=n.id
            WHERE n.schedule_type=? AND n.status='closed' AND n.net_date<=?
            GROUP BY n.id ORDER BY n.net_date DESC LIMIT ?""",
@@ -180,7 +287,7 @@ def recent_closed_saturday_summaries(limit=2):
     for row in rows:
         summary = dict(row)
         summary["sequence_number"] = saturday_net_number(
-            date.fromisoformat(row["net_date"])
+            date.fromisoformat(row["scheduled_date"])
         )
         summaries.append(summary)
     return summaries
@@ -284,12 +391,30 @@ def init_db():
             updated_at TEXT
         );
 
+        CREATE TABLE IF NOT EXISTS schedule_exceptions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            schedule_type TEXT NOT NULL CHECK(schedule_type IN ('monthly', 'saturday')),
+            scheduled_date TEXT NOT NULL,
+            action TEXT NOT NULL CHECK(action IN ('canceled', 'postponed')),
+            new_date TEXT,
+            new_time TEXT,
+            reason TEXT NOT NULL,
+            created_by INTEGER NOT NULL REFERENCES users(id),
+            created_at TEXT NOT NULL,
+            updated_by INTEGER REFERENCES users(id),
+            updated_at TEXT,
+            UNIQUE(schedule_type, scheduled_date),
+            CHECK(action='canceled' OR (new_date IS NOT NULL AND new_time IS NOT NULL))
+        );
+
         CREATE INDEX IF NOT EXISTS idx_nets_date ON nets(net_date DESC);
         CREATE INDEX IF NOT EXISTS idx_participants_net ON participants(net_id, checkin_at);
         CREATE INDEX IF NOT EXISTS idx_net_deletions_date
             ON net_deletions(deleted_at DESC);
         CREATE INDEX IF NOT EXISTS idx_callsign_directory_active
             ON callsign_directory(active, callsign);
+        CREATE INDEX IF NOT EXISTS idx_schedule_exceptions_date
+            ON schedule_exceptions(scheduled_date);
         """
     )
 
@@ -298,6 +423,7 @@ def init_db():
         "schedule_type": "TEXT",
         "repeater": "TEXT",
         "control_callsign": "TEXT",
+        "scheduled_date": "TEXT",
     }.items():
         if column not in net_columns:
             try:
@@ -306,8 +432,14 @@ def init_db():
                 if "duplicate column name" not in str(error).lower():
                     raise
     db.execute(
+        """UPDATE nets SET scheduled_date=net_date
+           WHERE schedule_type IS NOT NULL AND scheduled_date IS NULL"""
+    )
+    db.execute("DROP INDEX IF EXISTS idx_nets_schedule_date")
+    db.execute(
         """CREATE UNIQUE INDEX IF NOT EXISTS idx_nets_schedule_date
-           ON nets(schedule_type, net_date) WHERE schedule_type IS NOT NULL"""
+           ON nets(schedule_type, COALESCE(scheduled_date, net_date))
+           WHERE schedule_type IS NOT NULL"""
     )
     db.commit()
 
@@ -458,17 +590,14 @@ def login():
             session["csrf_token"] = secrets.token_urlsafe(32)
             return redirect(url_for("dashboard"))
         flash("Napačno uporabniško ime ali geslo.", "danger")
-    displayed_saturday = next(
-        scheduled
-        for scheduled in next_scheduled_nets(include_started_today=True)
-        if scheduled["schedule_type"] == SCHEDULE_SATURDAY
-    )
+    countdown_net = next_effective_countdown_net()
+    displayed_saturday = next_effective_saturday_net()
     return render_template(
-        "login.html",
-        countdown_net=next_countdown_net(),
+        "login_v2.html",
+        countdown_net=countdown_net,
         next_saturday=displayed_saturday,
         saturday_participant_count=scheduled_net_participant_count(
-            SCHEDULE_SATURDAY, displayed_saturday["date"]
+            SCHEDULE_SATURDAY, displayed_saturday["original_date"]
         ),
         recent_saturdays=recent_closed_saturday_summaries(),
     )
@@ -485,13 +614,13 @@ def logout():
 @login_required
 def dashboard():
     db = get_db()
-    scheduled_nets = next_scheduled_nets()
+    scheduled_nets = dashboard_scheduled_nets()
     current_date = now_local().date()
     for scheduled in scheduled_nets:
         existing = db.execute(
             """SELECT id, status FROM nets
-               WHERE schedule_type=? AND net_date=?""",
-            (scheduled["schedule_type"], scheduled["date"]),
+               WHERE schedule_type=? AND COALESCE(scheduled_date,net_date)=?""",
+            (scheduled["schedule_type"], scheduled["original_date"]),
         ).fetchone()
         scheduled["existing_id"] = existing["id"] if existing else None
         scheduled["existing_status"] = existing["status"] if existing else None
@@ -514,11 +643,164 @@ def dashboard():
            WHERE n.status='closed' GROUP BY n.id ORDER BY n.started_at DESC LIMIT 15"""
     ).fetchall()
     return render_template(
-        "dashboard.html",
+        "dashboard_v2.html",
         open_nets=open_nets,
         recent=recent,
         scheduled_nets=scheduled_nets,
     )
+
+
+@app.route(
+    "/schedule/<schedule_type>/<scheduled_date>/exception", methods=["GET", "POST"]
+)
+@admin_required
+def schedule_exception(schedule_type, scheduled_date):
+    if schedule_type not in SCHEDULE_TYPES:
+        abort(404)
+    try:
+        original_date = date.fromisoformat(scheduled_date)
+    except ValueError:
+        abort(404)
+    scheduled = scheduled_net_for_date(schedule_type, original_date)
+    if scheduled is None:
+        abort(404)
+
+    db = get_db()
+    existing_net = db.execute(
+        """SELECT id FROM nets WHERE schedule_type=?
+           AND COALESCE(scheduled_date,net_date)=?""",
+        (schedule_type, scheduled_date),
+    ).fetchone()
+    if existing_net:
+        flash("Termina ni mogoče spreminjati, ker dnevnik že obstaja.", "warning")
+        return redirect(url_for("net_detail", net_id=existing_net["id"]))
+
+    exception = get_schedule_exception(schedule_type, scheduled_date, db)
+    if request.method == "POST":
+        action = request.form.get("action", "").strip()
+        reason = request.form.get("reason", "").strip()
+        new_date = request.form.get("new_date", "").strip() or None
+        new_time = request.form.get("new_time", "").strip() or None
+        errors = []
+        if action not in {"canceled", "postponed"}:
+            errors.append("Izberi odpoved ali prestavitev.")
+        if len(reason) < 10:
+            errors.append("Razlog mora imeti najmanj 10 znakov.")
+        if action == "postponed":
+            try:
+                datetime.strptime(f"{new_date} {new_time}", "%Y-%m-%d %H:%M")
+            except (TypeError, ValueError):
+                errors.append("Vnesi veljaven novi datum in uro.")
+        else:
+            new_date = None
+            new_time = None
+
+        if errors:
+            for error in errors:
+                flash(error, "danger")
+        elif exception:
+            db.execute(
+                """UPDATE schedule_exceptions
+                   SET action=?, new_date=?, new_time=?, reason=?,
+                       updated_by=?, updated_at=? WHERE id=?""",
+                (
+                    action,
+                    new_date,
+                    new_time,
+                    reason[:1000],
+                    g.user["id"],
+                    now_db(),
+                    exception["id"],
+                ),
+            )
+            db.commit()
+            audit(
+                "update",
+                "schedule_exception",
+                exception["id"],
+                json.dumps(
+                    {
+                        "schedule_type": schedule_type,
+                        "scheduled_date": scheduled_date,
+                        "action": action,
+                        "new_date": new_date,
+                        "new_time": new_time,
+                        "reason": reason,
+                    },
+                    ensure_ascii=False,
+                ),
+            )
+            flash("Sprememba termina je shranjena.", "success")
+            return redirect(url_for("dashboard"))
+        else:
+            cursor = db.execute(
+                """INSERT INTO schedule_exceptions
+                   (schedule_type, scheduled_date, action, new_date, new_time,
+                    reason, created_by, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    schedule_type,
+                    scheduled_date,
+                    action,
+                    new_date,
+                    new_time,
+                    reason[:1000],
+                    g.user["id"],
+                    now_db(),
+                ),
+            )
+            db.commit()
+            audit(
+                "create",
+                "schedule_exception",
+                cursor.lastrowid,
+                json.dumps(
+                    {
+                        "schedule_type": schedule_type,
+                        "scheduled_date": scheduled_date,
+                        "action": action,
+                        "new_date": new_date,
+                        "new_time": new_time,
+                        "reason": reason,
+                    },
+                    ensure_ascii=False,
+                ),
+            )
+            flash("Sprememba termina je shranjena.", "success")
+            return redirect(url_for("dashboard"))
+
+    return render_template(
+        "schedule_exception.html", scheduled=scheduled, exception=exception
+    )
+
+
+@app.post("/schedule/<schedule_type>/<scheduled_date>/exception/delete")
+@admin_required
+def delete_schedule_exception(schedule_type, scheduled_date):
+    if schedule_type not in SCHEDULE_TYPES:
+        abort(404)
+    db = get_db()
+    exception = get_schedule_exception(schedule_type, scheduled_date, db)
+    if exception is None:
+        abort(404)
+    db.execute("DELETE FROM schedule_exceptions WHERE id=?", (exception["id"],))
+    db.commit()
+    audit(
+        "delete",
+        "schedule_exception",
+        exception["id"],
+        json.dumps(
+            {
+                "schedule_type": schedule_type,
+                "scheduled_date": scheduled_date,
+                "action": exception["action"],
+                "reason": exception["reason"],
+            },
+            ensure_ascii=False,
+        ),
+    )
+    flash("Redni termin je ponovno nastavljen po običajnem urniku.", "success")
+    return redirect(url_for("dashboard"))
 
 
 @app.post("/nets/new")
@@ -542,11 +824,26 @@ def new_net():
     repeater = None
     control_callsign = None
     if schedule_type:
-        scheduled_info = scheduled_net_for_date(schedule_type, parsed_start.date())
-        if scheduled_info is None or started_time != scheduled_info["time"]:
+        scheduled_date = request.form.get("scheduled_date", net_date)
+        try:
+            original_date = date.fromisoformat(scheduled_date)
+        except ValueError:
+            flash("Prvotni datum rednega skeda ni veljaven.", "danger")
+            return redirect(url_for("dashboard"))
+        scheduled_info = scheduled_net_for_date(schedule_type, original_date)
+        if scheduled_info is None:
             flash("Datum ali ura ne ustrezata pravilom izbranega rednega skeda.", "danger")
             return redirect(url_for("dashboard"))
+        effective_info = apply_schedule_exception(scheduled_info)
+        if effective_info["exception_action"] == "canceled":
+            flash("Ta redni sked je odpovedan in dnevnika ni mogoče odpreti.", "warning")
+            return redirect(url_for("dashboard"))
+        if net_date != effective_info["date"] or started_time != effective_info["time"]:
+            flash("Datum ali ura ne ustrezata veljavnemu terminu rednega skeda.", "danger")
+            return redirect(url_for("dashboard"))
         title = scheduled_info["title"]
+        if effective_info["exception_action"] == "postponed":
+            title += f" (prestavljen na {parsed_start.strftime('%d. %m. %Y')})"
         repeater = scheduled_info["repeater"]
         control_callsign = scheduled_info["control_callsign"]
         open_date = regular_net_open_date(parsed_start.date())
@@ -567,8 +864,9 @@ def new_net():
     db = get_db()
     if schedule_type:
         existing = db.execute(
-            "SELECT id FROM nets WHERE schedule_type=? AND net_date=?",
-            (schedule_type, net_date),
+            """SELECT id FROM nets WHERE schedule_type=?
+               AND COALESCE(scheduled_date,net_date)=?""",
+            (schedule_type, scheduled_date),
         ).fetchone()
         if existing:
             flash("Dnevnik za ta redni sked že obstaja.", "warning")
@@ -577,12 +875,13 @@ def new_net():
     try:
         cur = db.execute(
             """INSERT INTO nets
-               (title, net_date, started_at, status, leader_id, schedule_type,
+               (title, net_date, scheduled_date, started_at, status, leader_id, schedule_type,
                 repeater, control_callsign, created_at)
-               VALUES (?, ?, ?, 'open', ?, ?, ?, ?, ?)""",
+               VALUES (?, ?, ?, ?, 'open', ?, ?, ?, ?, ?)""",
             (
                 title[:120],
                 net_date,
+                scheduled_date if schedule_type else None,
                 f"{net_date} {started_time}:00",
                 g.user["id"],
                 schedule_type,
@@ -596,8 +895,9 @@ def new_net():
         db.rollback()
         if schedule_type:
             existing = db.execute(
-                "SELECT id FROM nets WHERE schedule_type=? AND net_date=?",
-                (schedule_type, net_date),
+                """SELECT id FROM nets WHERE schedule_type=?
+                   AND COALESCE(scheduled_date,net_date)=?""",
+                (schedule_type, scheduled_date),
             ).fetchone()
             if existing:
                 flash("Dnevnik za ta redni sked že obstaja.", "warning")
@@ -1249,7 +1549,7 @@ TEMPLATES = {
 *{box-sizing:border-box}body{margin:0;font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;color:var(--text);background:#f5f7f9}
 header{background:linear-gradient(135deg,var(--blue2),var(--blue));color:white;box-shadow:0 2px 8px #0003}.nav{max-width:1100px;margin:auto;padding:14px 18px;display:flex;align-items:center;gap:18px;flex-wrap:wrap}.brand{font-weight:800;font-size:1.12rem;margin-right:auto}.nav a,.link-button{color:white;text-decoration:none;font-weight:650;background:none;border:0;padding:0;cursor:pointer;font:inherit}.user{font-size:.9rem;opacity:.9}
 main{max-width:1100px;margin:24px auto;padding:0 16px}.card{background:white;border:1px solid var(--line);border-radius:14px;padding:20px;margin-bottom:18px;box-shadow:0 2px 10px #1020300c}.card h1,.card h2{margin-top:0}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:16px}.actions{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
-.schedule-box{border:1px solid var(--line);border-radius:12px;padding:16px;background:var(--light)}.schedule-box h2{margin:10px 0 8px}
+.schedule-box{border:1px solid var(--line);border-radius:12px;padding:16px;background:var(--light)}.schedule-box h2{margin:10px 0 8px}.canceled{background:#fee4e2;color:#8f1d14}.postponed{background:#fff1c7;color:#704b00}.exception-note{padding:11px;border-radius:9px;background:#fff8e5}.exception-login{padding:10px;border-radius:9px;background:#ffffff18}
 .countdown-card{background:linear-gradient(135deg,var(--blue2),var(--blue));color:white}.countdown-card .muted{color:#dbeeff}.countdown-value{font-size:clamp(1.8rem,6vw,3.2rem);font-weight:850;letter-spacing:.03em;margin:8px 0}
 .footer{max-width:1100px;margin:0 auto;padding:2px 16px 22px;text-align:center;color:#65717c;font-size:.85rem}.alpha-banner{background:#f5a800;color:#2b2100;padding:10px 16px;text-align:center;font-weight:850;letter-spacing:.03em}
 label{display:block;font-weight:700;margin:0 0 6px}.field{margin-bottom:14px}input,select,textarea{width:100%;padding:11px 12px;border:1px solid #aebdca;border-radius:9px;background:white;font:inherit}input:focus,select:focus,textarea:focus{outline:3px solid #bddcff;border-color:var(--blue)}textarea{min-height:120px;resize:vertical}
@@ -1293,6 +1593,20 @@ table{width:100%;border-collapse:collapse}th,td{text-align:left;padding:11px 9px
 "user_form.html": r'''{% extends "base.html" %}{% block content %}<div class="card"><h1>{{ 'Uredi uporabnika' if edit_user else 'Novi uporabnik' }}</h1><form method="post"><input type="hidden" name="csrf_token" value="{{ csrf_token }}">{% if not edit_user %}<div class="field"><label>Uporabniško ime</label><input name="username" required autocomplete="off"></div>{% else %}<p>Uporabniško ime: <b>{{ edit_user['username'] }}</b></p>{% endif %}<div class="grid"><div class="field"><label>Ime in priimek</label><input name="full_name" value="{{ edit_user['full_name'] if edit_user else '' }}" required></div><div class="field"><label>Klicni znak</label><input name="callsign" value="{{ edit_user['callsign'] if edit_user else '' }}" required style="text-transform:uppercase"></div><div class="field"><label>Vloga</label><select name="role"><option value="leader" {% if edit_user and edit_user['role']=='leader' %}selected{% endif %}>Vodja skeda</option><option value="admin" {% if edit_user and edit_user['role']=='admin' %}selected{% endif %}>Administrator</option></select></div></div><div class="field"><label>{{ 'Novo geslo (pusti prazno, če ga ne spreminjaš)' if edit_user else 'Začasno geslo (najmanj 10 znakov)' }}</label><input type="password" name="password" {% if not edit_user %}required{% endif %} autocomplete="new-password"></div>{% if edit_user %}<div class="field"><label><input style="width:auto" type="checkbox" name="active" value="1" {% if edit_user['active'] %}checked{% endif %}> Aktiven uporabnik</label></div>{% endif %}<div class="actions"><button class="btn btn-primary">Shrani</button><a class="btn btn-secondary" href="{{ url_for('users') }}">Prekliči</a></div></form></div>{% endblock %}''',
 "change_password.html": r'''{% extends "base.html" %}{% block content %}<div class="card" style="max-width:520px"><h1>Spremeni geslo</h1><form method="post"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><div class="field"><label>Trenutno geslo</label><input type="password" name="current_password" required></div><div class="field"><label>Novo geslo (najmanj 10 znakov)</label><input type="password" name="new_password" required></div><div class="field"><label>Ponovi novo geslo</label><input type="password" name="confirm_password" required></div><button class="btn btn-primary">Spremeni geslo</button></form></div>{% endblock %}'''
 }
+
+TEMPLATES.update({
+"login_v2.html": r'''{% extends "base.html" %}{% block title %}Prijava · {{ app_name }}{% endblock %}{% block content %}
+<div class="card login"><h1>📻 S50TTT</h1><h2>Dnevnik skedov</h2><p class="muted">Prijava za vodje skeda</p><form method="post"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><div class="field"><label>Uporabniško ime</label><input name="username" autocomplete="username" required autofocus></div><div class="field"><label>Geslo</label><input type="password" name="password" autocomplete="current-password" required></div><button class="btn btn-primary" type="submit">Prijava</button></form></div>
+<div class="card countdown-card login-schedule" data-countdown="{{ countdown_net['starts_at_iso'] }}"><p class="muted">Do naslednjega rednega skeda</p><div class="countdown-value" data-countdown-value>Izračunavam …</div><p><b>{{ countdown_net['label'] }}</b><br>{{ countdown_net['date']|date_si }} ob {{ countdown_net['time'] }}{% if countdown_net['repeater'] %} · {{ countdown_net['repeater'] }}{% endif %}</p>{% if countdown_net['exception_action']=='postponed' %}<p class="exception-login">Prestavljen s {{ countdown_net['original_date']|date_si }}. Razlog: {{ countdown_net['exception_reason'] }}</p>{% endif %}<div class="login-stats"><div class="login-stat"><span>Redni sobotni sked</span><strong>št. {{ next_saturday['sequence_number'] }}</strong><small>{{ next_saturday['date']|date_si }} ob {{ next_saturday['time'] }}<br>{{ next_saturday['repeater'] }}</small>{% if next_saturday['exception_action']=='postponed' %}<small>Prestavljen s {{ next_saturday['original_date']|date_si }}</small>{% endif %}</div><div class="login-stat" data-participant-count="{{ saturday_participant_count }}"><span>Prijavljenih</span><strong>{{ saturday_participant_count }}</strong><small>v dnevniku tega skeda</small></div></div>{% if recent_saturdays %}<p class="login-history-title">Zadnja zaključena sobotna skeda</p><div class="login-stats">{% for saturday in recent_saturdays %}<div class="login-stat" data-history-count="{{ saturday['participant_count'] }}"><span>Sobotni sked</span><strong>št. {{ saturday['sequence_number'] }}</strong><span class="login-history-count">{{ saturday['participant_count'] }} prijavljenih</span><small>{{ saturday['net_date']|date_si }}</small></div>{% endfor %}</div>{% endif %}</div>
+<script>(function(){const card=document.querySelector('[data-countdown]');if(!card)return;const output=card.querySelector('[data-countdown-value]');const target=Date.parse(card.dataset.countdown);function pad(value){return String(value).padStart(2,'0')}function update(){const remaining=target-Date.now();if(remaining<=0){output.textContent='Sked se je začel';return}const total=Math.floor(remaining/1000);const days=Math.floor(total/86400);const hours=Math.floor((total%86400)/3600);const minutes=Math.floor((total%3600)/60);const seconds=total%60;output.textContent=(days?days+' dni · ':'')+pad(hours)+':'+pad(minutes)+':'+pad(seconds)}update();setInterval(update,1000)})();</script>{% endblock %}''',
+"dashboard_v2.html": r'''{% extends "base.html" %}{% block content %}
+<div class="card"><h1>Naslednji redni skedi</h1><p class="muted">Portal samodejno upošteva mesečni in sezonski sobotni urnik Radiokluba Sevnica.</p><div class="grid">{% for s in scheduled_nets %}<div class="schedule-box"><span class="badge leader">{{ 'Mesečni' if s['schedule_type']=='monthly' else 'Sobotni' }}</span>{% if s['exception_action']=='canceled' %} <span class="badge canceled">Odpovedan</span>{% elif s['exception_action']=='postponed' %} <span class="badge postponed">Prestavljen</span>{% endif %}{% if s['existing_status'] %} <span class="badge {{ s['existing_status'] }}">{{ 'Odprt' if s['existing_status']=='open' else 'Zaključen' }}</span>{% endif %}<h2>{{ s['label'] }}</h2><p><b>{{ s['date']|date_si }}</b> ob {{ s['time'] }}<br>Upravna postaja: <b>{{ s['control_callsign'] }}</b>{% if s['repeater'] %}<br>Repetitor: {{ s['repeater'] }}{% endif %}</p>{% if s['exception_action']=='postponed' %}<p class="exception-note"><b>Prvotni termin:</b> {{ s['original_date']|date_si }} ob {{ s['original_time'] }}<br><b>Razlog:</b> {{ s['exception_reason'] }}</p>{% elif s['exception_action']=='canceled' %}<p class="exception-note"><b>Razlog odpovedi:</b> {{ s['exception_reason'] }}</p>{% else %}<p class="muted">{{ s['rule'] }}</p>{% endif %}<div class="actions">{% if s['existing_id'] %}<a class="btn btn-primary" href="{{ url_for('net_detail',net_id=s['existing_id']) }}">Odpri obstoječi dnevnik</a>{% elif s['exception_action']!='canceled' %}<form method="post" action="{{ url_for('new_net') }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="schedule_type" value="{{ s['schedule_type'] }}"><input type="hidden" name="scheduled_date" value="{{ s['original_date'] }}"><input type="hidden" name="net_date" value="{{ s['date'] }}"><input type="hidden" name="started_time" value="{{ s['time'] }}">{% if s['can_open'] %}<button class="btn btn-primary">Odpri ta dnevnik</button>{% else %}<input type="hidden" name="early_unlock" value="0" data-early-unlock><button type="button" class="btn btn-locked" data-early-open aria-disabled="true">Odpri ta dnevnik</button>{% endif %}</form>{% endif %}{% if g.user['role']=='admin' and not s['existing_id'] %}<a class="btn btn-secondary" href="{{ url_for('schedule_exception',schedule_type=s['schedule_type'],scheduled_date=s['original_date']) }}">{{ 'Uredi spremembo' if s['exception_action'] else 'Odpovej ali prestavi' }}</a>{% endif %}</div></div>{% endfor %}</div></div>
+<script>(function(){document.querySelectorAll('[data-early-open]').forEach(function(button){let presses=0;let resetTimer;const original=button.textContent;button.addEventListener('click',function(){presses+=1;clearTimeout(resetTimer);if(presses>=5){button.form.querySelector('[data-early-unlock]').value='1';alert('Ti si pravi Heker 😄');button.textContent='Odpiram …';button.form.requestSubmit();return}button.textContent='Še '+(5-presses)+'× pritisni';resetTimer=setTimeout(function(){presses=0;button.textContent=original},4000)})})})();</script>
+<div class="card"><h2>Drug ali izredni sked</h2><p class="muted">Po potrebi odpri dnevnik z ročno izbranim datumom in uro.</p><form method="post" action="{{ url_for('new_net') }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><div class="grid"><div class="field"><label>Naslov (neobvezno)</label><input name="title" placeholder="Samodejno: Sked DD. MM. LLLL"></div><div class="field"><label>Datum</label><input type="date" name="net_date" value="{{ now_local_value if now_local_value else '' }}" required></div><div class="field"><label>Začetna ura</label><input type="time" name="started_time" value="{{ current_time if current_time else '' }}" required></div></div><button class="btn btn-secondary">＋ Odpri izredni sked</button></form></div>
+{% if open_nets %}<h2>Odprti skedi</h2><div class="grid">{% for n in open_nets %}<div class="card"><span class="badge open">Odprt</span><h2>{{ n['title'] }}</h2><p><b>{{ n['net_date']|date_si }}</b> ob {{ n['started_at']|time_si }}<br>Vodja: {{ n['leader_name'] }} ({{ n['leader_callsign'] }})</p><p><span class="big-number">{{ n['participant_count'] }}</span> prijavljenih</p><a class="btn btn-primary" href="{{ url_for('net_detail',net_id=n['id']) }}">Odpri dnevnik</a></div>{% endfor %}</div>{% endif %}
+<div class="card"><div class="actions"><h2>Zadnji zaključeni skedi</h2><a class="btn btn-secondary right" href="{{ url_for('archive') }}">Celoten arhiv</a></div>{% if recent %}<div class="table-wrap"><table><thead><tr><th>Sked</th><th>Vodja</th><th>Prijavljeni</th><th></th></tr></thead><tbody>{% for n in recent %}<tr><td><b>{{ n['title'] }}</b><br><span class="muted">{{ n['net_date']|date_si }} ob {{ n['started_at']|time_si }}</span></td><td>{{ n['leader_callsign'] }}</td><td>{{ n['participant_count'] }}</td><td><a class="btn btn-secondary btn-small" href="{{ url_for('net_detail',net_id=n['id']) }}">Pregled</a></td></tr>{% endfor %}</tbody></table></div>{% else %}<p class="empty">V arhivu še ni skedov.</p>{% endif %}</div>{% endblock %}''',
+"schedule_exception.html": r'''{% extends "base.html" %}{% block content %}<div class="card" style="max-width:680px"><h1>Odpovej ali prestavi redni sked</h1><p><b>{{ scheduled['label'] }}</b><br>Redni termin: {{ scheduled['date']|date_si }} ob {{ scheduled['time'] }}</p><p class="muted">Spremembo lahko naredi samo administrator. Razlog in vsaka sprememba se shranita v revizijsko sled.</p><form method="post"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><div class="field"><label>Sprememba</label><select name="action" id="exception-action" required><option value="postponed" {% if exception and exception['action']=='postponed' %}selected{% endif %}>Prestavi na drug termin</option><option value="canceled" {% if exception and exception['action']=='canceled' %}selected{% endif %}>Odpovej sked</option></select></div><div id="postponed-fields" class="grid"><div class="field"><label>Novi datum</label><input type="date" name="new_date" value="{{ exception['new_date'] if exception and exception['new_date'] else scheduled['date'] }}"></div><div class="field"><label>Nova ura</label><input type="time" name="new_time" value="{{ exception['new_time'] if exception and exception['new_time'] else scheduled['time'] }}"></div></div><div class="field"><label>Razlog</label><textarea name="reason" minlength="10" maxlength="1000" required placeholder="Na primer: dogodek kluba, praznik, tehnične težave …">{{ exception['reason'] if exception else '' }}</textarea><small class="muted">Najmanj 10 znakov.</small></div><div class="actions"><button class="btn btn-primary">Shrani spremembo</button><a class="btn btn-secondary" href="{{ url_for('dashboard') }}">Prekliči</a></div></form>{% if exception %}<div class="danger-zone"><form method="post" action="{{ url_for('delete_schedule_exception',schedule_type=scheduled['schedule_type'],scheduled_date=scheduled['date']) }}" onsubmit="return confirm('Odstranim spremembo in povrnem običajni termin?')"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="btn btn-danger">Razveljavi spremembo</button></form></div>{% endif %}</div><script>(function(){const action=document.getElementById('exception-action');const fields=document.getElementById('postponed-fields');function update(){fields.hidden=action.value!=='postponed';fields.querySelectorAll('input').forEach(function(input){input.required=action.value==='postponed'})}action.addEventListener('change',update);update()})();</script>{% endblock %}'''
+})
 
 app.jinja_loader = DictLoader(TEMPLATES)
 
