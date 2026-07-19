@@ -2,7 +2,7 @@ import hmac
 import os
 import secrets
 import sqlite3
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from functools import wraps
 from zoneinfo import ZoneInfo
 
@@ -17,6 +17,9 @@ from werkzeug.security import check_password_hash, generate_password_hash
 APP_NAME = "S50TTT Dnevnik skedov"
 DB_PATH = os.environ.get("DATABASE_PATH", "/app/data/skedi.db")
 TIMEZONE = ZoneInfo(os.environ.get("TZ", "Europe/Ljubljana"))
+SCHEDULE_MONTHLY = "monthly"
+SCHEDULE_SATURDAY = "saturday"
+SCHEDULE_TYPES = {SCHEDULE_MONTHLY, SCHEDULE_SATURDAY}
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY") or secrets.token_hex(32)
@@ -36,13 +39,74 @@ def now_db():
     return now_local().strftime("%Y-%m-%d %H:%M:%S")
 
 
+def first_weekday_of_month(year, month, weekday):
+    first = date(year, month, 1)
+    return first + timedelta(days=(weekday - first.weekday()) % 7)
+
+
+def next_month(year, month):
+    return (year + 1, 1) if month == 12 else (year, month + 1)
+
+
+def saturday_start_time(net_date):
+    return "21:00" if 6 <= net_date.month <= 8 else "20:00"
+
+
+def scheduled_net_for_date(schedule_type, net_date):
+    if schedule_type == SCHEDULE_MONTHLY:
+        if net_date != first_weekday_of_month(net_date.year, net_date.month, 3):
+            return None
+        return {
+            "schedule_type": SCHEDULE_MONTHLY,
+            "label": "Mesečni sked Radiokluba Sevnica",
+            "title": f"Mesečni sked S50TTT – {net_date.strftime('%d. %m. %Y')}",
+            "date": net_date.isoformat(),
+            "time": "19:00",
+            "rule": "Prvi četrtek v mesecu ob 19.00",
+            "repeater": None,
+            "control_callsign": "S50TTT",
+        }
+    if schedule_type == SCHEDULE_SATURDAY:
+        if net_date.weekday() != 5:
+            return None
+        return {
+            "schedule_type": SCHEDULE_SATURDAY,
+            "label": "Sobotni sked prek repetitorja S55USX",
+            "title": f"Sobotni sked S50TTT prek S55USX – {net_date.strftime('%d. %m. %Y')}",
+            "date": net_date.isoformat(),
+            "time": saturday_start_time(net_date),
+            "rule": "Vsako soboto; poleti ob 21.00, sicer ob 20.00",
+            "repeater": "S55USX – Sv. Rok",
+            "control_callsign": "S50TTT",
+        }
+    return None
+
+
+def next_scheduled_nets(reference=None):
+    reference = reference or now_local()
+
+    monthly_date = first_weekday_of_month(reference.year, reference.month, 3)
+    if monthly_date < reference.date():
+        year, month = next_month(reference.year, reference.month)
+        monthly_date = first_weekday_of_month(year, month, 3)
+
+    saturday_date = reference.date() + timedelta(days=(5 - reference.weekday()) % 7)
+
+    scheduled = [
+        scheduled_net_for_date(SCHEDULE_MONTHLY, monthly_date),
+        scheduled_net_for_date(SCHEDULE_SATURDAY, saturday_date),
+    ]
+    return sorted(scheduled, key=lambda item: (item["date"], item["time"]))
+
+
 def get_db():
     if "db" not in g:
         os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
-        g.db = sqlite3.connect(DB_PATH)
+        g.db = sqlite3.connect(DB_PATH, timeout=30)
         g.db.row_factory = sqlite3.Row
         g.db.execute("PRAGMA foreign_keys = ON")
         g.db.execute("PRAGMA journal_mode = WAL")
+        g.db.execute("PRAGMA busy_timeout = 30000")
     return g.db
 
 
@@ -76,6 +140,9 @@ def init_db():
             ended_at TEXT,
             status TEXT NOT NULL DEFAULT 'open' CHECK(status IN ('open', 'closed')),
             leader_id INTEGER NOT NULL REFERENCES users(id),
+            schedule_type TEXT,
+            repeater TEXT,
+            control_callsign TEXT,
             created_at TEXT NOT NULL
         );
 
@@ -105,6 +172,23 @@ def init_db():
         CREATE INDEX IF NOT EXISTS idx_nets_date ON nets(net_date DESC);
         CREATE INDEX IF NOT EXISTS idx_participants_net ON participants(net_id, checkin_at);
         """
+    )
+
+    net_columns = {row["name"] for row in db.execute("PRAGMA table_info(nets)")}
+    for column, declaration in {
+        "schedule_type": "TEXT",
+        "repeater": "TEXT",
+        "control_callsign": "TEXT",
+    }.items():
+        if column not in net_columns:
+            try:
+                db.execute(f"ALTER TABLE nets ADD COLUMN {column} {declaration}")
+            except sqlite3.OperationalError as error:
+                if "duplicate column name" not in str(error).lower():
+                    raise
+    db.execute(
+        """CREATE UNIQUE INDEX IF NOT EXISTS idx_nets_schedule_date
+           ON nets(schedule_type, net_date) WHERE schedule_type IS NOT NULL"""
     )
     db.commit()
 
@@ -222,6 +306,16 @@ def logout():
 @login_required
 def dashboard():
     db = get_db()
+    scheduled_nets = next_scheduled_nets()
+    for scheduled in scheduled_nets:
+        existing = db.execute(
+            """SELECT id, status FROM nets
+               WHERE schedule_type=? AND net_date=?""",
+            (scheduled["schedule_type"], scheduled["date"]),
+        ).fetchone()
+        scheduled["existing_id"] = existing["id"] if existing else None
+        scheduled["existing_status"] = existing["status"] if existing else None
+
     open_nets = db.execute(
         """SELECT n.*, u.full_name AS leader_name, u.callsign AS leader_callsign,
                   COUNT(p.id) AS participant_count
@@ -236,7 +330,12 @@ def dashboard():
            LEFT JOIN participants p ON p.net_id=n.id
            WHERE n.status='closed' GROUP BY n.id ORDER BY n.started_at DESC LIMIT 15"""
     ).fetchall()
-    return render_template("dashboard.html", open_nets=open_nets, recent=recent)
+    return render_template(
+        "dashboard.html",
+        open_nets=open_nets,
+        recent=recent,
+        scheduled_nets=scheduled_nets,
+    )
 
 
 @app.post("/nets/new")
@@ -246,20 +345,70 @@ def new_net():
     net_date = request.form.get("net_date", current.strftime("%Y-%m-%d"))
     started_time = request.form.get("started_time", current.strftime("%H:%M"))
     try:
-        datetime.strptime(f"{net_date} {started_time}", "%Y-%m-%d %H:%M")
+        parsed_start = datetime.strptime(f"{net_date} {started_time}", "%Y-%m-%d %H:%M")
     except ValueError:
         flash("Datum ali ura nista veljavna.", "danger")
         return redirect(url_for("dashboard"))
-    title = request.form.get("title", "").strip()
-    if not title:
-        title = f"Sked {datetime.strptime(net_date, '%Y-%m-%d').strftime('%d. %m. %Y')}"
+
+    schedule_type = request.form.get("schedule_type", "").strip() or None
+    if schedule_type and schedule_type not in SCHEDULE_TYPES:
+        abort(400, "Neveljavna vrsta rednega skeda.")
+
+    scheduled_info = None
+    repeater = None
+    control_callsign = None
+    if schedule_type:
+        scheduled_info = scheduled_net_for_date(schedule_type, parsed_start.date())
+        if scheduled_info is None or started_time != scheduled_info["time"]:
+            flash("Datum ali ura ne ustrezata pravilom izbranega rednega skeda.", "danger")
+            return redirect(url_for("dashboard"))
+        title = scheduled_info["title"]
+        repeater = scheduled_info["repeater"]
+        control_callsign = scheduled_info["control_callsign"]
+    else:
+        title = request.form.get("title", "").strip()
+        if not title:
+            title = f"Sked {parsed_start.strftime('%d. %m. %Y')}"
+
     db = get_db()
-    cur = db.execute(
-        """INSERT INTO nets(title, net_date, started_at, status, leader_id, created_at)
-           VALUES (?, ?, ?, 'open', ?, ?)""",
-        (title[:120], net_date, f"{net_date} {started_time}:00", g.user["id"], now_db()),
-    )
-    db.commit()
+    if schedule_type:
+        existing = db.execute(
+            "SELECT id FROM nets WHERE schedule_type=? AND net_date=?",
+            (schedule_type, net_date),
+        ).fetchone()
+        if existing:
+            flash("Dnevnik za ta redni sked že obstaja.", "warning")
+            return redirect(url_for("net_detail", net_id=existing["id"]))
+
+    try:
+        cur = db.execute(
+            """INSERT INTO nets
+               (title, net_date, started_at, status, leader_id, schedule_type,
+                repeater, control_callsign, created_at)
+               VALUES (?, ?, ?, 'open', ?, ?, ?, ?, ?)""",
+            (
+                title[:120],
+                net_date,
+                f"{net_date} {started_time}:00",
+                g.user["id"],
+                schedule_type,
+                repeater,
+                control_callsign,
+                now_db(),
+            ),
+        )
+        db.commit()
+    except sqlite3.IntegrityError:
+        db.rollback()
+        if schedule_type:
+            existing = db.execute(
+                "SELECT id FROM nets WHERE schedule_type=? AND net_date=?",
+                (schedule_type, net_date),
+            ).fetchone()
+            if existing:
+                flash("Dnevnik za ta redni sked že obstaja.", "warning")
+                return redirect(url_for("net_detail", net_id=existing["id"]))
+        raise
     audit("create", "net", cur.lastrowid, title)
     flash("Novi sked je odprt.", "success")
     return redirect(url_for("net_detail", net_id=cur.lastrowid))
@@ -543,6 +692,7 @@ TEMPLATES = {
 *{box-sizing:border-box}body{margin:0;font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;color:var(--text);background:#f5f7f9}
 header{background:linear-gradient(135deg,var(--blue2),var(--blue));color:white;box-shadow:0 2px 8px #0003}.nav{max-width:1100px;margin:auto;padding:14px 18px;display:flex;align-items:center;gap:18px;flex-wrap:wrap}.brand{font-weight:800;font-size:1.12rem;margin-right:auto}.nav a,.link-button{color:white;text-decoration:none;font-weight:650;background:none;border:0;padding:0;cursor:pointer;font:inherit}.user{font-size:.9rem;opacity:.9}
 main{max-width:1100px;margin:24px auto;padding:0 16px}.card{background:white;border:1px solid var(--line);border-radius:14px;padding:20px;margin-bottom:18px;box-shadow:0 2px 10px #1020300c}.card h1,.card h2{margin-top:0}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:16px}.actions{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+.schedule-box{border:1px solid var(--line);border-radius:12px;padding:16px;background:var(--light)}.schedule-box h2{margin:10px 0 8px}
 label{display:block;font-weight:700;margin:0 0 6px}.field{margin-bottom:14px}input,select{width:100%;padding:11px 12px;border:1px solid #aebdca;border-radius:9px;background:white;font:inherit}input:focus,select:focus{outline:3px solid #bddcff;border-color:var(--blue)}
 .btn{display:inline-block;border:0;border-radius:9px;padding:10px 15px;font-weight:750;cursor:pointer;text-decoration:none;font:inherit}.btn-primary{background:var(--blue);color:white}.btn-primary:hover{background:var(--blue2)}.btn-secondary{background:#e6edf3;color:#1d2b36}.btn-danger{background:#fee4e2;color:var(--danger)}.btn-success{background:#daf5e6;color:#075f34}.btn-small{padding:7px 10px;font-size:.9rem}
 table{width:100%;border-collapse:collapse}th,td{text-align:left;padding:11px 9px;border-bottom:1px solid var(--line)}th{background:var(--light);font-size:.88rem}tr:last-child td{border-bottom:0}.table-wrap{overflow-x:auto}.badge{display:inline-block;padding:4px 9px;border-radius:999px;font-size:.8rem;font-weight:750}.open{background:#d8f3e5;color:#075f34}.closed{background:#e7ebef;color:#45525d}.admin{background:#e5ddff;color:#4f2c90}.leader{background:#ddebfa;color:#164f7c}
@@ -555,17 +705,18 @@ table{width:100%;border-collapse:collapse}th,td{text-align:left;padding:11px 9px
 </body></html>''',
 "login.html": r'''{% extends "base.html" %}{% block title %}Prijava · {{ app_name }}{% endblock %}{% block content %}<div class="card login"><h1>📻 S50TTT</h1><h2>Dnevnik skedov</h2><p class="muted">Prijava za vodje skeda</p><form method="post"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><div class="field"><label>Uporabniško ime</label><input name="username" autocomplete="username" required autofocus></div><div class="field"><label>Geslo</label><input type="password" name="password" autocomplete="current-password" required></div><button class="btn btn-primary" type="submit">Prijava</button></form></div>{% endblock %}''',
 "dashboard.html": r'''{% extends "base.html" %}{% block content %}
-<div class="card"><h1>Dnevnik skedov</h1><p class="muted">Odpri nov dnevnik za današnji sked.</p><form method="post" action="{{ url_for('new_net') }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><div class="grid"><div class="field"><label>Naslov (neobvezno)</label><input name="title" placeholder="Samodejno: Sked DD. MM. LLLL"></div><div class="field"><label>Datum</label><input type="date" name="net_date" value="{{ now_local_value if now_local_value else '' }}" required></div><div class="field"><label>Začetna ura</label><input type="time" name="started_time" value="{{ current_time if current_time else '' }}" required></div></div><button class="btn btn-primary">＋ Novi sked</button></form></div>
+<div class="card"><h1>Naslednji redni skedi</h1><p class="muted">Portal samodejno upošteva mesečni in sezonski sobotni urnik Radiokluba Sevnica.</p><div class="grid">{% for s in scheduled_nets %}<div class="schedule-box"><span class="badge leader">{{ 'Mesečni' if s['schedule_type']=='monthly' else 'Sobotni' }}</span>{% if s['existing_status'] %} <span class="badge {{ s['existing_status'] }}">{{ 'Odprt' if s['existing_status']=='open' else 'Zaključen' }}</span>{% endif %}<h2>{{ s['label'] }}</h2><p><b>{{ s['date']|date_si }}</b> ob {{ s['time'] }}<br>Upravna postaja: <b>{{ s['control_callsign'] }}</b>{% if s['repeater'] %}<br>Repetitor: {{ s['repeater'] }}{% endif %}</p><p class="muted">{{ s['rule'] }}</p>{% if s['existing_id'] %}<a class="btn btn-primary" href="{{ url_for('net_detail',net_id=s['existing_id']) }}">Odpri obstoječi dnevnik</a>{% else %}<form method="post" action="{{ url_for('new_net') }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="schedule_type" value="{{ s['schedule_type'] }}"><input type="hidden" name="net_date" value="{{ s['date'] }}"><input type="hidden" name="started_time" value="{{ s['time'] }}"><button class="btn btn-primary">Odpri ta dnevnik</button></form>{% endif %}</div>{% endfor %}</div></div>
+<div class="card"><h2>Drug ali izredni sked</h2><p class="muted">Po potrebi odpri dnevnik z ročno izbranim datumom in uro.</p><form method="post" action="{{ url_for('new_net') }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><div class="grid"><div class="field"><label>Naslov (neobvezno)</label><input name="title" placeholder="Samodejno: Sked DD. MM. LLLL"></div><div class="field"><label>Datum</label><input type="date" name="net_date" value="{{ now_local_value if now_local_value else '' }}" required></div><div class="field"><label>Začetna ura</label><input type="time" name="started_time" value="{{ current_time if current_time else '' }}" required></div></div><button class="btn btn-secondary">＋ Odpri izredni sked</button></form></div>
 {% if open_nets %}<h2>Odprti skedi</h2><div class="grid">{% for n in open_nets %}<div class="card"><span class="badge open">Odprt</span><h2>{{ n['title'] }}</h2><p><b>{{ n['net_date']|date_si }}</b> ob {{ n['started_at']|time_si }}<br>Vodja: {{ n['leader_name'] }} ({{ n['leader_callsign'] }})</p><p><span class="big-number">{{ n['participant_count'] }}</span> prijavljenih</p><a class="btn btn-primary" href="{{ url_for('net_detail',net_id=n['id']) }}">Odpri dnevnik</a></div>{% endfor %}</div>{% endif %}
 <div class="card"><div class="actions"><h2>Zadnji zaključeni skedi</h2><a class="btn btn-secondary right" href="{{ url_for('archive') }}">Celoten arhiv</a></div>{% if recent %}<div class="table-wrap"><table><thead><tr><th>Sked</th><th>Vodja</th><th>Prijavljeni</th><th></th></tr></thead><tbody>{% for n in recent %}<tr><td><b>{{ n['title'] }}</b><br><span class="muted">{{ n['net_date']|date_si }} ob {{ n['started_at']|time_si }}</span></td><td>{{ n['leader_callsign'] }}</td><td>{{ n['participant_count'] }}</td><td><a class="btn btn-secondary btn-small" href="{{ url_for('net_detail',net_id=n['id']) }}">Pregled</a></td></tr>{% endfor %}</tbody></table></div>{% else %}<p class="empty">V arhivu še ni skedov.</p>{% endif %}</div>
 {% endblock %}''',
 "net.html": r'''{% extends "base.html" %}{% block title %}{{ net['title'] }} · {{ app_name }}{% endblock %}{% block content %}
-<div class="card"><div class="actions"><div><span class="badge {{ net['status'] }}">{{ 'Odprt' if net['status']=='open' else 'Zaključen' }}</span><h1>{{ net['title'] }}</h1><p>{{ net['net_date']|date_si }} · začetek {{ net['started_at']|time_si }}{% if net['ended_at'] %} · konec {{ net['ended_at']|time_si }}{% endif %}<br>Vodja: <b>{{ net['leader_name'] }} ({{ net['leader_callsign'] }})</b></p></div><div class="actions right no-print"><button class="btn btn-secondary" onclick="window.print()">🖨 Natisni / PDF</button>{% if net['status']=='open' %}<form method="post" action="{{ url_for('close_net',net_id=net['id']) }}" onsubmit="return confirm('Zaključim ta sked?')"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="btn btn-success">✓ Zaključi sked</button></form>{% elif g.user['role']=='admin' %}<form method="post" action="{{ url_for('reopen_net',net_id=net['id']) }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="btn btn-secondary">Ponovno odpri</button></form>{% endif %}</div></div></div>
+<div class="card"><div class="actions"><div><span class="badge {{ net['status'] }}">{{ 'Odprt' if net['status']=='open' else 'Zaključen' }}</span>{% if net['schedule_type'] %} <span class="badge leader">Redni sked</span>{% endif %}<h1>{{ net['title'] }}</h1><p>{{ net['net_date']|date_si }} · začetek {{ net['started_at']|time_si }}{% if net['ended_at'] %} · konec {{ net['ended_at']|time_si }}{% endif %}{% if net['control_callsign'] %}<br>Upravna postaja: <b>{{ net['control_callsign'] }}</b>{% endif %}{% if net['repeater'] %}<br>Repetitor: <b>{{ net['repeater'] }}</b>{% endif %}<br>Operater: <b>{{ net['leader_name'] }} ({{ net['leader_callsign'] }})</b></p></div><div class="actions right no-print"><button class="btn btn-secondary" onclick="window.print()">🖨 Natisni / PDF</button>{% if net['status']=='open' %}<form method="post" action="{{ url_for('close_net',net_id=net['id']) }}" onsubmit="return confirm('Zaključim ta sked?')"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="btn btn-success">✓ Zaključi sked</button></form>{% elif g.user['role']=='admin' %}<form method="post" action="{{ url_for('reopen_net',net_id=net['id']) }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="btn btn-secondary">Ponovno odpri</button></form>{% endif %}</div></div></div>
 {% if net['status']=='open' %}<div class="card no-print"><h2>Dodaj prijavljenega</h2><form method="post" action="{{ url_for('add_participant',net_id=net['id']) }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><div class="grid"><div class="field"><label>Ime in priimek</label><input name="full_name" required autofocus autocomplete="off"></div><div class="field"><label>Klicni znak</label><input name="callsign" required autocomplete="off" style="text-transform:uppercase"></div><div class="field"><label>Ura prijave</label><input type="time" name="checkin_time" value="{{ now.strftime('%H:%M') }}" required></div></div><button class="btn btn-primary">＋ Dodaj v dnevnik</button></form></div>{% endif %}
 <div class="card"><h2>Prijavljeni: {{ participants|length }}</h2>{% if participants %}<div class="table-wrap"><table><thead><tr><th>Št.</th><th>Ura</th><th>Klicni znak</th><th>Ime in priimek</th><th class="no-print">Vnesel</th><th class="no-print"></th></tr></thead><tbody>{% for p in participants %}<tr><td>{{ loop.index }}</td><td class="nowrap">{{ p['checkin_at']|time_si }}</td><td><b>{{ p['callsign'] }}</b></td><td>{{ p['full_name'] }}</td><td class="no-print">{{ p['entered_by_name'] }}</td><td class="no-print"><div class="actions"><a class="btn btn-secondary btn-small" href="{{ url_for('edit_participant',participant_id=p['id']) }}">Uredi</a><form method="post" action="{{ url_for('delete_participant',participant_id=p['id']) }}" onsubmit="return confirm('Izbrišem {{ p['callsign'] }}?')"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="btn btn-danger btn-small">Izbriši</button></form></div></td></tr>{% endfor %}</tbody></table></div>{% else %}<p class="empty">V tem skedu še ni prijavljenih.</p>{% endif %}</div>
 {% endblock %}''',
 "participant_edit.html": r'''{% extends "base.html" %}{% block content %}<div class="card"><h1>Uredi prijavo</h1><p>{{ net['title'] }}</p><form method="post"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><div class="field"><label>Ime in priimek</label><input name="full_name" value="{{ participant['full_name'] }}" required></div><div class="field"><label>Klicni znak</label><input name="callsign" value="{{ participant['callsign'] }}" required style="text-transform:uppercase"></div><div class="field"><label>Ura prijave</label><input type="time" name="checkin_time" value="{{ participant['checkin_at']|time_si }}" required></div><div class="actions"><button class="btn btn-primary">Shrani</button><a class="btn btn-secondary" href="{{ url_for('net_detail',net_id=net['id']) }}">Prekliči</a></div></form></div>{% endblock %}''',
-"archive.html": r'''{% extends "base.html" %}{% block content %}<div class="card"><h1>Arhiv skedov</h1>{% if nets %}<div class="table-wrap"><table><thead><tr><th>Datum</th><th>Sked</th><th>Status</th><th>Vodja</th><th>Prijavljeni</th><th></th></tr></thead><tbody>{% for n in nets %}<tr><td class="nowrap">{{ n['net_date']|date_si }}</td><td><b>{{ n['title'] }}</b><br><span class="muted">{{ n['started_at']|time_si }}{% if n['ended_at'] %}–{{ n['ended_at']|time_si }}{% endif %}</span></td><td><span class="badge {{ n['status'] }}">{{ 'Odprt' if n['status']=='open' else 'Zaključen' }}</span></td><td>{{ n['leader_name'] }} ({{ n['leader_callsign'] }})</td><td>{{ n['participant_count'] }}</td><td><a class="btn btn-secondary btn-small" href="{{ url_for('net_detail',net_id=n['id']) }}">Pregled</a></td></tr>{% endfor %}</tbody></table></div>{% else %}<p class="empty">Arhiv je prazen.</p>{% endif %}</div>{% endblock %}''',
+"archive.html": r'''{% extends "base.html" %}{% block content %}<div class="card"><h1>Arhiv skedov</h1>{% if nets %}<div class="table-wrap"><table><thead><tr><th>Datum</th><th>Sked</th><th>Status</th><th>Operater</th><th>Prijavljeni</th><th></th></tr></thead><tbody>{% for n in nets %}<tr><td class="nowrap">{{ n['net_date']|date_si }}</td><td><b>{{ n['title'] }}</b><br><span class="muted">{{ n['started_at']|time_si }}{% if n['ended_at'] %}–{{ n['ended_at']|time_si }}{% endif %}{% if n['repeater'] %} · {{ n['repeater'] }}{% endif %}</span></td><td><span class="badge {{ n['status'] }}">{{ 'Odprt' if n['status']=='open' else 'Zaključen' }}</span></td><td>{{ n['leader_name'] }} ({{ n['leader_callsign'] }})</td><td>{{ n['participant_count'] }}</td><td><a class="btn btn-secondary btn-small" href="{{ url_for('net_detail',net_id=n['id']) }}">Pregled</a></td></tr>{% endfor %}</tbody></table></div>{% else %}<p class="empty">Arhiv je prazen.</p>{% endif %}</div>{% endblock %}''',
 "users.html": r'''{% extends "base.html" %}{% block content %}<div class="card"><div class="actions"><h1>Uporabniki</h1><a class="btn btn-primary right" href="{{ url_for('new_user') }}">＋ Novi uporabnik</a></div><div class="table-wrap"><table><thead><tr><th>Uporabnik</th><th>Ime</th><th>Klicni znak</th><th>Vloga</th><th>Status</th><th></th></tr></thead><tbody>{% for u in users %}<tr><td><b>{{ u['username'] }}</b></td><td>{{ u['full_name'] }}</td><td>{{ u['callsign'] }}</td><td><span class="badge {{ u['role'] }}">{{ 'Administrator' if u['role']=='admin' else 'Vodja skeda' }}</span></td><td>{{ 'Aktiven' if u['active'] else 'Onemogočen' }}</td><td><a class="btn btn-secondary btn-small" href="{{ url_for('edit_user',user_id=u['id']) }}">Uredi</a></td></tr>{% endfor %}</tbody></table></div></div>{% endblock %}''',
 "user_form.html": r'''{% extends "base.html" %}{% block content %}<div class="card"><h1>{{ 'Uredi uporabnika' if edit_user else 'Novi uporabnik' }}</h1><form method="post"><input type="hidden" name="csrf_token" value="{{ csrf_token }}">{% if not edit_user %}<div class="field"><label>Uporabniško ime</label><input name="username" required autocomplete="off"></div>{% else %}<p>Uporabniško ime: <b>{{ edit_user['username'] }}</b></p>{% endif %}<div class="grid"><div class="field"><label>Ime in priimek</label><input name="full_name" value="{{ edit_user['full_name'] if edit_user else '' }}" required></div><div class="field"><label>Klicni znak</label><input name="callsign" value="{{ edit_user['callsign'] if edit_user else '' }}" required style="text-transform:uppercase"></div><div class="field"><label>Vloga</label><select name="role"><option value="leader" {% if edit_user and edit_user['role']=='leader' %}selected{% endif %}>Vodja skeda</option><option value="admin" {% if edit_user and edit_user['role']=='admin' %}selected{% endif %}>Administrator</option></select></div></div><div class="field"><label>{{ 'Novo geslo (pusti prazno, če ga ne spreminjaš)' if edit_user else 'Začasno geslo (najmanj 10 znakov)' }}</label><input type="password" name="password" {% if not edit_user %}required{% endif %} autocomplete="new-password"></div>{% if edit_user %}<div class="field"><label><input style="width:auto" type="checkbox" name="active" value="1" {% if edit_user['active'] %}checked{% endif %}> Aktiven uporabnik</label></div>{% endif %}<div class="actions"><button class="btn btn-primary">Shrani</button><a class="btn btn-secondary" href="{{ url_for('users') }}">Prekliči</a></div></form></div>{% endblock %}''',
 "change_password.html": r'''{% extends "base.html" %}{% block content %}<div class="card" style="max-width:520px"><h1>Spremeni geslo</h1><form method="post"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><div class="field"><label>Trenutno geslo</label><input type="password" name="current_password" required></div><div class="field"><label>Novo geslo (najmanj 10 znakov)</label><input type="password" name="new_password" required></div><div class="field"><label>Ponovi novo geslo</label><input type="password" name="confirm_password" required></div><button class="btn btn-primary">Spremeni geslo</button></form></div>{% endblock %}'''

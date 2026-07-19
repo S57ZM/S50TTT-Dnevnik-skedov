@@ -5,6 +5,7 @@ Ločen spletni portal Radiokluba Sevnica S50TTT za vodenje skedov.
 ## Funkcije
 
 - več uporabnikov z vlogama administrator in vodja skeda;
+- samodejni izračun naslednjega mesečnega in sobotnega rednega skeda;
 - odpiranje novega skeda z datumom, uro in vodjo;
 - hiter vnos imena, klicnega znaka ter ure prijave;
 - preprečevanje podvojenega klicnega znaka v istem skedu;
@@ -14,6 +15,20 @@ Ločen spletni portal Radiokluba Sevnica S50TTT za vodenje skedov.
 - mobilnim napravam prilagojen prikaz;
 - sled sprememb v podatkovni bazi;
 - SQLite podatkovna baza v trajni mapi `data`.
+
+## Redni skedi
+
+Portal pozna redni urnik Radiokluba Sevnica in na domači strani ponudi naslednja
+termina:
+
+- mesečni sked vsak prvi četrtek v mesecu ob 19.00;
+- sobotni sked prek repetitorja `S55USX` na Sv. Roku vsako soboto;
+- sobotni sked se od 1. septembra do 31. maja začne ob 20.00, od 1. junija do
+  31. avgusta pa ob 21.00.
+
+Upravna postaja rednega skeda je `S50TTT`, operater pa prijavljeni član kluba, ki
+odpre dnevnik. Portal prepreči, da bi bil za isti redni termin odprt podvojen
+dnevnik. Drug ali izredni sked je še vedno mogoče odpreti ročno.
 
 ## Namestitev
 
@@ -56,4 +71,12 @@ Pred kopiranjem je priporočljivo za kratek čas ustaviti vsebnik.
 ```bash
 git pull
 docker compose up -d --build
+```
+
+## Preizkus
+
+Po gradnji slike je mogoče preveriti pravila rednih terminov z:
+
+```bash
+docker compose run --rm skedi python -m unittest discover -s tests -v
 ```
