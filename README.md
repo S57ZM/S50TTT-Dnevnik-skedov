@@ -6,6 +6,8 @@ Ločen spletni portal Radiokluba Sevnica S50TTT za vodenje skedov.
 
 - več uporabnikov z vlogama administrator in vodja skeda;
 - samodejni izračun naslednjega mesečnega in sobotnega rednega skeda;
+- živ odštevalnik do naslednjega rednega skeda;
+- zaporedno številčenje sobotnih skedov od 5. januarja 2019;
 - odpiranje novega skeda z datumom, uro in vodjo;
 - hiter vnos imena, klicnega znaka ter ure prijave;
 - preprečevanje podvojenega klicnega znaka v istem skedu;
@@ -29,6 +31,9 @@ termina:
 Upravna postaja rednega skeda je `S50TTT`, operater pa prijavljeni član kluba, ki
 odpre dnevnik. Portal prepreči, da bi bil za isti redni termin odprt podvojen
 dnevnik. Drug ali izredni sked je še vedno mogoče odpreti ročno.
+
+Sobotni skedi se številčijo neprekinjeno od prve sobote leta 2019: sked 5.
+januarja 2019 je št. 1. Po tem pravilu je sobotni sked 25. julija 2026 št. 395.
 
 ## Namestitev
 

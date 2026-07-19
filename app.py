@@ -20,6 +20,7 @@ TIMEZONE = ZoneInfo(os.environ.get("TZ", "Europe/Ljubljana"))
 SCHEDULE_MONTHLY = "monthly"
 SCHEDULE_SATURDAY = "saturday"
 SCHEDULE_TYPES = {SCHEDULE_MONTHLY, SCHEDULE_SATURDAY}
+SATURDAY_SERIES_START = date(2019, 1, 5)
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY") or secrets.token_hex(32)
@@ -52,6 +53,12 @@ def saturday_start_time(net_date):
     return "21:00" if 6 <= net_date.month <= 8 else "20:00"
 
 
+def saturday_net_number(net_date):
+    if net_date.weekday() != 5 or net_date < SATURDAY_SERIES_START:
+        return None
+    return ((net_date - SATURDAY_SERIES_START).days // 7) + 1
+
+
 def scheduled_net_for_date(schedule_type, net_date):
     if schedule_type == SCHEDULE_MONTHLY:
         if net_date != first_weekday_of_month(net_date.year, net_date.month, 3):
@@ -69,34 +76,62 @@ def scheduled_net_for_date(schedule_type, net_date):
     if schedule_type == SCHEDULE_SATURDAY:
         if net_date.weekday() != 5:
             return None
+        sequence_number = saturday_net_number(net_date)
+        if sequence_number is None:
+            return None
         return {
             "schedule_type": SCHEDULE_SATURDAY,
-            "label": "Sobotni sked prek repetitorja S55USX",
-            "title": f"Sobotni sked S50TTT prek S55USX – {net_date.strftime('%d. %m. %Y')}",
+            "label": f"Sobotni sked št. {sequence_number} prek repetitorja S55USX",
+            "title": (
+                f"Sobotni sked S50TTT št. {sequence_number} prek S55USX – "
+                f"{net_date.strftime('%d. %m. %Y')}"
+            ),
             "date": net_date.isoformat(),
             "time": saturday_start_time(net_date),
             "rule": "Vsako soboto; poleti ob 21.00, sicer ob 20.00",
             "repeater": "S55USX – Sv. Rok",
             "control_callsign": "S50TTT",
+            "sequence_number": sequence_number,
         }
     return None
 
 
-def next_scheduled_nets(reference=None):
+def schedule_start_datetime(scheduled):
+    return datetime.strptime(
+        f"{scheduled['date']} {scheduled['time']}", "%Y-%m-%d %H:%M"
+    )
+
+
+def next_scheduled_nets(reference=None, include_started_today=True):
     reference = reference or now_local()
 
     monthly_date = first_weekday_of_month(reference.year, reference.month, 3)
-    if monthly_date < reference.date():
+    monthly_info = scheduled_net_for_date(SCHEDULE_MONTHLY, monthly_date)
+    if monthly_date < reference.date() or (
+        not include_started_today and schedule_start_datetime(monthly_info) < reference
+    ):
         year, month = next_month(reference.year, reference.month)
         monthly_date = first_weekday_of_month(year, month, 3)
 
     saturday_date = reference.date() + timedelta(days=(5 - reference.weekday()) % 7)
+    saturday_info = scheduled_net_for_date(SCHEDULE_SATURDAY, saturday_date)
+    if not include_started_today and schedule_start_datetime(saturday_info) < reference:
+        saturday_date += timedelta(days=7)
 
     scheduled = [
         scheduled_net_for_date(SCHEDULE_MONTHLY, monthly_date),
         scheduled_net_for_date(SCHEDULE_SATURDAY, saturday_date),
     ]
     return sorted(scheduled, key=lambda item: (item["date"], item["time"]))
+
+
+def next_countdown_net(reference=None):
+    reference = reference or now_local()
+    scheduled = next_scheduled_nets(reference, include_started_today=False)[0]
+    scheduled["starts_at_iso"] = (
+        schedule_start_datetime(scheduled).replace(tzinfo=TIMEZONE).isoformat()
+    )
+    return scheduled
 
 
 def get_db():
@@ -335,6 +370,7 @@ def dashboard():
         open_nets=open_nets,
         recent=recent,
         scheduled_nets=scheduled_nets,
+        countdown_net=next_countdown_net(),
     )
 
 
@@ -693,6 +729,7 @@ TEMPLATES = {
 header{background:linear-gradient(135deg,var(--blue2),var(--blue));color:white;box-shadow:0 2px 8px #0003}.nav{max-width:1100px;margin:auto;padding:14px 18px;display:flex;align-items:center;gap:18px;flex-wrap:wrap}.brand{font-weight:800;font-size:1.12rem;margin-right:auto}.nav a,.link-button{color:white;text-decoration:none;font-weight:650;background:none;border:0;padding:0;cursor:pointer;font:inherit}.user{font-size:.9rem;opacity:.9}
 main{max-width:1100px;margin:24px auto;padding:0 16px}.card{background:white;border:1px solid var(--line);border-radius:14px;padding:20px;margin-bottom:18px;box-shadow:0 2px 10px #1020300c}.card h1,.card h2{margin-top:0}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:16px}.actions{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
 .schedule-box{border:1px solid var(--line);border-radius:12px;padding:16px;background:var(--light)}.schedule-box h2{margin:10px 0 8px}
+.countdown-card{background:linear-gradient(135deg,var(--blue2),var(--blue));color:white}.countdown-card .muted{color:#dbeeff}.countdown-value{font-size:clamp(1.8rem,6vw,3.2rem);font-weight:850;letter-spacing:.03em;margin:8px 0}
 label{display:block;font-weight:700;margin:0 0 6px}.field{margin-bottom:14px}input,select{width:100%;padding:11px 12px;border:1px solid #aebdca;border-radius:9px;background:white;font:inherit}input:focus,select:focus{outline:3px solid #bddcff;border-color:var(--blue)}
 .btn{display:inline-block;border:0;border-radius:9px;padding:10px 15px;font-weight:750;cursor:pointer;text-decoration:none;font:inherit}.btn-primary{background:var(--blue);color:white}.btn-primary:hover{background:var(--blue2)}.btn-secondary{background:#e6edf3;color:#1d2b36}.btn-danger{background:#fee4e2;color:var(--danger)}.btn-success{background:#daf5e6;color:#075f34}.btn-small{padding:7px 10px;font-size:.9rem}
 table{width:100%;border-collapse:collapse}th,td{text-align:left;padding:11px 9px;border-bottom:1px solid var(--line)}th{background:var(--light);font-size:.88rem}tr:last-child td{border-bottom:0}.table-wrap{overflow-x:auto}.badge{display:inline-block;padding:4px 9px;border-radius:999px;font-size:.8rem;font-weight:750}.open{background:#d8f3e5;color:#075f34}.closed{background:#e7ebef;color:#45525d}.admin{background:#e5ddff;color:#4f2c90}.leader{background:#ddebfa;color:#164f7c}
@@ -705,10 +742,12 @@ table{width:100%;border-collapse:collapse}th,td{text-align:left;padding:11px 9px
 </body></html>''',
 "login.html": r'''{% extends "base.html" %}{% block title %}Prijava · {{ app_name }}{% endblock %}{% block content %}<div class="card login"><h1>📻 S50TTT</h1><h2>Dnevnik skedov</h2><p class="muted">Prijava za vodje skeda</p><form method="post"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><div class="field"><label>Uporabniško ime</label><input name="username" autocomplete="username" required autofocus></div><div class="field"><label>Geslo</label><input type="password" name="password" autocomplete="current-password" required></div><button class="btn btn-primary" type="submit">Prijava</button></form></div>{% endblock %}''',
 "dashboard.html": r'''{% extends "base.html" %}{% block content %}
+<div class="card countdown-card" data-countdown="{{ countdown_net['starts_at_iso'] }}"><p class="muted">Do naslednjega rednega skeda</p><div class="countdown-value" data-countdown-value>Izračunavam …</div><p><b>{{ countdown_net['label'] }}</b><br>{{ countdown_net['date']|date_si }} ob {{ countdown_net['time'] }}{% if countdown_net['repeater'] %} · {{ countdown_net['repeater'] }}{% endif %}</p></div>
 <div class="card"><h1>Naslednji redni skedi</h1><p class="muted">Portal samodejno upošteva mesečni in sezonski sobotni urnik Radiokluba Sevnica.</p><div class="grid">{% for s in scheduled_nets %}<div class="schedule-box"><span class="badge leader">{{ 'Mesečni' if s['schedule_type']=='monthly' else 'Sobotni' }}</span>{% if s['existing_status'] %} <span class="badge {{ s['existing_status'] }}">{{ 'Odprt' if s['existing_status']=='open' else 'Zaključen' }}</span>{% endif %}<h2>{{ s['label'] }}</h2><p><b>{{ s['date']|date_si }}</b> ob {{ s['time'] }}<br>Upravna postaja: <b>{{ s['control_callsign'] }}</b>{% if s['repeater'] %}<br>Repetitor: {{ s['repeater'] }}{% endif %}</p><p class="muted">{{ s['rule'] }}</p>{% if s['existing_id'] %}<a class="btn btn-primary" href="{{ url_for('net_detail',net_id=s['existing_id']) }}">Odpri obstoječi dnevnik</a>{% else %}<form method="post" action="{{ url_for('new_net') }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="schedule_type" value="{{ s['schedule_type'] }}"><input type="hidden" name="net_date" value="{{ s['date'] }}"><input type="hidden" name="started_time" value="{{ s['time'] }}"><button class="btn btn-primary">Odpri ta dnevnik</button></form>{% endif %}</div>{% endfor %}</div></div>
 <div class="card"><h2>Drug ali izredni sked</h2><p class="muted">Po potrebi odpri dnevnik z ročno izbranim datumom in uro.</p><form method="post" action="{{ url_for('new_net') }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><div class="grid"><div class="field"><label>Naslov (neobvezno)</label><input name="title" placeholder="Samodejno: Sked DD. MM. LLLL"></div><div class="field"><label>Datum</label><input type="date" name="net_date" value="{{ now_local_value if now_local_value else '' }}" required></div><div class="field"><label>Začetna ura</label><input type="time" name="started_time" value="{{ current_time if current_time else '' }}" required></div></div><button class="btn btn-secondary">＋ Odpri izredni sked</button></form></div>
 {% if open_nets %}<h2>Odprti skedi</h2><div class="grid">{% for n in open_nets %}<div class="card"><span class="badge open">Odprt</span><h2>{{ n['title'] }}</h2><p><b>{{ n['net_date']|date_si }}</b> ob {{ n['started_at']|time_si }}<br>Vodja: {{ n['leader_name'] }} ({{ n['leader_callsign'] }})</p><p><span class="big-number">{{ n['participant_count'] }}</span> prijavljenih</p><a class="btn btn-primary" href="{{ url_for('net_detail',net_id=n['id']) }}">Odpri dnevnik</a></div>{% endfor %}</div>{% endif %}
 <div class="card"><div class="actions"><h2>Zadnji zaključeni skedi</h2><a class="btn btn-secondary right" href="{{ url_for('archive') }}">Celoten arhiv</a></div>{% if recent %}<div class="table-wrap"><table><thead><tr><th>Sked</th><th>Vodja</th><th>Prijavljeni</th><th></th></tr></thead><tbody>{% for n in recent %}<tr><td><b>{{ n['title'] }}</b><br><span class="muted">{{ n['net_date']|date_si }} ob {{ n['started_at']|time_si }}</span></td><td>{{ n['leader_callsign'] }}</td><td>{{ n['participant_count'] }}</td><td><a class="btn btn-secondary btn-small" href="{{ url_for('net_detail',net_id=n['id']) }}">Pregled</a></td></tr>{% endfor %}</tbody></table></div>{% else %}<p class="empty">V arhivu še ni skedov.</p>{% endif %}</div>
+<script>(function(){const card=document.querySelector('[data-countdown]');if(!card)return;const output=card.querySelector('[data-countdown-value]');const target=Date.parse(card.dataset.countdown);function pad(value){return String(value).padStart(2,'0')}function update(){const remaining=target-Date.now();if(remaining<=0){output.textContent='Sked se je začel';return}const total=Math.floor(remaining/1000);const days=Math.floor(total/86400);const hours=Math.floor((total%86400)/3600);const minutes=Math.floor((total%3600)/60);const seconds=total%60;output.textContent=(days?days+' dni · ':'')+pad(hours)+':'+pad(minutes)+':'+pad(seconds)}update();setInterval(update,1000)})();</script>
 {% endblock %}''',
 "net.html": r'''{% extends "base.html" %}{% block title %}{{ net['title'] }} · {{ app_name }}{% endblock %}{% block content %}
 <div class="card"><div class="actions"><div><span class="badge {{ net['status'] }}">{{ 'Odprt' if net['status']=='open' else 'Zaključen' }}</span>{% if net['schedule_type'] %} <span class="badge leader">Redni sked</span>{% endif %}<h1>{{ net['title'] }}</h1><p>{{ net['net_date']|date_si }} · začetek {{ net['started_at']|time_si }}{% if net['ended_at'] %} · konec {{ net['ended_at']|time_si }}{% endif %}{% if net['control_callsign'] %}<br>Upravna postaja: <b>{{ net['control_callsign'] }}</b>{% endif %}{% if net['repeater'] %}<br>Repetitor: <b>{{ net['repeater'] }}</b>{% endif %}<br>Operater: <b>{{ net['leader_name'] }} ({{ net['leader_callsign'] }})</b></p></div><div class="actions right no-print"><button class="btn btn-secondary" onclick="window.print()">🖨 Natisni / PDF</button>{% if net['status']=='open' %}<form method="post" action="{{ url_for('close_net',net_id=net['id']) }}" onsubmit="return confirm('Zaključim ta sked?')"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="btn btn-success">✓ Zaključi sked</button></form>{% elif g.user['role']=='admin' %}<form method="post" action="{{ url_for('reopen_net',net_id=net['id']) }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="btn btn-secondary">Ponovno odpri</button></form>{% endif %}</div></div></div>

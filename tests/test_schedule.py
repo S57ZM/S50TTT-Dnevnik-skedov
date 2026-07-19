@@ -12,7 +12,9 @@ os.environ["SECRET_KEY"] = "test-secret-key"
 from app import (  # noqa: E402
     SCHEDULE_MONTHLY,
     SCHEDULE_SATURDAY,
+    next_countdown_net,
     next_scheduled_nets,
+    saturday_net_number,
     saturday_start_time,
     scheduled_net_for_date,
 )
@@ -47,6 +49,17 @@ class ScheduleTests(unittest.TestCase):
 
         self.assertEqual(scheduled["repeater"], "S55USX – Sv. Rok")
         self.assertEqual(scheduled["control_callsign"], "S50TTT")
+
+    def test_saturday_sequence_starts_in_2019(self):
+        self.assertEqual(saturday_net_number(date(2019, 1, 5)), 1)
+        self.assertEqual(saturday_net_number(date(2026, 7, 25)), 395)
+        self.assertIsNone(saturday_net_number(date(2026, 7, 26)))
+
+    def test_countdown_moves_to_next_saturday_after_start(self):
+        scheduled = next_countdown_net(datetime(2026, 7, 25, 21, 1))
+
+        self.assertEqual(scheduled["date"], "2026-08-01")
+        self.assertEqual(scheduled["sequence_number"], 396)
 
 
 if __name__ == "__main__":
