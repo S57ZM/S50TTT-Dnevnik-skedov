@@ -16,7 +16,13 @@ from werkzeug.security import check_password_hash, generate_password_hash
 
 
 APP_NAME = "S50TTT Dnevnik skedov"
-APP_VERSION = "1.8.2"
+BASE_VERSION = "1.9.0"
+RELEASE_CHANNEL = os.environ.get("RELEASE_CHANNEL", "stable").strip().lower()
+if RELEASE_CHANNEL not in {"stable", "alpha"}:
+    RELEASE_CHANNEL = "stable"
+APP_VERSION = (
+    f"{BASE_VERSION}-alpha" if RELEASE_CHANNEL == "alpha" else BASE_VERSION
+)
 DB_PATH = os.environ.get("DATABASE_PATH", "/app/data/skedi.db")
 TIMEZONE = ZoneInfo(os.environ.get("TZ", "Europe/Ljubljana"))
 SCHEDULE_MONTHLY = "monthly"
@@ -345,6 +351,7 @@ def template_context():
     return {
         "app_name": APP_NAME,
         "app_version": APP_VERSION,
+        "release_channel": RELEASE_CHANNEL,
         "csrf_token": session.get("csrf_token", ""),
     }
 
@@ -375,7 +382,11 @@ def valid_password(password):
 
 @app.route("/health")
 def health():
-    return {"status": "ok", "version": APP_VERSION}
+    return {
+        "status": "ok",
+        "version": APP_VERSION,
+        "channel": RELEASE_CHANNEL,
+    }
 
 
 @app.route("/login", methods=["GET", "POST"])
@@ -1049,7 +1060,7 @@ header{background:linear-gradient(135deg,var(--blue2),var(--blue));color:white;b
 main{max-width:1100px;margin:24px auto;padding:0 16px}.card{background:white;border:1px solid var(--line);border-radius:14px;padding:20px;margin-bottom:18px;box-shadow:0 2px 10px #1020300c}.card h1,.card h2{margin-top:0}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:16px}.actions{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
 .schedule-box{border:1px solid var(--line);border-radius:12px;padding:16px;background:var(--light)}.schedule-box h2{margin:10px 0 8px}
 .countdown-card{background:linear-gradient(135deg,var(--blue2),var(--blue));color:white}.countdown-card .muted{color:#dbeeff}.countdown-value{font-size:clamp(1.8rem,6vw,3.2rem);font-weight:850;letter-spacing:.03em;margin:8px 0}
-.footer{max-width:1100px;margin:0 auto;padding:2px 16px 22px;text-align:center;color:#65717c;font-size:.85rem}
+.footer{max-width:1100px;margin:0 auto;padding:2px 16px 22px;text-align:center;color:#65717c;font-size:.85rem}.alpha-banner{background:#f5a800;color:#2b2100;padding:10px 16px;text-align:center;font-weight:850;letter-spacing:.03em}
 label{display:block;font-weight:700;margin:0 0 6px}.field{margin-bottom:14px}input,select,textarea{width:100%;padding:11px 12px;border:1px solid #aebdca;border-radius:9px;background:white;font:inherit}input:focus,select:focus,textarea:focus{outline:3px solid #bddcff;border-color:var(--blue)}textarea{min-height:120px;resize:vertical}
 .btn{display:inline-block;border:0;border-radius:9px;padding:10px 15px;font-weight:750;cursor:pointer;text-decoration:none;font:inherit}.btn-primary{background:var(--blue);color:white}.btn-primary:hover{background:var(--blue2)}.btn-secondary{background:#e6edf3;color:#1d2b36}.btn-danger{background:#fee4e2;color:var(--danger)}.btn-success{background:#daf5e6;color:#075f34}.btn-locked,.btn-locked:hover{background:#d7dde3;color:#66727c}.btn-small{padding:7px 10px;font-size:.9rem}
 table{width:100%;border-collapse:collapse}th,td{text-align:left;padding:11px 9px;border-bottom:1px solid var(--line)}th{background:var(--light);font-size:.88rem}tr:last-child td{border-bottom:0}.table-wrap{overflow-x:auto}.badge{display:inline-block;padding:4px 9px;border-radius:999px;font-size:.8rem;font-weight:750}.open{background:#d8f3e5;color:#075f34}.closed{background:#e7ebef;color:#45525d}.admin{background:#e5ddff;color:#4f2c90}.leader{background:#ddebfa;color:#164f7c}
@@ -1057,6 +1068,7 @@ table{width:100%;border-collapse:collapse}th,td{text-align:left;padding:11px 9px
 @media(max-width:700px){main{margin-top:14px}.card{padding:15px}.nav{gap:12px}.user{width:100%;order:3}th,td{padding:9px 6px}.hide-mobile{display:none}.btn{width:100%;text-align:center}.actions form{width:100%}.actions .btn-small{width:auto}.brand{width:100%}}
 @media print{header,.no-print,.flash,.footer{display:none!important}body{background:white}main{max-width:none;margin:0;padding:0}.card{border:0;box-shadow:none;padding:0}table{font-size:11pt}a{color:black;text-decoration:none}}
 </style></head><body>
+{% if release_channel=='alpha' %}<div class="alpha-banner">⚠ ALPHA TESTNA RAZLIČICA · podatki niso produkcijski</div>{% endif %}
 {% if g.user %}<header><nav class="nav"><span class="brand">📻 S50TTT Skedi</span><a href="{{ url_for('dashboard') }}">Domov</a><a href="{{ url_for('archive') }}">Arhiv</a>{% if g.user['role']=='admin' %}<a href="{{ url_for('users') }}">Uporabniki</a>{% endif %}<span class="user">{{ g.user['full_name'] }} · {{ g.user['callsign'] }}</span><a href="{{ url_for('change_password') }}">Geslo</a><form class="inline" method="post" action="{{ url_for('logout') }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="link-button">Odjava</button></form></nav></header>{% endif %}
 <main>{% with msgs=get_flashed_messages(with_categories=true) %}{% for category,msg in msgs %}<div class="flash {{ category }}">{{ msg }}</div>{% endfor %}{% endwith %}{% block content %}{% endblock %}</main>
 <footer class="footer">{{ app_name }} · različica {{ app_version }}</footer>

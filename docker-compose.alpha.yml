@@ -1,0 +1,21 @@
+name: s50ttt-skedi-alpha
+
+services:
+  skedi-alpha:
+    build: .
+    container_name: s50ttt-skedi-alpha
+    restart: unless-stopped
+    user: "${PUID}:${PGID}"
+    env_file: .env.alpha
+    environment:
+      RELEASE_CHANNEL: alpha
+    volumes:
+      - ./data-alpha:/app/data
+    ports:
+      - "${BIND_IP:-0.0.0.0}:${ALPHA_PORT:-8024}:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s

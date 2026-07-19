@@ -1,6 +1,9 @@
 .env
+.env.alpha
 .initial-admin-password
+.initial-alpha-admin-password
 data/
+data-alpha/
 __pycache__/
 *.pyc
 .docker-config/

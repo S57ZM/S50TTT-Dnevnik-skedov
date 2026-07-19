@@ -2,7 +2,7 @@
 
 Ločen spletni portal Radiokluba Sevnica S50TTT za vodenje skedov.
 
-Trenutna različica: **1.8.2**
+Trenutna različica: **1.9.0**
 
 ## Funkcije
 
@@ -75,6 +75,10 @@ chmod +x install.sh
 
 Namestitveni program ob prvem zagonu ustvari administratorski račun `S57ZM` in
 izpiše naključno začetno geslo. Po prvi prijavi ga je treba zamenjati.
+
+Za varno preizkušanje novih funkcij je na voljo tudi povsem ločena alpha
+namestitev. Uporablja vejo `alpha`, port `8024`, vsebnik `s50ttt-skedi-alpha` in
+lastno podatkovno bazo. Celoten postopek je opisan v [ALPHA.md](ALPHA.md).
 
 Lokalni naslov na rpi-services:
 

@@ -1,7 +1,10 @@
 .git
 .env
+.env.alpha
 .initial-admin-password
+.initial-alpha-admin-password
 .docker-config
 data
+data-alpha
 __pycache__
 *.pyc

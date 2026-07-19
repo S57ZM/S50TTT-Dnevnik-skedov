@@ -86,6 +86,20 @@ class ScheduleTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.get_json()["version"], APP_VERSION)
+        self.assertEqual(response.get_json()["channel"], "stable")
+
+    def test_alpha_channel_has_visible_warning(self):
+        with patch("app.RELEASE_CHANNEL", "alpha"), patch(
+            "app.APP_VERSION", "1.9.0-alpha"
+        ):
+            response = flask_app.test_client().get("/login")
+            health_response = flask_app.test_client().get("/health")
+
+        html = response.get_data(as_text=True)
+        self.assertIn("ALPHA TESTNA RAZLIČICA", html)
+        self.assertIn("podatki niso produkcijski", html)
+        self.assertIn("različica 1.9.0-alpha", html)
+        self.assertEqual(health_response.get_json()["channel"], "alpha")
 
     def test_login_shows_countdown_and_next_saturday_number(self):
         displayed_saturday = next(
