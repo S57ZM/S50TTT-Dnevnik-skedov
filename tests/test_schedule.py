@@ -333,7 +333,7 @@ class ScheduleTests(unittest.TestCase):
 
     def test_alpha_channel_has_visible_warning(self):
         with patch("app.RELEASE_CHANNEL", "alpha"), patch(
-            "app.APP_VERSION", "1.18.0-alpha"
+            "app.APP_VERSION", "1.19.0-alpha"
         ):
             response = flask_app.test_client().get("/login")
             health_response = flask_app.test_client().get("/health")
@@ -341,7 +341,7 @@ class ScheduleTests(unittest.TestCase):
         html = response.get_data(as_text=True)
         self.assertIn("ALPHA TESTNA RAZLIČICA", html)
         self.assertIn("podatki niso produkcijski", html)
-        self.assertIn("različica 1.18.0-alpha", html)
+        self.assertIn("različica 1.19.0-alpha", html)
         self.assertEqual(health_response.get_json()["channel"], "alpha")
 
     def test_login_shows_countdown_and_next_saturday_number(self):
@@ -675,6 +675,71 @@ class ScheduleTests(unittest.TestCase):
                 get_db().execute("SELECT id FROM nets WHERE id=?", (net_id,)).fetchone()
             )
 
+    def test_net_leader_can_write_notes_but_other_leader_cannot(self):
+        with flask_app.app_context():
+            db = get_db()
+            for username, full_name, callsign in (
+                ("notes-owner", "Vodja Zapisnika", "S50NOTE"),
+                ("notes-other", "Drugi Vodja", "S51NOTE"),
+            ):
+                db.execute(
+                    """INSERT OR IGNORE INTO users
+                       (username, full_name, callsign, password_hash,
+                        role, active, created_at)
+                       VALUES (?, ?, ?, 'not-used-in-test', 'leader', 1, ?)""",
+                    (username, full_name, callsign, now_db()),
+                )
+            owner_id = db.execute(
+                "SELECT id FROM users WHERE username='notes-owner'"
+            ).fetchone()["id"]
+            other_id = db.execute(
+                "SELECT id FROM users WHERE username='notes-other'"
+            ).fetchone()["id"]
+            cursor = db.execute(
+                """INSERT INTO nets
+                   (title, net_date, started_at, status, leader_id, created_at)
+                   VALUES ('Sked z zapisnikom', '2032-05-08',
+                           '2032-05-08 20:00:00', 'open', ?, ?)""",
+                (owner_id, now_db()),
+            )
+            net_id = cursor.lastrowid
+            db.commit()
+
+        owner_client = self.authenticated_client(owner_id)
+        notes = "Obvestilo radiokluba\nTežava na repetitorju <test>."
+        response = owner_client.post(
+            f"/nets/{net_id}/notes",
+            data={"csrf_token": "test-csrf-token", "notes": notes},
+        )
+        self.assertEqual(response.status_code, 302)
+        owner_html = owner_client.get(f"/nets/{net_id}").get_data(as_text=True)
+        self.assertIn("Shrani zapisnik", owner_html)
+        self.assertIn("&lt;test&gt;", owner_html)
+
+        other_client = self.authenticated_client(other_id)
+        other_html = other_client.get(f"/nets/{net_id}").get_data(as_text=True)
+        self.assertIn("Obvestilo radiokluba", other_html)
+        self.assertNotIn("Shrani zapisnik", other_html)
+        forbidden = other_client.post(
+            f"/nets/{net_id}/notes",
+            data={"csrf_token": "test-csrf-token", "notes": "Nedovoljena sprememba"},
+        )
+        self.assertEqual(forbidden.status_code, 403)
+
+        with flask_app.app_context():
+            db = get_db()
+            stored = db.execute(
+                "SELECT notes FROM nets WHERE id=?", (net_id,)
+            ).fetchone()["notes"]
+            audit_row = db.execute(
+                """SELECT id FROM audit_log
+                   WHERE action='update_notes' AND entity_type='net' AND entity_id=?
+                   ORDER BY id DESC LIMIT 1""",
+                (net_id,),
+            ).fetchone()
+            self.assertEqual(stored, notes)
+            self.assertIsNotNone(audit_row)
+
     def test_archive_search_filters_and_pagination(self):
         matching_id, admin_id = self.create_closed_net(
             "Posebni mesečni arhivski sked", with_participant=False
@@ -757,6 +822,7 @@ class ScheduleTests(unittest.TestCase):
 
         self.assertEqual(edit_page.status_code, 200)
         self.assertIn("Uredi zaključeni sked", edit_page.get_data(as_text=True))
+        self.assertIn("Zapisnik / opombe skeda", edit_page.get_data(as_text=True))
         self.assertIn("Razlog brisanja", edit_page.get_data(as_text=True))
         self.assertIn(
             f'action="/nets/{net_id}/delete-closed"',
@@ -774,6 +840,7 @@ class ScheduleTests(unittest.TestCase):
                 "started_time": "21:00",
                 "ended_time": "00:41",
                 "leader_id": str(admin_id),
+                "notes": "Naknadno dopolnjen zapisnik skeda.",
             },
         )
 
@@ -793,6 +860,7 @@ class ScheduleTests(unittest.TestCase):
 
             self.assertEqual(net["title"], "Popravljen zaključeni sked")
             self.assertEqual(net["started_at"], "2030-02-09 21:00:00")
+            self.assertEqual(net["notes"], "Naknadno dopolnjen zapisnik skeda.")
             self.assertEqual(net["ended_at"], "2030-02-10 00:41:00")
             self.assertTrue(participant["checkin_at"].startswith("2030-02-09 "))
             self.assertIn('"before"', audit_row["details"])
@@ -1014,6 +1082,13 @@ class ScheduleTests(unittest.TestCase):
     def test_deleted_net_can_be_reviewed_and_restored_only_once(self):
         title = "Pomotoma izbrisani sked za obnovitev"
         net_id, admin_id = self.create_closed_net(title, with_participant=True)
+        with flask_app.app_context():
+            db = get_db()
+            db.execute(
+                "UPDATE nets SET notes='Pomembna ohranjena opomba.' WHERE id=?",
+                (net_id,),
+            )
+            db.commit()
         client = self.authenticated_client(admin_id)
         delete_response = client.post(
             f"/nets/{net_id}/delete-closed",
@@ -1070,6 +1145,7 @@ class ScheduleTests(unittest.TestCase):
             self.assertEqual(deletion["restored_by"], admin_id)
             self.assertEqual(restored_net["title"], title)
             self.assertEqual(restored_net["status"], "closed")
+            self.assertEqual(restored_net["notes"], "Pomembna ohranjena opomba.")
             self.assertEqual(restored_participant["callsign"], "S58TEST")
             self.assertIn(f'"deletion_id": {deletion_id}', audit_row["details"])
 
@@ -1224,7 +1300,8 @@ class ScheduleTests(unittest.TestCase):
             db.execute(
                 """UPDATE nets SET net_date='2040-03-02',
                    started_at='2040-03-02 20:00:00',
-                   ended_at='2040-03-02 20:30:00' WHERE id=?""",
+                   ended_at='2040-03-02 20:30:00',
+                   notes='Opomba v izvozu in poročilu.' WHERE id=?""",
                 (net_id,),
             )
             db.execute(
@@ -1250,12 +1327,14 @@ class ScheduleTests(unittest.TestCase):
         self.assertTrue(csv_text.startswith("\ufeff"))
         self.assertIn("Statistični testni sked", csv_text)
         self.assertIn("S58TEST", csv_text)
+        self.assertIn("Opomba v izvozu in poročilu.", csv_text)
 
         print_response = client.get(f"/reports/print?{query}")
         print_html = print_response.get_data(as_text=True)
         self.assertEqual(print_response.status_code, 200)
         self.assertIn("Poročilo skedov Radiokluba Sevnica", print_html)
         self.assertIn("Statistični testni sked", print_html)
+        self.assertIn("Opomba v izvozu in poročilu.", print_html)
         self.assertIn("Shrani kot PDF", print_html)
 
     def test_audit_view_is_filterable_and_admin_only(self):

@@ -2,7 +2,7 @@
 
 Ločen spletni portal Radiokluba Sevnica S50TTT za vodenje skedov.
 
-Trenutna alpha različica: **1.18.0-alpha**
+Trenutna alpha različica: **1.19.0-alpha**
 
 ## Funkcije
 
@@ -26,6 +26,7 @@ Trenutna alpha različica: **1.18.0-alpha**
 - zaporedno številčenje sobotnih skedov od 5. januarja 2019;
 - odpiranje novega skeda z datumom, uro in vodjo;
 - hiter vnos imena, klicnega znaka ter ure prijave;
+- zapisnik oziroma opombe skeda za obvestila, tehnične težave in posebnosti;
 - preprečevanje podvojenega klicnega znaka v istem skedu;
 - urejanje in brisanje napačnih vnosov;
 - brisanje praznega odprtega skeda s strani operaterja ali administratorja;
@@ -114,6 +115,14 @@ mogoče obnoviti samo enkrat; portal prepreči tudi podvajanje rednega termina.
 Arhiv prikazuje največ 25 rezultatov na stran. Iskanje upošteva naslov skeda,
 ime in klicni znak operaterja ter imena in klicne znake vseh prijavljenih.
 Izbrane filtre in iskalni niz ohrani tudi pri premikanju med stranmi rezultatov.
+
+## Zapisnik skeda
+
+Dejanski vodja odprtega skeda in administrator lahko v dnevniku vodita zapisnik
+z dolžino do 5000 znakov. Drugi vodje ga lahko preberejo, ne morejo pa ga
+spreminjati. Po zaključku ga lahko naknadno popravi samo administrator.
+Zapisnik je vključen v tiskanje oziroma PDF, CSV-izvoz, kopijo izbrisanega skeda
+in obnovitev iz koša. Vsako shranjevanje se zabeleži v revizijsko sled.
 
 ## Redni skedi
 

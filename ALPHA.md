@@ -9,14 +9,15 @@ veja alpha ──> s50ttt-skedi-alpha  ──> port 8024 ──> data-alpha/sked
 ```
 
 Alpha na vsaki strani prikaže rumeno opozorilo in različico, na primer
-`1.18.0-alpha`. Vpisani testni podatki nikoli ne končajo v produkcijski bazi.
+`1.19.0-alpha`. Vpisani testni podatki nikoli ne končajo v produkcijski bazi.
 
 Trenutne alpha funkcije vključujejo lokalni imenik klicnih znakov,
 administratorsko odpoved ali prestavitev rednega skeda, statistiko, CSV/PDF
 poročila, pregled revizijske sledi, dnevne preverjene varnostne kopije in
 zaščito prijave pred ponavljajočim ugibanjem gesel, profile klicnih znakov z
 zgodovino, internimi opombami in združevanjem podvojenih vnosov, koš z
-obnovitvijo pomotoma izbrisanih skedov ter iskanje in filtriranje arhiva.
+obnovitvijo pomotoma izbrisanih skedov, iskanje in filtriranje arhiva ter
+zapisnik oziroma opombe posameznega skeda.
 
 ## 1. Ustvarjanje veje alpha
 
@@ -81,7 +82,7 @@ curl -s http://127.0.0.1:8024/health
 Pričakovani odgovor vsebuje kanal `alpha`:
 
 ```json
-{"channel":"alpha","status":"ok","version":"1.18.0-alpha"}
+{"channel":"alpha","status":"ok","version":"1.19.0-alpha"}
 ```
 
 Alpha varnostne kopije se shranjujejo v `backups-alpha/`. Obnovitev izbrane

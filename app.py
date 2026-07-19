@@ -22,7 +22,7 @@ from backup import backup_path, create_backup, list_backups, verify_database
 
 
 APP_NAME = "S50TTT Dnevnik skedov"
-BASE_VERSION = "1.18.0"
+BASE_VERSION = "1.19.0"
 RELEASE_CHANNEL = os.environ.get("RELEASE_CHANNEL", "stable").strip().lower()
 if RELEASE_CHANNEL not in {"stable", "alpha"}:
     RELEASE_CHANNEL = "stable"
@@ -360,6 +360,7 @@ def init_db():
             schedule_type TEXT,
             repeater TEXT,
             control_callsign TEXT,
+            notes TEXT,
             created_at TEXT NOT NULL
         );
 
@@ -455,6 +456,7 @@ def init_db():
         "repeater": "TEXT",
         "control_callsign": "TEXT",
         "scheduled_date": "TEXT",
+        "notes": "TEXT",
     }.items():
         if column not in net_columns:
             try:
@@ -1170,14 +1172,35 @@ def net_detail(net_id):
         and not participants
         and (g.user["role"] == "admin" or net["leader_id"] == g.user["id"])
     )
+    can_edit_notes = g.user["role"] == "admin" or (
+        net["status"] == "open" and net["leader_id"] == g.user["id"]
+    )
     return render_template(
-        "net.html",
+        "net_v2.html",
         net=net,
         participants=participants,
         now=now_local(),
         can_delete_net=can_delete_net,
+        can_edit_notes=can_edit_notes,
         directory_entries=directory_entries,
     )
+
+
+@app.post("/nets/<int:net_id>/notes")
+@login_required
+def update_net_notes(net_id):
+    net = fetch_net(net_id)
+    if g.user["role"] != "admin" and (
+        net["status"] != "open" or net["leader_id"] != g.user["id"]
+    ):
+        abort(403)
+    notes = request.form.get("notes", "").strip()[:5000]
+    db = get_db()
+    db.execute("UPDATE nets SET notes=? WHERE id=?", (notes or None, net_id))
+    db.commit()
+    audit("update_notes", "net", net_id, net["title"])
+    flash("Zapisnik skeda je shranjen.", "success")
+    return redirect(url_for("net_detail", net_id=net_id))
 
 
 @app.route("/nets/<int:net_id>/edit", methods=["GET", "POST"])
@@ -1207,6 +1230,7 @@ def edit_net(net_id):
         net_date = request.form.get("net_date", "").strip()
         started_time = request.form.get("started_time", "").strip()
         ended_time = request.form.get("ended_time", "").strip()
+        notes = request.form.get("notes", "").strip()[:5000]
         try:
             leader_id = int(request.form.get("leader_id", ""))
             started_at = datetime.strptime(
@@ -1242,6 +1266,7 @@ def edit_net(net_id):
             "started_at": net["started_at"],
             "ended_at": net["ended_at"],
             "leader_id": net["leader_id"],
+            "notes": net["notes"],
         }
         after = {
             "title": title[:180],
@@ -1249,11 +1274,12 @@ def edit_net(net_id):
             "started_at": started_at.strftime("%Y-%m-%d %H:%M:%S"),
             "ended_at": ended_at.strftime("%Y-%m-%d %H:%M:%S"),
             "leader_id": leader_id,
+            "notes": notes or None,
         }
         try:
             db.execute(
                 """UPDATE nets
-                   SET title=?, net_date=?, started_at=?, ended_at=?, leader_id=?
+                   SET title=?, net_date=?, started_at=?, ended_at=?, leader_id=?, notes=?
                    WHERE id=?""",
                 (
                     after["title"],
@@ -1261,6 +1287,7 @@ def edit_net(net_id):
                     after["started_at"],
                     after["ended_at"],
                     after["leader_id"],
+                    after["notes"],
                     net_id,
                 ),
             )
@@ -1296,7 +1323,7 @@ def edit_net(net_id):
         return redirect(url_for("net_detail", net_id=net_id))
 
     return render_template(
-        "net_edit.html",
+        "net_edit_v2.html",
         net=net,
         users=users,
         participants=participants,
@@ -1499,6 +1526,7 @@ def delete_closed_net(net_id):
                     "scheduled_date",
                     "repeater",
                     "control_callsign",
+                    "notes",
                     "created_at",
                 )
             },
@@ -1807,7 +1835,7 @@ def report_participant_rows(filters):
     where, parameters = report_where(filters)
     return get_db().execute(
         f"""SELECT n.net_date, n.title, n.schedule_type, n.status,
-                   n.started_at, n.ended_at, u.full_name AS leader_name,
+                   n.started_at, n.ended_at, n.notes, u.full_name AS leader_name,
                    u.callsign AS leader_callsign, p.callsign,
                    p.full_name, p.checkin_at
             FROM nets n JOIN users u ON u.id=n.leader_id
@@ -1836,7 +1864,7 @@ def export_csv():
         [
             "Datum", "Naslov", "Vrsta", "Status", "Začetek", "Konec",
             "Operater", "Klicni znak operaterja", "Klicni znak prijavljenega",
-            "Ime prijavljenega", "Ura prijave",
+            "Ime prijavljenega", "Ura prijave", "Opombe skeda",
         ]
     )
     type_labels = {"monthly": "Mesečni", "saturday": "Sobotni", None: "Izredni"}
@@ -1847,7 +1875,7 @@ def export_csv():
                 "Zaključen" if row["status"] == "closed" else "Odprt",
                 row["started_at"], row["ended_at"] or "", row["leader_name"],
                 row["leader_callsign"], row["callsign"] or "",
-                row["full_name"] or "", row["checkin_at"] or "",
+                row["full_name"] or "", row["checkin_at"] or "", row["notes"] or "",
             ]]
         )
     content = "\ufeff" + output.getvalue()
@@ -2061,8 +2089,8 @@ def restore_deleted_net(deletion_id):
         cursor = db.execute(
             """INSERT INTO nets
                (title, net_date, scheduled_date, started_at, ended_at, status,
-                leader_id, schedule_type, repeater, control_callsign, created_at)
-               VALUES (?, ?, ?, ?, ?, 'closed', ?, ?, ?, ?, ?)""",
+                leader_id, schedule_type, repeater, control_callsign, notes, created_at)
+               VALUES (?, ?, ?, ?, ?, 'closed', ?, ?, ?, ?, ?, ?)""",
             (
                 title,
                 net_date,
@@ -2073,6 +2101,7 @@ def restore_deleted_net(deletion_id):
                 schedule_type,
                 net_data.get("repeater"),
                 net_data.get("control_callsign"),
+                net_data.get("notes"),
                 net_data.get("created_at") or now_db(),
             ),
         )
@@ -2689,6 +2718,26 @@ TEMPLATES["deleted_nets.html"] = r'''{% extends "base.html" %}{% block title %}K
 
 TEMPLATES["deleted_net_detail.html"] = r'''{% extends "base.html" %}{% block title %}Izbrisani sked · {{ app_name }}{% endblock %}{% block content %}<div class="card"><div class="actions"><div><span class="badge {{ 'open' if deletion['restored_at'] else 'closed' }}">{{ 'Obnovljen' if deletion['restored_at'] else 'V košu' }}</span><h1>{{ deletion['title'] }}</h1><p>{{ deletion['net_date']|date_si }} · {{ deletion['participant_count'] }} prijavljenih</p></div><a class="btn btn-secondary right" href="{{ url_for('deleted_nets') }}">Nazaj v koš</a></div><h2>Razlog brisanja</h2><div class="flash warning">{{ deletion['reason'] }}</div><p class="muted">Izbris izvedel {{ deletion['deleted_by_name'] }} ({{ deletion['deleted_by_callsign'] }}) · {{ deletion['deleted_at']|datetime_si }}</p>{% if deletion['restored_at'] %}<p><b>Obnovil:</b> {{ deletion['restored_by_name'] }} ({{ deletion['restored_by_callsign'] }}) · {{ deletion['restored_at']|datetime_si }}</p>{% if restored_exists %}<a class="btn btn-primary" href="{{ url_for('net_detail',net_id=deletion['restored_net_id']) }}">Odpri obnovljeni sked</a>{% endif %}{% elif snapshot %}<form method="post" action="{{ url_for('restore_deleted_net',deletion_id=deletion['id']) }}" onsubmit="return confirm('Obnovim ta sked in vse prijavljene v arhiv?')"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="btn btn-success">Obnovi sked in prijavljene</button></form>{% else %}<div class="flash danger">Shranjene kopije ni mogoče prebrati, zato obnova ni na voljo.</div>{% endif %}</div>{% if snapshot %}<div class="card"><h2>Shranjeni podatki</h2><p><b>Začetek:</b> {{ snapshot['net']['started_at']|datetime_si }}{% if snapshot['net']['ended_at'] %}<br><b>Konec:</b> {{ snapshot['net']['ended_at']|datetime_si }}{% endif %}<br><b>Operater:</b> {{ snapshot['net']['leader_name'] }} ({{ snapshot['net']['leader_callsign'] }}){% if snapshot['net']['repeater'] %}<br><b>Repetitor:</b> {{ snapshot['net']['repeater'] }}{% endif %}</p><h2>Prijavljeni: {{ snapshot['participants']|length }}</h2>{% if snapshot['participants'] %}<div class="table-wrap"><table><thead><tr><th>Ura</th><th>Klicni znak</th><th>Ime in priimek</th></tr></thead><tbody>{% for participant in snapshot['participants'] %}<tr><td>{{ participant['checkin_at']|time_si }}</td><td><b>{{ participant['callsign'] }}</b></td><td>{{ participant['full_name'] }}</td></tr>{% endfor %}</tbody></table></div>{% else %}<p class="empty">Sked ni imel prijavljenih.</p>{% endif %}</div>{% endif %}{% endblock %}'''
 
+TEMPLATES["net_v2.html"] = TEMPLATES["net.html"].replace(
+    '''{% if net['status']=='open' %}<div class="card no-print"><h2>Dodaj prijavljenega</h2>''',
+    '''{% if net['notes'] or can_edit_notes %}<div class="card"><h2>Zapisnik / opombe skeda</h2>{% if can_edit_notes %}<form class="notes-editor no-print" method="post" action="{{ url_for('update_net_notes',net_id=net['id']) }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><textarea name="notes" maxlength="5000" placeholder="Obvestila kluba, tehnične težave, posebnosti skeda …">{{ net['notes'] or '' }}</textarea><div class="actions" style="margin-top:10px"><button class="btn btn-primary">Shrani zapisnik</button><span class="muted">Največ 5000 znakov</span></div></form>{% if net['notes'] %}<div class="net-notes notes-preview">{{ net['notes'] }}</div>{% endif %}{% else %}<div class="net-notes">{{ net['notes'] }}</div>{% endif %}</div>{% endif %}{% if net['status']=='open' %}<div class="card no-print"><h2>Dodaj prijavljenega</h2>''',
+)
+
+TEMPLATES["net_edit_v2.html"] = TEMPLATES["net_edit.html"].replace(
+    '''</select></div><div class="actions"><button class="btn btn-primary">Shrani popravke</button>''',
+    '''</select></div><div class="field"><label>Zapisnik / opombe skeda</label><textarea name="notes" maxlength="5000" placeholder="Obvestila kluba, tehnične težave, posebnosti skeda …">{{ net['notes'] or '' }}</textarea><small class="muted">Opomba ostane vidna v arhivu in na natisnjenem dnevniku.</small></div><div class="actions"><button class="btn btn-primary">Shrani popravke</button>''',
+)
+
+TEMPLATES["deleted_net_detail.html"] = TEMPLATES["deleted_net_detail.html"].replace(
+    '''</p><h2>Prijavljeni: {{ snapshot['participants']|length }}</h2>''',
+    '''</p>{% if snapshot['net']['notes'] %}<h2>Zapisnik / opombe skeda</h2><div class="net-notes">{{ snapshot['net']['notes'] }}</div>{% endif %}<h2>Prijavljeni: {{ snapshot['participants']|length }}</h2>''',
+)
+
+TEMPLATES["print_report.html"] = TEMPLATES["print_report.html"].replace(
+    '''{% if row['ended_at'] %}–{{ row['ended_at']|time_si }}{% endif %}</td><td>{{ 'Zaključen' if row['status']=='closed' else 'Odprt' }}''',
+    '''{% if row['ended_at'] %}–{{ row['ended_at']|time_si }}{% endif %}{% if row['notes'] %}<div class="net-notes muted">{{ row['notes'] }}</div>{% endif %}</td><td>{{ 'Zaključen' if row['status']=='closed' else 'Odprt' }}''',
+)
+
 TEMPLATES["callsigns_v2.html"] = r'''{% extends "base.html" %}{% block content %}<div class="card"><div class="actions"><div><h1>Imenik klicnih znakov</h1><p class="muted">Izberi klicni znak za prikaz zgodovine sodelovanja.</p></div>{% if g.user['role']=='admin' %}<a class="btn btn-primary right" href="{{ url_for('new_callsign') }}">＋ Novi vnos</a>{% endif %}</div><form method="get" class="actions no-print" style="margin-bottom:18px"><input name="q" value="{{ query }}" placeholder="Išči po klicnem znaku ali imenu" style="max-width:360px"><button class="btn btn-secondary">Išči</button>{% if query %}<a class="btn btn-secondary" href="{{ url_for('callsigns') }}">Počisti</a>{% endif %}</form>{% if entries %}<div class="table-wrap"><table><thead><tr><th>Klicni znak</th><th>Ime in priimek</th><th>Sodelovanj</th><th>Zadnja prijava</th><th>Status</th><th></th></tr></thead><tbody>{% for entry in entries %}<tr><td><a href="{{ url_for('callsign_profile',entry_id=entry['id']) }}"><b>{{ entry['callsign'] }}</b></a></td><td>{{ entry['full_name'] }}</td><td>{{ entry['use_count'] }}</td><td>{{ entry['last_used_at']|datetime_si if entry['last_used_at'] else '–' }}</td><td><span class="badge {{ 'open' if entry['active'] else 'closed' }}">{{ 'Aktiven' if entry['active'] else 'Skrit' }}</span></td><td><div class="actions"><a class="btn btn-secondary btn-small" href="{{ url_for('callsign_profile',entry_id=entry['id']) }}">Profil</a>{% if g.user['role']=='admin' %}<a class="btn btn-secondary btn-small" href="{{ url_for('edit_callsign',entry_id=entry['id']) }}">Uredi</a>{% endif %}</div></td></tr>{% endfor %}</tbody></table></div>{% else %}<p class="empty">V imeniku ni zadetkov.</p>{% endif %}</div>{% endblock %}'''
 
 TEMPLATES["callsign_profile.html"] = r'''{% extends "base.html" %}{% block title %}{{ entry['callsign'] }} · {{ app_name }}{% endblock %}{% block content %}<div class="card"><div class="actions"><div><span class="badge {{ 'open' if entry['active'] else 'closed' }}">{{ 'Aktiven' if entry['active'] else 'Skrit' }}</span><h1>{{ entry['callsign'] }}</h1><h2>{{ entry['full_name'] }}</h2></div>{% if g.user['role']=='admin' %}<div class="actions right"><a class="btn btn-secondary" href="{{ url_for('edit_callsign',entry_id=entry['id']) }}">Uredi podatke</a><a class="btn btn-danger" href="{{ url_for('merge_callsign',entry_id=entry['id']) }}">Združi klicni znak</a></div>{% endif %}</div></div><div class="stats-grid"><div class="card stat"><span>Sodelovanj</span><strong>{{ summary['attendance_count'] }}</strong></div><div class="card stat"><span>Aktivnih let</span><strong>{{ summary['years_count'] }}</strong></div><div class="card stat"><span>Prvo sodelovanje</span><strong class="profile-date">{{ summary['first_checkin']|date_si if summary['first_checkin'] else '–' }}</strong></div><div class="card stat"><span>Zadnje sodelovanje</span><strong class="profile-date">{{ summary['last_checkin']|date_si if summary['last_checkin'] else '–' }}</strong></div></div>{% if g.user['role']=='admin' %}<div class="card"><h2>Interna opomba</h2><p class="muted">Opomba je vidna samo administratorjem in se zabeleži v revizijsko sled.</p><form method="post"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><textarea name="notes" maxlength="2000" placeholder="Neobvezna interna opomba …">{{ entry['notes'] or '' }}</textarea><button class="btn btn-primary" style="margin-top:10px">Shrani opombo</button></form></div>{% endif %}<div class="grid"><div class="card"><h2>Sodelovanja po letih</h2>{% if yearly %}<div class="table-wrap"><table><thead><tr><th>Leto</th><th>Sodelovanj</th></tr></thead><tbody>{% for item in yearly %}<tr><td>{{ item['year'] }}</td><td><b>{{ item['attendance_count'] }}</b></td></tr>{% endfor %}</tbody></table></div>{% else %}<p class="empty">Sodelovanj še ni.</p>{% endif %}</div><div class="card"><h2>Podatki imenika</h2><p>Vnos ustvarjen: <b>{{ entry['created_at']|datetime_si }}</b>{% if entry['updated_at'] %}<br>Zadnja sprememba: <b>{{ entry['updated_at']|datetime_si }}</b>{% endif %}</p><a class="btn btn-secondary" href="{{ url_for('callsigns') }}">Nazaj v imenik</a></div></div><div class="card"><h2>Zgodovina skedov</h2>{% if history %}<div class="table-wrap"><table><thead><tr><th>Datum</th><th>Sked</th><th>Prijava</th><th>Operater</th><th></th></tr></thead><tbody>{% for item in history %}<tr><td class="nowrap">{{ item['net_date']|date_si }}</td><td><b>{{ item['title'] }}</b><br><span class="badge {{ item['status'] }}">{{ 'Zaključen' if item['status']=='closed' else 'Odprt' }}</span></td><td>{{ item['checkin_at']|time_si }}</td><td>{{ item['leader_name'] }} ({{ item['leader_callsign'] }})</td><td><a class="btn btn-secondary btn-small" href="{{ url_for('net_detail',net_id=item['net_id']) }}">Pregled</a></td></tr>{% endfor %}</tbody></table></div>{% else %}<p class="empty">Ta klicni znak še ni sodeloval v shranjenem skedu.</p>{% endif %}</div>{% endblock %}'''
@@ -2703,7 +2752,7 @@ TEMPLATES["base.html"] = TEMPLATES["base.html"].replace(
     '<a href="{{ url_for(\'users\') }}">Uporabniki</a><a href="{{ url_for(\'audit_log_view\') }}">Revizija</a><a href="{{ url_for(\'security_view\') }}">Varnost</a><a href="{{ url_for(\'backups_view\') }}">Kopije</a>',
 ).replace(
     '</style>',
-    r'''.report-filters{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;align-items:end}.report-filters .field{margin:0}.stats-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:14px}.stat{text-align:center}.stat span{display:block;color:#65717c}.stat strong{display:block;font-size:2rem;margin-top:5px}.stat .profile-date{font-size:1.25rem}.bar-chart{display:grid;gap:12px}.bar-row{display:grid;grid-template-columns:minmax(95px,1.2fr) minmax(110px,3fr) 42px minmax(62px,auto);gap:9px;align-items:center}.bar-track{height:13px;background:#e7edf2;border-radius:999px;overflow:hidden}.bar-track i{display:block;height:100%;min-width:2px;background:var(--blue);border-radius:999px}.bar-row small{color:#65717c}.audit-details{display:block;white-space:pre-wrap;overflow-wrap:anywhere;max-width:420px;margin-top:7px}.print-report{max-width:none}@media(max-width:700px){.stats-grid{grid-template-columns:1fr 1fr}.bar-row{grid-template-columns:minmax(85px,1.3fr) minmax(80px,2fr) 34px}.bar-row>small{display:none}.report-filters{grid-template-columns:1fr}}@media print{.stats-grid{grid-template-columns:repeat(4,1fr)}.print-report table{font-size:10pt}}</style>''',
+    r'''.report-filters{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;align-items:end}.report-filters .field{margin:0}.stats-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:14px}.stat{text-align:center}.stat span{display:block;color:#65717c}.stat strong{display:block;font-size:2rem;margin-top:5px}.stat .profile-date{font-size:1.25rem}.bar-chart{display:grid;gap:12px}.bar-row{display:grid;grid-template-columns:minmax(95px,1.2fr) minmax(110px,3fr) 42px minmax(62px,auto);gap:9px;align-items:center}.bar-track{height:13px;background:#e7edf2;border-radius:999px;overflow:hidden}.bar-track i{display:block;height:100%;min-width:2px;background:var(--blue);border-radius:999px}.bar-row small{color:#65717c}.audit-details{display:block;white-space:pre-wrap;overflow-wrap:anywhere;max-width:420px;margin-top:7px}.net-notes{white-space:pre-wrap;overflow-wrap:anywhere;line-height:1.55}.notes-preview{display:none}.print-report{max-width:none}@media(max-width:700px){.stats-grid{grid-template-columns:1fr 1fr}.bar-row{grid-template-columns:minmax(85px,1.3fr) minmax(80px,2fr) 34px}.bar-row>small{display:none}.report-filters{grid-template-columns:1fr}}@media print{.stats-grid{grid-template-columns:repeat(4,1fr)}.print-report table{font-size:10pt}.notes-preview{display:block}}</style>''',
 )
 
 app.jinja_loader = DictLoader(TEMPLATES)
