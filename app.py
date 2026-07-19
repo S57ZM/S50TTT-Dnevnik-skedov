@@ -15,7 +15,7 @@ from werkzeug.security import check_password_hash, generate_password_hash
 
 
 APP_NAME = "S50TTT Dnevnik skedov"
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.4.0"
 DB_PATH = os.environ.get("DATABASE_PATH", "/app/data/skedi.db")
 TIMEZONE = ZoneInfo(os.environ.get("TZ", "Europe/Ljubljana"))
 SCHEDULE_MONTHLY = "monthly"
@@ -133,6 +133,16 @@ def next_countdown_net(reference=None):
         schedule_start_datetime(scheduled).replace(tzinfo=TIMEZONE).isoformat()
     )
     return scheduled
+
+
+def next_saturday_net(reference=None):
+    return next(
+        scheduled
+        for scheduled in next_scheduled_nets(
+            reference or now_local(), include_started_today=False
+        )
+        if scheduled["schedule_type"] == SCHEDULE_SATURDAY
+    )
 
 
 def get_db():
@@ -332,7 +342,11 @@ def login():
             session["csrf_token"] = secrets.token_urlsafe(32)
             return redirect(url_for("dashboard"))
         flash("Napačno uporabniško ime ali geslo.", "danger")
-    return render_template("login.html")
+    return render_template(
+        "login.html",
+        countdown_net=next_countdown_net(),
+        next_saturday=next_saturday_net(),
+    )
 
 
 @app.post("/logout")
@@ -375,7 +389,6 @@ def dashboard():
         open_nets=open_nets,
         recent=recent,
         scheduled_nets=scheduled_nets,
-        countdown_net=next_countdown_net(),
     )
 
 
@@ -476,7 +489,18 @@ def net_detail(net_id):
            WHERE p.net_id=? ORDER BY p.checkin_at, p.id""",
         (net_id,),
     ).fetchall()
-    return render_template("net.html", net=net, participants=participants, now=now_local())
+    can_delete_net = (
+        net["status"] == "open"
+        and not participants
+        and (g.user["role"] == "admin" or net["leader_id"] == g.user["id"])
+    )
+    return render_template(
+        "net.html",
+        net=net,
+        participants=participants,
+        now=now_local(),
+        can_delete_net=can_delete_net,
+    )
 
 
 @app.post("/nets/<int:net_id>/participants")
@@ -567,6 +591,30 @@ def delete_participant(participant_id):
     audit("delete", "participant", participant_id, f"{participant['callsign']} – {participant['full_name']}")
     flash("Vnos je izbrisan.", "success")
     return redirect(url_for("net_detail", net_id=net["id"]))
+
+
+@app.post("/nets/<int:net_id>/delete")
+@login_required
+def delete_net(net_id):
+    net = fetch_net(net_id)
+    if g.user["role"] != "admin" and net["leader_id"] != g.user["id"]:
+        abort(403)
+    if net["status"] != "open":
+        flash("Zaključenega skeda ni mogoče izbrisati.", "danger")
+        return redirect(url_for("net_detail", net_id=net_id))
+
+    db = get_db()
+    participant_count = db.execute(
+        "SELECT COUNT(*) AS n FROM participants WHERE net_id=?", (net_id,)
+    ).fetchone()["n"]
+    if participant_count:
+        flash("Skeda z vpisanimi udeleženci ni mogoče izbrisati.", "warning")
+        return redirect(url_for("net_detail", net_id=net_id))
+
+    db.execute("DELETE FROM nets WHERE id=?", (net_id,))
+    audit("delete", "net", net_id, f"{net['title']} ({net['net_date']})")
+    flash("Prazen odprt sked je izbrisan.", "success")
+    return redirect(url_for("dashboard"))
 
 
 @app.post("/nets/<int:net_id>/close")
@@ -739,7 +787,7 @@ main{max-width:1100px;margin:24px auto;padding:0 16px}.card{background:white;bor
 label{display:block;font-weight:700;margin:0 0 6px}.field{margin-bottom:14px}input,select{width:100%;padding:11px 12px;border:1px solid #aebdca;border-radius:9px;background:white;font:inherit}input:focus,select:focus{outline:3px solid #bddcff;border-color:var(--blue)}
 .btn{display:inline-block;border:0;border-radius:9px;padding:10px 15px;font-weight:750;cursor:pointer;text-decoration:none;font:inherit}.btn-primary{background:var(--blue);color:white}.btn-primary:hover{background:var(--blue2)}.btn-secondary{background:#e6edf3;color:#1d2b36}.btn-danger{background:#fee4e2;color:var(--danger)}.btn-success{background:#daf5e6;color:#075f34}.btn-small{padding:7px 10px;font-size:.9rem}
 table{width:100%;border-collapse:collapse}th,td{text-align:left;padding:11px 9px;border-bottom:1px solid var(--line)}th{background:var(--light);font-size:.88rem}tr:last-child td{border-bottom:0}.table-wrap{overflow-x:auto}.badge{display:inline-block;padding:4px 9px;border-radius:999px;font-size:.8rem;font-weight:750}.open{background:#d8f3e5;color:#075f34}.closed{background:#e7ebef;color:#45525d}.admin{background:#e5ddff;color:#4f2c90}.leader{background:#ddebfa;color:#164f7c}
-.flash{padding:12px 14px;border-radius:9px;margin-bottom:14px;background:#e7edf2}.flash.success{background:#dff5e9;color:#075f34}.flash.danger{background:#fee4e2;color:#8f1d14}.flash.warning{background:#fff1c7;color:#704b00}.muted{color:#65717c}.big-number{font-size:2rem;font-weight:850}.login{max-width:430px;margin:8vh auto}.inline{display:inline}.right{margin-left:auto}.empty{text-align:center;padding:30px;color:#65717c}.nowrap{white-space:nowrap}
+.flash{padding:12px 14px;border-radius:9px;margin-bottom:14px;background:#e7edf2}.flash.success{background:#dff5e9;color:#075f34}.flash.danger{background:#fee4e2;color:#8f1d14}.flash.warning{background:#fff1c7;color:#704b00}.muted{color:#65717c}.big-number{font-size:2rem;font-weight:850}.login{max-width:430px;margin:6vh auto 18px}.login-schedule{max-width:620px;margin:0 auto 24px;text-align:center}.saturday-number{margin-top:18px;padding-top:16px;border-top:1px solid #ffffff55}.inline{display:inline}.right{margin-left:auto}.empty{text-align:center;padding:30px;color:#65717c}.nowrap{white-space:nowrap}
 @media(max-width:700px){main{margin-top:14px}.card{padding:15px}.nav{gap:12px}.user{width:100%;order:3}th,td{padding:9px 6px}.hide-mobile{display:none}.btn{width:100%;text-align:center}.actions form{width:100%}.actions .btn-small{width:auto}.brand{width:100%}}
 @media print{header,.no-print,.flash,.footer{display:none!important}body{background:white}main{max-width:none;margin:0;padding:0}.card{border:0;box-shadow:none;padding:0}table{font-size:11pt}a{color:black;text-decoration:none}}
 </style></head><body>
@@ -747,17 +795,17 @@ table{width:100%;border-collapse:collapse}th,td{text-align:left;padding:11px 9px
 <main>{% with msgs=get_flashed_messages(with_categories=true) %}{% for category,msg in msgs %}<div class="flash {{ category }}">{{ msg }}</div>{% endfor %}{% endwith %}{% block content %}{% endblock %}</main>
 <footer class="footer">{{ app_name }} · različica {{ app_version }}</footer>
 </body></html>''',
-"login.html": r'''{% extends "base.html" %}{% block title %}Prijava · {{ app_name }}{% endblock %}{% block content %}<div class="card login"><h1>📻 S50TTT</h1><h2>Dnevnik skedov</h2><p class="muted">Prijava za vodje skeda</p><form method="post"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><div class="field"><label>Uporabniško ime</label><input name="username" autocomplete="username" required autofocus></div><div class="field"><label>Geslo</label><input type="password" name="password" autocomplete="current-password" required></div><button class="btn btn-primary" type="submit">Prijava</button></form></div>{% endblock %}''',
+"login.html": r'''{% extends "base.html" %}{% block title %}Prijava · {{ app_name }}{% endblock %}{% block content %}<div class="card login"><h1>📻 S50TTT</h1><h2>Dnevnik skedov</h2><p class="muted">Prijava za vodje skeda</p><form method="post"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><div class="field"><label>Uporabniško ime</label><input name="username" autocomplete="username" required autofocus></div><div class="field"><label>Geslo</label><input type="password" name="password" autocomplete="current-password" required></div><button class="btn btn-primary" type="submit">Prijava</button></form></div>
+<div class="card countdown-card login-schedule" data-countdown="{{ countdown_net['starts_at_iso'] }}"><p class="muted">Do naslednjega rednega skeda</p><div class="countdown-value" data-countdown-value>Izračunavam …</div><p><b>{{ countdown_net['label'] }}</b><br>{{ countdown_net['date']|date_si }} ob {{ countdown_net['time'] }}{% if countdown_net['repeater'] %} · {{ countdown_net['repeater'] }}{% endif %}</p><p class="saturday-number">Naslednji redni sobotni sked:<br><b>št. {{ next_saturday['sequence_number'] }}</b> · {{ next_saturday['date']|date_si }} ob {{ next_saturday['time'] }}<br>{{ next_saturday['repeater'] }}</p></div>
+<script>(function(){const card=document.querySelector('[data-countdown]');if(!card)return;const output=card.querySelector('[data-countdown-value]');const target=Date.parse(card.dataset.countdown);function pad(value){return String(value).padStart(2,'0')}function update(){const remaining=target-Date.now();if(remaining<=0){output.textContent='Sked se je začel';return}const total=Math.floor(remaining/1000);const days=Math.floor(total/86400);const hours=Math.floor((total%86400)/3600);const minutes=Math.floor((total%3600)/60);const seconds=total%60;output.textContent=(days?days+' dni · ':'')+pad(hours)+':'+pad(minutes)+':'+pad(seconds)}update();setInterval(update,1000)})();</script>{% endblock %}''',
 "dashboard.html": r'''{% extends "base.html" %}{% block content %}
-<div class="card countdown-card" data-countdown="{{ countdown_net['starts_at_iso'] }}"><p class="muted">Do naslednjega rednega skeda</p><div class="countdown-value" data-countdown-value>Izračunavam …</div><p><b>{{ countdown_net['label'] }}</b><br>{{ countdown_net['date']|date_si }} ob {{ countdown_net['time'] }}{% if countdown_net['repeater'] %} · {{ countdown_net['repeater'] }}{% endif %}</p></div>
 <div class="card"><h1>Naslednji redni skedi</h1><p class="muted">Portal samodejno upošteva mesečni in sezonski sobotni urnik Radiokluba Sevnica.</p><div class="grid">{% for s in scheduled_nets %}<div class="schedule-box"><span class="badge leader">{{ 'Mesečni' if s['schedule_type']=='monthly' else 'Sobotni' }}</span>{% if s['existing_status'] %} <span class="badge {{ s['existing_status'] }}">{{ 'Odprt' if s['existing_status']=='open' else 'Zaključen' }}</span>{% endif %}<h2>{{ s['label'] }}</h2><p><b>{{ s['date']|date_si }}</b> ob {{ s['time'] }}<br>Upravna postaja: <b>{{ s['control_callsign'] }}</b>{% if s['repeater'] %}<br>Repetitor: {{ s['repeater'] }}{% endif %}</p><p class="muted">{{ s['rule'] }}</p>{% if s['existing_id'] %}<a class="btn btn-primary" href="{{ url_for('net_detail',net_id=s['existing_id']) }}">Odpri obstoječi dnevnik</a>{% else %}<form method="post" action="{{ url_for('new_net') }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="schedule_type" value="{{ s['schedule_type'] }}"><input type="hidden" name="net_date" value="{{ s['date'] }}"><input type="hidden" name="started_time" value="{{ s['time'] }}"><button class="btn btn-primary">Odpri ta dnevnik</button></form>{% endif %}</div>{% endfor %}</div></div>
 <div class="card"><h2>Drug ali izredni sked</h2><p class="muted">Po potrebi odpri dnevnik z ročno izbranim datumom in uro.</p><form method="post" action="{{ url_for('new_net') }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><div class="grid"><div class="field"><label>Naslov (neobvezno)</label><input name="title" placeholder="Samodejno: Sked DD. MM. LLLL"></div><div class="field"><label>Datum</label><input type="date" name="net_date" value="{{ now_local_value if now_local_value else '' }}" required></div><div class="field"><label>Začetna ura</label><input type="time" name="started_time" value="{{ current_time if current_time else '' }}" required></div></div><button class="btn btn-secondary">＋ Odpri izredni sked</button></form></div>
 {% if open_nets %}<h2>Odprti skedi</h2><div class="grid">{% for n in open_nets %}<div class="card"><span class="badge open">Odprt</span><h2>{{ n['title'] }}</h2><p><b>{{ n['net_date']|date_si }}</b> ob {{ n['started_at']|time_si }}<br>Vodja: {{ n['leader_name'] }} ({{ n['leader_callsign'] }})</p><p><span class="big-number">{{ n['participant_count'] }}</span> prijavljenih</p><a class="btn btn-primary" href="{{ url_for('net_detail',net_id=n['id']) }}">Odpri dnevnik</a></div>{% endfor %}</div>{% endif %}
 <div class="card"><div class="actions"><h2>Zadnji zaključeni skedi</h2><a class="btn btn-secondary right" href="{{ url_for('archive') }}">Celoten arhiv</a></div>{% if recent %}<div class="table-wrap"><table><thead><tr><th>Sked</th><th>Vodja</th><th>Prijavljeni</th><th></th></tr></thead><tbody>{% for n in recent %}<tr><td><b>{{ n['title'] }}</b><br><span class="muted">{{ n['net_date']|date_si }} ob {{ n['started_at']|time_si }}</span></td><td>{{ n['leader_callsign'] }}</td><td>{{ n['participant_count'] }}</td><td><a class="btn btn-secondary btn-small" href="{{ url_for('net_detail',net_id=n['id']) }}">Pregled</a></td></tr>{% endfor %}</tbody></table></div>{% else %}<p class="empty">V arhivu še ni skedov.</p>{% endif %}</div>
-<script>(function(){const card=document.querySelector('[data-countdown]');if(!card)return;const output=card.querySelector('[data-countdown-value]');const target=Date.parse(card.dataset.countdown);function pad(value){return String(value).padStart(2,'0')}function update(){const remaining=target-Date.now();if(remaining<=0){output.textContent='Sked se je začel';return}const total=Math.floor(remaining/1000);const days=Math.floor(total/86400);const hours=Math.floor((total%86400)/3600);const minutes=Math.floor((total%3600)/60);const seconds=total%60;output.textContent=(days?days+' dni · ':'')+pad(hours)+':'+pad(minutes)+':'+pad(seconds)}update();setInterval(update,1000)})();</script>
 {% endblock %}''',
 "net.html": r'''{% extends "base.html" %}{% block title %}{{ net['title'] }} · {{ app_name }}{% endblock %}{% block content %}
-<div class="card"><div class="actions"><div><span class="badge {{ net['status'] }}">{{ 'Odprt' if net['status']=='open' else 'Zaključen' }}</span>{% if net['schedule_type'] %} <span class="badge leader">Redni sked</span>{% endif %}<h1>{{ net['title'] }}</h1><p>{{ net['net_date']|date_si }} · začetek {{ net['started_at']|time_si }}{% if net['ended_at'] %} · konec {{ net['ended_at']|time_si }}{% endif %}{% if net['control_callsign'] %}<br>Upravna postaja: <b>{{ net['control_callsign'] }}</b>{% endif %}{% if net['repeater'] %}<br>Repetitor: <b>{{ net['repeater'] }}</b>{% endif %}<br>Operater: <b>{{ net['leader_name'] }} ({{ net['leader_callsign'] }})</b></p></div><div class="actions right no-print"><button class="btn btn-secondary" onclick="window.print()">🖨 Natisni / PDF</button>{% if net['status']=='open' %}<form method="post" action="{{ url_for('close_net',net_id=net['id']) }}" onsubmit="return confirm('Zaključim ta sked?')"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="btn btn-success">✓ Zaključi sked</button></form>{% elif g.user['role']=='admin' %}<form method="post" action="{{ url_for('reopen_net',net_id=net['id']) }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="btn btn-secondary">Ponovno odpri</button></form>{% endif %}</div></div></div>
+<div class="card"><div class="actions"><div><span class="badge {{ net['status'] }}">{{ 'Odprt' if net['status']=='open' else 'Zaključen' }}</span>{% if net['schedule_type'] %} <span class="badge leader">Redni sked</span>{% endif %}<h1>{{ net['title'] }}</h1><p>{{ net['net_date']|date_si }} · začetek {{ net['started_at']|time_si }}{% if net['ended_at'] %} · konec {{ net['ended_at']|time_si }}{% endif %}{% if net['control_callsign'] %}<br>Upravna postaja: <b>{{ net['control_callsign'] }}</b>{% endif %}{% if net['repeater'] %}<br>Repetitor: <b>{{ net['repeater'] }}</b>{% endif %}<br>Operater: <b>{{ net['leader_name'] }} ({{ net['leader_callsign'] }})</b></p></div><div class="actions right no-print"><button class="btn btn-secondary" onclick="window.print()">🖨 Natisni / PDF</button>{% if net['status']=='open' %}{% if can_delete_net %}<form method="post" action="{{ url_for('delete_net',net_id=net['id']) }}" onsubmit="return confirm('Izbrišem ta prazen odprt sked? Tega dejanja ni mogoče razveljaviti.')"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="btn btn-danger">Izbriši prazen sked</button></form>{% endif %}<form method="post" action="{{ url_for('close_net',net_id=net['id']) }}" onsubmit="return confirm('Zaključim ta sked?')"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="btn btn-success">✓ Zaključi sked</button></form>{% elif g.user['role']=='admin' %}<form method="post" action="{{ url_for('reopen_net',net_id=net['id']) }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="btn btn-secondary">Ponovno odpri</button></form>{% endif %}</div></div></div>
 {% if net['status']=='open' %}<div class="card no-print"><h2>Dodaj prijavljenega</h2><form method="post" action="{{ url_for('add_participant',net_id=net['id']) }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><div class="grid"><div class="field"><label>Ime in priimek</label><input name="full_name" required autofocus autocomplete="off"></div><div class="field"><label>Klicni znak</label><input name="callsign" required autocomplete="off" style="text-transform:uppercase"></div><div class="field"><label>Ura prijave</label><input type="time" name="checkin_time" value="{{ now.strftime('%H:%M') }}" required></div></div><button class="btn btn-primary">＋ Dodaj v dnevnik</button></form></div>{% endif %}
 <div class="card"><h2>Prijavljeni: {{ participants|length }}</h2>{% if participants %}<div class="table-wrap"><table><thead><tr><th>Št.</th><th>Ura</th><th>Klicni znak</th><th>Ime in priimek</th><th class="no-print">Vnesel</th><th class="no-print"></th></tr></thead><tbody>{% for p in participants %}<tr><td>{{ loop.index }}</td><td class="nowrap">{{ p['checkin_at']|time_si }}</td><td><b>{{ p['callsign'] }}</b></td><td>{{ p['full_name'] }}</td><td class="no-print">{{ p['entered_by_name'] }}</td><td class="no-print"><div class="actions"><a class="btn btn-secondary btn-small" href="{{ url_for('edit_participant',participant_id=p['id']) }}">Uredi</a><form method="post" action="{{ url_for('delete_participant',participant_id=p['id']) }}" onsubmit="return confirm('Izbrišem {{ p['callsign'] }}?')"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="btn btn-danger btn-small">Izbriši</button></form></div></td></tr>{% endfor %}</tbody></table></div>{% else %}<p class="empty">V tem skedu še ni prijavljenih.</p>{% endif %}</div>
 {% endblock %}''',

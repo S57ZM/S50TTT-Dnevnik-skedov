@@ -14,8 +14,11 @@ from app import (  # noqa: E402
     SCHEDULE_MONTHLY,
     SCHEDULE_SATURDAY,
     app as flask_app,
+    get_db,
     next_countdown_net,
     next_scheduled_nets,
+    next_saturday_net,
+    now_db,
     saturday_net_number,
     saturday_start_time,
     scheduled_net_for_date,
@@ -23,11 +26,44 @@ from app import (  # noqa: E402
 
 
 class ScheduleTests(unittest.TestCase):
+    def create_open_net(self, title):
+        with flask_app.app_context():
+            db = get_db()
+            admin_id = db.execute(
+                "SELECT id FROM users WHERE role='admin' ORDER BY id LIMIT 1"
+            ).fetchone()["id"]
+            cursor = db.execute(
+                """INSERT INTO nets
+                   (title, net_date, started_at, status, leader_id, created_at)
+                   VALUES (?, '2030-01-05', '2030-01-05 20:00:00', 'open', ?, ?)""",
+                (title, admin_id, now_db()),
+            )
+            db.commit()
+            return cursor.lastrowid, admin_id
+
+    def post_delete_net(self, net_id, user_id):
+        client = flask_app.test_client()
+        with client.session_transaction() as session:
+            session["user_id"] = user_id
+            session["csrf_token"] = "test-csrf-token"
+        return client.post(
+            f"/nets/{net_id}/delete",
+            data={"csrf_token": "test-csrf-token"},
+        )
+
     def test_health_reports_application_version(self):
         response = flask_app.test_client().get("/health")
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.get_json()["version"], APP_VERSION)
+
+    def test_login_shows_countdown_and_next_saturday_number(self):
+        response = flask_app.test_client().get("/login")
+        html = response.get_data(as_text=True)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("data-countdown=", html)
+        self.assertIn("Naslednji redni sobotni sked", html)
 
     def test_next_summer_saturday_and_monthly_net(self):
         scheduled = next_scheduled_nets(datetime(2026, 7, 19, 12, 0))
@@ -68,6 +104,41 @@ class ScheduleTests(unittest.TestCase):
 
         self.assertEqual(scheduled["date"], "2026-08-01")
         self.assertEqual(scheduled["sequence_number"], 396)
+
+        next_saturday = next_saturday_net(datetime(2026, 7, 25, 21, 1))
+        self.assertEqual(next_saturday["sequence_number"], 396)
+
+    def test_empty_open_net_can_be_deleted(self):
+        net_id, admin_id = self.create_open_net("Prazen testni sked")
+
+        response = self.post_delete_net(net_id, admin_id)
+
+        self.assertEqual(response.status_code, 302)
+        with flask_app.app_context():
+            self.assertIsNone(
+                get_db().execute("SELECT id FROM nets WHERE id=?", (net_id,)).fetchone()
+            )
+
+    def test_net_with_participant_cannot_be_deleted(self):
+        net_id, admin_id = self.create_open_net("Testni sked z udeležencem")
+        with flask_app.app_context():
+            db = get_db()
+            db.execute(
+                """INSERT INTO participants
+                   (net_id, full_name, callsign, checkin_at, created_by, created_at)
+                   VALUES (?, 'Testni Radioamater', 'S59TEST',
+                           '2030-01-05 20:05:00', ?, ?)""",
+                (net_id, admin_id, now_db()),
+            )
+            db.commit()
+
+        response = self.post_delete_net(net_id, admin_id)
+
+        self.assertEqual(response.status_code, 302)
+        with flask_app.app_context():
+            self.assertIsNotNone(
+                get_db().execute("SELECT id FROM nets WHERE id=?", (net_id,)).fetchone()
+            )
 
 
 if __name__ == "__main__":
