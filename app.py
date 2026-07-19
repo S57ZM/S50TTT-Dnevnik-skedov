@@ -1,5 +1,6 @@
 import csv
 import hmac
+import ipaddress
 import io
 import json
 import os
@@ -21,7 +22,7 @@ from backup import backup_path, create_backup, list_backups, verify_database
 
 
 APP_NAME = "S50TTT Dnevnik skedov"
-BASE_VERSION = "1.14.0"
+BASE_VERSION = "1.15.0"
 RELEASE_CHANNEL = os.environ.get("RELEASE_CHANNEL", "stable").strip().lower()
 if RELEASE_CHANNEL not in {"stable", "alpha"}:
     RELEASE_CHANNEL = "stable"
@@ -30,10 +31,16 @@ APP_VERSION = (
 )
 DB_PATH = os.environ.get("DATABASE_PATH", "/app/data/skedi.db")
 TIMEZONE = ZoneInfo(os.environ.get("TZ", "Europe/Ljubljana"))
+TRUST_PROXY = os.environ.get("TRUST_PROXY", "0").strip() == "1"
 SCHEDULE_MONTHLY = "monthly"
 SCHEDULE_SATURDAY = "saturday"
 SCHEDULE_TYPES = {SCHEDULE_MONTHLY, SCHEDULE_SATURDAY}
 SATURDAY_SERIES_START = date(2019, 1, 5)
+LOGIN_MAX_FAILURES = 5
+LOGIN_LOCK_MINUTES = 15
+LOGIN_IP_MAX_FAILURES = 20
+LOGIN_ATTEMPT_RETENTION = 5000
+DUMMY_PASSWORD_HASH = generate_password_hash(secrets.token_urlsafe(32))
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY") or secrets.token_hex(32)
@@ -42,7 +49,8 @@ app.config.update(
     SESSION_COOKIE_SAMESITE="Lax",
     MAX_CONTENT_LENGTH=1024 * 1024,
 )
-app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
+if TRUST_PROXY:
+    app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
 
 
 def now_local():
@@ -331,6 +339,16 @@ def init_db():
             created_at TEXT NOT NULL
         );
 
+        CREATE TABLE IF NOT EXISTS login_attempts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER REFERENCES users(id),
+            username TEXT NOT NULL,
+            ip_address TEXT NOT NULL,
+            success INTEGER NOT NULL DEFAULT 0,
+            reason TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+
         CREATE TABLE IF NOT EXISTS nets (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             title TEXT NOT NULL,
@@ -420,6 +438,10 @@ def init_db():
             ON callsign_directory(active, callsign);
         CREATE INDEX IF NOT EXISTS idx_schedule_exceptions_date
             ON schedule_exceptions(scheduled_date);
+        CREATE INDEX IF NOT EXISTS idx_login_attempts_created
+            ON login_attempts(created_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_login_attempts_ip
+            ON login_attempts(ip_address, created_at DESC);
         """
     )
 
@@ -440,6 +462,20 @@ def init_db():
         """UPDATE nets SET scheduled_date=net_date
            WHERE schedule_type IS NOT NULL AND scheduled_date IS NULL"""
     )
+    user_columns = {row["name"] for row in db.execute("PRAGMA table_info(users)")}
+    for column, declaration in {
+        "failed_login_count": "INTEGER NOT NULL DEFAULT 0",
+        "last_failed_login_at": "TEXT",
+        "locked_until": "TEXT",
+        "last_login_at": "TEXT",
+        "last_login_ip": "TEXT",
+    }.items():
+        if column not in user_columns:
+            try:
+                db.execute(f"ALTER TABLE users ADD COLUMN {column} {declaration}")
+            except sqlite3.OperationalError as error:
+                if "duplicate column name" not in str(error).lower():
+                    raise
     db.execute("DROP INDEX IF EXISTS idx_nets_schedule_date")
     db.execute(
         """CREATE UNIQUE INDEX IF NOT EXISTS idx_nets_schedule_date
@@ -570,6 +606,37 @@ def valid_password(password):
     return len(password) >= 10
 
 
+def client_ip_address():
+    raw_value = (request.remote_addr or "").strip()
+    try:
+        return ipaddress.ip_address(raw_value).compressed
+    except ValueError:
+        return "unknown"
+
+
+def record_login_attempt(user, username, ip_address_value, success, reason, created_at):
+    db = get_db()
+    db.execute(
+        """INSERT INTO login_attempts
+           (user_id, username, ip_address, success, reason, created_at)
+           VALUES (?, ?, ?, ?, ?, ?)""",
+        (
+            user["id"] if user else None,
+            username[:120],
+            ip_address_value[:64],
+            1 if success else 0,
+            reason[:40],
+            created_at,
+        ),
+    )
+    db.execute(
+        """DELETE FROM login_attempts WHERE id NOT IN
+           (SELECT id FROM login_attempts ORDER BY id DESC LIMIT ?)""",
+        (LOGIN_ATTEMPT_RETENTION,),
+    )
+    db.commit()
+
+
 @app.route("/health")
 def health():
     return {
@@ -586,15 +653,129 @@ def login():
     if request.method == "POST":
         username = request.form.get("username", "").strip()
         password = request.form.get("password", "")
-        user = get_db().execute(
+        db = get_db()
+        current = now_local()
+        current_text = current.strftime("%Y-%m-%d %H:%M:%S")
+        ip_address_value = client_ip_address()
+        cutoff = (current - timedelta(minutes=LOGIN_LOCK_MINUTES)).strftime(
+            "%Y-%m-%d %H:%M:%S"
+        )
+        recent_ip_failures = db.execute(
+            """SELECT COUNT(*) AS n FROM login_attempts
+               WHERE ip_address=? AND success=0 AND created_at>=?""",
+            (ip_address_value, cutoff),
+        ).fetchone()["n"]
+        user = db.execute(
             "SELECT * FROM users WHERE username = ? AND active = 1", (username,)
         ).fetchone()
-        if user and check_password_hash(user["password_hash"], password):
-            session.clear()
-            session["user_id"] = user["id"]
-            session["csrf_token"] = secrets.token_urlsafe(32)
-            return redirect(url_for("dashboard"))
-        flash("Napačno uporabniško ime ali geslo.", "danger")
+
+        if recent_ip_failures >= LOGIN_IP_MAX_FAILURES:
+            check_password_hash(DUMMY_PASSWORD_HASH, password)
+            record_login_attempt(
+                user, username, ip_address_value, False, "ip_limited", current_text
+            )
+            flash(
+                "Prijava ni uspela. Preveri podatke ali poskusi znova čez 15 minut.",
+                "danger",
+            )
+        else:
+            if user and user["last_failed_login_at"] and user["last_failed_login_at"] < cutoff:
+                db.execute(
+                    """UPDATE users SET failed_login_count=0,
+                       last_failed_login_at=NULL, locked_until=NULL WHERE id=?""",
+                    (user["id"],),
+                )
+                db.commit()
+                user = db.execute(
+                    "SELECT * FROM users WHERE id=?", (user["id"],)
+                ).fetchone()
+
+            if user and user["locked_until"]:
+                locked_until = datetime.fromisoformat(user["locked_until"])
+                if locked_until <= current:
+                    db.execute(
+                        """UPDATE users SET failed_login_count=0,
+                           last_failed_login_at=NULL, locked_until=NULL WHERE id=?""",
+                        (user["id"],),
+                    )
+                    db.commit()
+                    user = db.execute(
+                        "SELECT * FROM users WHERE id=?", (user["id"],)
+                    ).fetchone()
+
+            account_locked = bool(
+                user
+                and user["locked_until"]
+                and datetime.fromisoformat(user["locked_until"]) > current
+            )
+            password_ok = check_password_hash(
+                user["password_hash"] if user else DUMMY_PASSWORD_HASH, password
+            )
+            if user and not account_locked and password_ok:
+                previous_login = user["last_login_at"]
+                db.execute(
+                    """UPDATE users SET failed_login_count=0,
+                       last_failed_login_at=NULL, locked_until=NULL,
+                       last_login_at=?, last_login_ip=? WHERE id=?""",
+                    (current_text, ip_address_value, user["id"]),
+                )
+                db.commit()
+                record_login_attempt(
+                    user, username, ip_address_value, True, "success", current_text
+                )
+                session.clear()
+                session["user_id"] = user["id"]
+                session["csrf_token"] = secrets.token_urlsafe(32)
+                if previous_login:
+                    flash(
+                        "Prejšnja uspešna prijava: "
+                        + datetime.fromisoformat(previous_login).strftime(
+                            "%d. %m. %Y ob %H:%M"
+                        ),
+                        "success",
+                    )
+                return redirect(url_for("dashboard"))
+
+            reason = "account_locked" if account_locked else "invalid_credentials"
+            if user and not account_locked:
+                lock_until_text = (
+                    current + timedelta(minutes=LOGIN_LOCK_MINUTES)
+                ).strftime("%Y-%m-%d %H:%M:%S")
+                db.execute(
+                    """UPDATE users
+                       SET failed_login_count=failed_login_count+1,
+                           last_failed_login_at=?,
+                           locked_until=CASE
+                               WHEN failed_login_count+1>=? THEN ? ELSE NULL END
+                       WHERE id=?""",
+                    (current_text, LOGIN_MAX_FAILURES, lock_until_text, user["id"]),
+                )
+                updated = db.execute(
+                    "SELECT failed_login_count FROM users WHERE id=?", (user["id"],)
+                ).fetchone()
+                if updated["failed_login_count"] >= LOGIN_MAX_FAILURES:
+                    reason = "account_locked"
+                    db.execute(
+                        """INSERT INTO audit_log
+                           (user_id, action, entity_type, entity_id, details, created_at)
+                           VALUES (NULL, 'login_locked', 'user', ?, ?, ?)""",
+                        (
+                            user["id"],
+                            json.dumps(
+                                {"username": user["username"], "ip": ip_address_value},
+                                ensure_ascii=False,
+                            ),
+                            current_text,
+                        ),
+                    )
+                db.commit()
+            record_login_attempt(
+                user, username, ip_address_value, False, reason, current_text
+            )
+            flash(
+                "Prijava ni uspela. Preveri podatke ali poskusi znova čez 15 minut.",
+                "danger",
+            )
     countdown_net = next_effective_countdown_net()
     displayed_saturday = next_effective_saturday_net()
     return render_template(
@@ -1725,7 +1906,71 @@ def edit_callsign(entry_id):
 @admin_required
 def users():
     rows = get_db().execute("SELECT * FROM users ORDER BY active DESC, full_name").fetchall()
-    return render_template("users.html", users=rows)
+    return render_template("users_v2.html", users=rows, now_value=now_db())
+
+
+@app.route("/security")
+@admin_required
+def security_view():
+    result = request.args.get("result", "all").strip()
+    query = request.args.get("q", "").strip()
+    if result not in {"all", "success", "failed", "limited"}:
+        result = "all"
+    clauses = []
+    parameters = []
+    if result == "success":
+        clauses.append("a.success=1")
+    elif result == "failed":
+        clauses.append("a.success=0")
+    elif result == "limited":
+        clauses.append("a.reason IN ('account_locked','ip_limited')")
+    if query:
+        clauses.append("(a.username LIKE ? OR a.ip_address LIKE ?)")
+        search = f"%{query}%"
+        parameters.extend([search, search])
+    where = " WHERE " + " AND ".join(clauses) if clauses else ""
+    db = get_db()
+    attempts = db.execute(
+        f"""SELECT a.*, u.full_name AS user_name, u.callsign AS user_callsign
+            FROM login_attempts a LEFT JOIN users u ON u.id=a.user_id
+            {where} ORDER BY a.id DESC LIMIT 200""",
+        parameters,
+    ).fetchall()
+    accounts = db.execute(
+        """SELECT id, username, full_name, callsign, active, failed_login_count,
+                  locked_until, last_login_at, last_login_ip
+           FROM users ORDER BY active DESC, full_name"""
+    ).fetchall()
+    return render_template(
+        "security.html",
+        attempts=attempts,
+        accounts=accounts,
+        selected_result=result,
+        query=query,
+        now_value=now_db(),
+        max_failures=LOGIN_MAX_FAILURES,
+        lock_minutes=LOGIN_LOCK_MINUTES,
+        ip_max_failures=LOGIN_IP_MAX_FAILURES,
+    )
+
+
+@app.post("/users/<int:user_id>/unlock")
+@admin_required
+def unlock_user(user_id):
+    user = get_db().execute(
+        "SELECT id, username FROM users WHERE id=?", (user_id,)
+    ).fetchone()
+    if user is None:
+        abort(404)
+    get_db().execute(
+        """UPDATE users SET failed_login_count=0, last_failed_login_at=NULL,
+           locked_until=NULL WHERE id=?""",
+        (user_id,),
+    )
+    get_db().commit()
+    audit("unlock", "user", user_id, user["username"])
+    flash("Uporabniški račun je odklenjen.", "success")
+    return redirect(url_for("security_view"))
 
 
 @app.route("/users/new", methods=["GET", "POST"])
@@ -1848,6 +2093,8 @@ def audit_action_si(value):
         "reopen": "Ponovno odprto",
         "learn": "Dodano v imenik",
         "password_change": "Sprememba gesla",
+        "login_locked": "Blokirana prijava",
+        "unlock": "Odklep računa",
     }.get(value, value)
 
 
@@ -1870,6 +2117,16 @@ def filesize_si(value):
         if size < 1024 or unit == "GB":
             return f"{size:.0f} {unit}" if unit == "B" else f"{size:.1f} {unit}"
         size /= 1024
+
+
+@app.template_filter("login_reason_si")
+def login_reason_si(value):
+    return {
+        "success": "Uspešna prijava",
+        "invalid_credentials": "Napačni podatki",
+        "account_locked": "Zaklenjen račun",
+        "ip_limited": "Omejen naslov IP",
+    }.get(value, value)
 
 
 TEMPLATES = {
@@ -1952,12 +2209,16 @@ TEMPLATES.update({
 
 TEMPLATES["backups.html"] = r'''{% extends "base.html" %}{% block title %}Varnostne kopije · {{ app_name }}{% endblock %}{% block content %}<div class="card"><div class="actions"><div><h1>Varnostne kopije</h1><p class="muted">Portal vsak dan izdela preverjeno kopijo SQLite baze in ohrani zadnjih 30 kopij.</p></div><form class="right" method="post" action="{{ url_for('create_backup_view') }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="btn btn-primary">Izdelaj kopijo zdaj</button></form></div></div><div class="card"><h2>Shranjene kopije: {{ backups|length }}</h2>{% if backups %}<div class="table-wrap"><table><thead><tr><th>Datoteka</th><th>Čas izdelave</th><th>Velikost</th><th></th></tr></thead><tbody>{% for backup in backups %}<tr><td><b>{{ backup['name'] }}</b>{% if backup['name'].startswith('auto-') %}<br><span class="muted">Samodejna</span>{% elif backup['name'].startswith('pre-restore-') %}<br><span class="muted">Pred obnovo</span>{% else %}<br><span class="muted">Ročna</span>{% endif %}</td><td class="nowrap">{{ backup['modified_at']|datetime_si }}</td><td>{{ backup['size']|filesize_si }}</td><td><a class="btn btn-secondary btn-small" href="{{ url_for('download_backup',name=backup['name']) }}">Prenesi</a></td></tr>{% endfor %}</tbody></table></div>{% else %}<p class="empty">Varnostna kopija še ni bila izdelana.</p>{% endif %}</div><div class="card"><h2>Obnovitev baze</h2><div class="flash warning">Obnovitev namenoma ni mogoča med delovanjem portala. Najprej prenesi izbrano kopijo tudi na drugo napravo, nato portal in storitev za kopije ustavi ter uporabi dokumentirani ukaz na strežniku.</div><p class="muted">Pred obnovitvijo orodje preveri kopijo in samodejno izdela še varnostno kopijo trenutne baze.</p></div>{% endblock %}'''
 
+TEMPLATES["users_v2.html"] = r'''{% extends "base.html" %}{% block content %}<div class="card"><div class="actions"><h1>Uporabniki</h1><a class="btn btn-primary right" href="{{ url_for('new_user') }}">＋ Novi uporabnik</a></div><div class="table-wrap"><table><thead><tr><th>Uporabnik</th><th>Ime in klicni znak</th><th>Vloga</th><th>Zadnja prijava</th><th>Varnost</th><th></th></tr></thead><tbody>{% for user in users %}<tr><td><b>{{ user['username'] }}</b><br>{{ 'Aktiven' if user['active'] else 'Onemogočen' }}</td><td>{{ user['full_name'] }}<br><b>{{ user['callsign'] }}</b></td><td><span class="badge {{ user['role'] }}">{{ 'Administrator' if user['role']=='admin' else 'Vodja skeda' }}</span></td><td>{% if user['last_login_at'] %}{{ user['last_login_at']|datetime_si }}{% if user['last_login_ip'] %}<br><span class="muted">IP: {{ user['last_login_ip'] }}</span>{% endif %}{% else %}–{% endif %}</td><td>{% if user['locked_until'] and user['locked_until']>now_value %}<span class="badge canceled">Zaklenjen</span><br><small>do {{ user['locked_until']|datetime_si }}</small>{% elif user['failed_login_count'] %}<span class="badge postponed">{{ user['failed_login_count'] }} napačnih poskusov</span>{% else %}<span class="badge open">V redu</span>{% endif %}</td><td><a class="btn btn-secondary btn-small" href="{{ url_for('edit_user',user_id=user['id']) }}">Uredi</a></td></tr>{% endfor %}</tbody></table></div></div>{% endblock %}'''
+
+TEMPLATES["security.html"] = r'''{% extends "base.html" %}{% block title %}Varnost prijav · {{ app_name }}{% endblock %}{% block content %}<div class="card"><h1>Varnost prijav</h1><p class="muted">Po {{ max_failures }} napačnih geslih se račun zaklene za {{ lock_minutes }} minut. Po {{ ip_max_failures }} neuspešnih poskusih z istega naslova v {{ lock_minutes }} minutah se začasno omeji tudi ta naslov.</p><div class="table-wrap"><table><thead><tr><th>Uporabnik</th><th>Zadnja uspešna prijava</th><th>Napačni poskusi</th><th>Status</th><th></th></tr></thead><tbody>{% for account in accounts %}<tr><td>{{ account['full_name'] }}<br><b>{{ account['callsign'] }}</b> · {{ account['username'] }}</td><td>{% if account['last_login_at'] %}{{ account['last_login_at']|datetime_si }}<br><span class="muted">{{ account['last_login_ip'] or '' }}</span>{% else %}–{% endif %}</td><td>{{ account['failed_login_count'] }}</td><td>{% if account['locked_until'] and account['locked_until']>now_value %}<span class="badge canceled">Zaklenjen do {{ account['locked_until']|datetime_si }}</span>{% elif account['active'] %}<span class="badge open">Aktiven</span>{% else %}<span class="badge closed">Onemogočen</span>{% endif %}</td><td>{% if account['locked_until'] or account['failed_login_count'] %}<form method="post" action="{{ url_for('unlock_user',user_id=account['id']) }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="btn btn-secondary btn-small">Odkleni</button></form>{% endif %}</td></tr>{% endfor %}</tbody></table></div></div><div class="card"><h2>Zadnjih 200 poskusov prijave</h2><form method="get" class="actions" style="margin-bottom:16px"><input name="q" value="{{ query }}" placeholder="Uporabniško ime ali IP" style="max-width:300px"><select name="result" style="max-width:220px"><option value="all">Vsi poskusi</option><option value="success" {% if selected_result=='success' %}selected{% endif %}>Uspešni</option><option value="failed" {% if selected_result=='failed' %}selected{% endif %}>Neuspešni</option><option value="limited" {% if selected_result=='limited' %}selected{% endif %}>Blokirani</option></select><button class="btn btn-primary">Filtriraj</button><a class="btn btn-secondary" href="{{ url_for('security_view') }}">Počisti</a></form>{% if attempts %}<div class="table-wrap"><table><thead><tr><th>Čas</th><th>Vpisano uporabniško ime</th><th>Naslov IP</th><th>Rezultat</th></tr></thead><tbody>{% for attempt in attempts %}<tr><td class="nowrap">{{ attempt['created_at']|datetime_si }}</td><td>{{ attempt['username'] }}{% if attempt['user_callsign'] %}<br><b>{{ attempt['user_callsign'] }}</b>{% endif %}</td><td>{{ attempt['ip_address'] }}</td><td><span class="badge {{ 'open' if attempt['success'] else 'canceled' }}">{{ attempt['reason']|login_reason_si }}</span></td></tr>{% endfor %}</tbody></table></div>{% else %}<p class="empty">Poskusov prijave še ni.</p>{% endif %}</div>{% endblock %}'''
+
 TEMPLATES["base.html"] = TEMPLATES["base.html"].replace(
     '<a href="{{ url_for(\'callsigns\') }}">Imenik</a>',
     '<a href="{{ url_for(\'callsigns\') }}">Imenik</a><a href="{{ url_for(\'statistics\') }}">Statistika</a>',
 ).replace(
     '<a href="{{ url_for(\'users\') }}">Uporabniki</a>',
-    '<a href="{{ url_for(\'users\') }}">Uporabniki</a><a href="{{ url_for(\'audit_log_view\') }}">Revizija</a><a href="{{ url_for(\'backups_view\') }}">Kopije</a>',
+    '<a href="{{ url_for(\'users\') }}">Uporabniki</a><a href="{{ url_for(\'audit_log_view\') }}">Revizija</a><a href="{{ url_for(\'security_view\') }}">Varnost</a><a href="{{ url_for(\'backups_view\') }}">Kopije</a>',
 ).replace(
     '</style>',
     r'''.report-filters{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;align-items:end}.report-filters .field{margin:0}.stats-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:14px}.stat{text-align:center}.stat span{display:block;color:#65717c}.stat strong{display:block;font-size:2rem;margin-top:5px}.bar-chart{display:grid;gap:12px}.bar-row{display:grid;grid-template-columns:minmax(95px,1.2fr) minmax(110px,3fr) 42px minmax(62px,auto);gap:9px;align-items:center}.bar-track{height:13px;background:#e7edf2;border-radius:999px;overflow:hidden}.bar-track i{display:block;height:100%;min-width:2px;background:var(--blue);border-radius:999px}.bar-row small{color:#65717c}.audit-details{display:block;white-space:pre-wrap;overflow-wrap:anywhere;max-width:420px;margin-top:7px}.print-report{max-width:none}@media(max-width:700px){.stats-grid{grid-template-columns:1fr 1fr}.bar-row{grid-template-columns:minmax(85px,1.3fr) minmax(80px,2fr) 34px}.bar-row>small{display:none}.report-filters{grid-template-columns:1fr}}@media print{.stats-grid{grid-template-columns:repeat(4,1fr)}.print-report table{font-size:10pt}}</style>''',

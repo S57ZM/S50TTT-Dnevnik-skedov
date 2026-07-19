@@ -187,7 +187,7 @@ class ScheduleTests(unittest.TestCase):
 
     def test_alpha_channel_has_visible_warning(self):
         with patch("app.RELEASE_CHANNEL", "alpha"), patch(
-            "app.APP_VERSION", "1.14.0-alpha"
+            "app.APP_VERSION", "1.15.0-alpha"
         ):
             response = flask_app.test_client().get("/login")
             health_response = flask_app.test_client().get("/health")
@@ -195,7 +195,7 @@ class ScheduleTests(unittest.TestCase):
         html = response.get_data(as_text=True)
         self.assertIn("ALPHA TESTNA RAZLIČICA", html)
         self.assertIn("podatki niso produkcijski", html)
-        self.assertIn("različica 1.14.0-alpha", html)
+        self.assertIn("različica 1.15.0-alpha", html)
         self.assertEqual(health_response.get_json()["channel"], "alpha")
 
     def test_login_shows_countdown_and_next_saturday_number(self):
@@ -287,6 +287,98 @@ class ScheduleTests(unittest.TestCase):
         for past_date, participant_count in past_saturdays:
             self.assertIn(f"št. {saturday_net_number(past_date)}", html)
             self.assertIn(f'data-history-count="{participant_count}"', html)
+
+    def test_login_is_temporarily_locked_and_admin_can_unlock_it(self):
+        with flask_app.app_context():
+            db = get_db()
+            admin = db.execute(
+                "SELECT * FROM users WHERE role='admin' ORDER BY id LIMIT 1"
+            ).fetchone()
+            admin_id = admin["id"]
+            username = admin["username"]
+            db.execute(
+                """UPDATE users SET failed_login_count=0, locked_until=NULL,
+                   last_login_at=NULL, last_login_ip=NULL WHERE id=?""",
+                (admin_id,),
+            )
+            db.execute("DELETE FROM login_attempts")
+            db.commit()
+
+        client = flask_app.test_client()
+        client.get("/login")
+        with client.session_transaction() as session:
+            csrf_token = session["csrf_token"]
+
+        for _ in range(5):
+            response = client.post(
+                "/login",
+                data={
+                    "csrf_token": csrf_token,
+                    "username": username,
+                    "password": "napačno-geslo",
+                },
+            )
+            self.assertEqual(response.status_code, 200)
+
+        with flask_app.app_context():
+            db = get_db()
+            locked = db.execute("SELECT * FROM users WHERE id=?", (admin_id,)).fetchone()
+            self.assertEqual(locked["failed_login_count"], 5)
+            self.assertIsNotNone(locked["locked_until"])
+            self.assertEqual(
+                db.execute(
+                    "SELECT COUNT(*) AS n FROM login_attempts WHERE success=0"
+                ).fetchone()["n"],
+                5,
+            )
+            self.assertIsNotNone(
+                db.execute(
+                    """SELECT id FROM audit_log WHERE action='login_locked'
+                       AND entity_type='user' AND entity_id=?""",
+                    (admin_id,),
+                ).fetchone()
+            )
+
+        blocked_response = client.post(
+            "/login",
+            data={
+                "csrf_token": csrf_token,
+                "username": username,
+                "password": "test-password-123",
+            },
+        )
+        self.assertEqual(blocked_response.status_code, 200)
+        self.assertIn(
+            "poskusi znova čez 15 minut", blocked_response.get_data(as_text=True)
+        )
+
+        admin_client = self.authenticated_client(admin_id)
+        unlock_response = admin_client.post(
+            f"/users/{admin_id}/unlock",
+            data={"csrf_token": "test-csrf-token"},
+        )
+        self.assertEqual(unlock_response.status_code, 302)
+
+        success_response = client.post(
+            "/login",
+            data={
+                "csrf_token": csrf_token,
+                "username": username,
+                "password": "test-password-123",
+            },
+        )
+        self.assertEqual(success_response.status_code, 302)
+        with flask_app.app_context():
+            updated = get_db().execute(
+                "SELECT * FROM users WHERE id=?", (admin_id,)
+            ).fetchone()
+            self.assertEqual(updated["failed_login_count"], 0)
+            self.assertIsNone(updated["locked_until"])
+            self.assertIsNotNone(updated["last_login_at"])
+
+        security_html = client.get("/security").get_data(as_text=True)
+        self.assertIn("Varnost prijav", security_html)
+        self.assertIn("Uspešna prijava", security_html)
 
     def test_next_summer_saturday_and_monthly_net(self):
         scheduled = next_scheduled_nets(datetime(2026, 7, 19, 12, 0))

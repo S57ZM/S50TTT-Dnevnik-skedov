@@ -2,7 +2,7 @@
 
 Ločen spletni portal Radiokluba Sevnica S50TTT za vodenje skedov.
 
-Trenutna alpha različica: **1.14.0-alpha**
+Trenutna alpha različica: **1.15.0-alpha**
 
 ## Funkcije
 
@@ -13,6 +13,7 @@ Trenutna alpha različica: **1.14.0-alpha**
 - filtriran izvoz poročila v CSV ter priprava za PDF oziroma tiskanje;
 - administratorski pregled revizijske sledi s filtri;
 - dnevne preverjene varnostne kopije z 30-dnevno hrambo in ročnim prenosom;
+- zaščita prijave z začasnim zaklepom, beleženjem poskusov in ročnim odklepom;
 - zaklenjeno odpiranje rednega dnevnika do petka pred skedom, s predčasnim
   odklepom po petih hitrih pritiskih;
 - živ odštevalnik, številka sobotnega skeda in skupno število prijavljenih na
@@ -59,6 +60,21 @@ posamezne prijave, medtem ko je PDF-pogled oblikovan kot pregled skedov.
 Stran `Revizija` je dostopna samo administratorju. Omogoča filtriranje po
 dejanju, vrsti podatka, uporabniku in datumskem obdobju ter prikaže, kdo je
 spremembo izvedel, kdaj in katere podrobnosti so bile zabeležene.
+
+## Varnost prijav (alpha)
+
+Po petih napačnih geslih se uporabniški račun začasno zaklene za 15 minut. Za
+dodatno zaščito se po 20 neuspešnih poskusih z istega naslova IP v 15 minutah
+začasno omeji tudi ta naslov. Odgovor ob neuspehu ne razkrije, ali vpisani
+uporabnik obstaja.
+
+Administrator ima na strani `Varnost` pregled zadnjih 200 poskusov, njihovega
+časa, naslova IP in rezultata. Zaklenjen račun lahko ročno odklene. Stran
+`Uporabniki` prikazuje zadnjo uspešno prijavo in trenutno stanje zaščite.
+Evidenca je omejena na zadnjih 5000 dogodkov, da se baza ne povečuje brez meje.
+Produkcijski Docker zaupa enemu nastavljenemu povratnemu posredniku, lokalna
+alpha različica pa posredovanih naslovov ne zaupa in uporabi neposredni naslov
+odjemalca.
 
 Administrator lahko v urejevalniku zaključenega skeda naknadno doda, popravi ali
 izbriše prijavljenega člana. Naknadno dodani klicni znaki se prav tako shranijo v

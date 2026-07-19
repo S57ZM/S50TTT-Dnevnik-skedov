@@ -11,6 +11,7 @@ services:
       RELEASE_CHANNEL: alpha
       BACKUP_DIR: /app/backups
       BACKUP_RETENTION: 30
+      TRUST_PROXY: 0
     volumes:
       - ./data-alpha:/app/data
       - ./backups-alpha:/app/backups
