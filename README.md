@@ -2,24 +2,38 @@
 
 Ločen spletni portal Radiokluba Sevnica S50TTT za vodenje skedov.
 
-Trenutna različica: **1.4.0**
+Trenutna različica: **1.5.0**
 
 ## Funkcije
 
 - več uporabnikov z vlogama administrator in vodja skeda;
 - samodejni izračun naslednjega mesečnega in sobotnega rednega skeda;
-- živ odštevalnik in številka naslednjega sobotnega skeda na prijavni strani;
+- živ odštevalnik, številka sobotnega skeda in skupno število prijavljenih na
+  prijavni strani;
 - zaporedno številčenje sobotnih skedov od 5. januarja 2019;
 - odpiranje novega skeda z datumom, uro in vodjo;
 - hiter vnos imena, klicnega znaka ter ure prijave;
 - preprečevanje podvojenega klicnega znaka v istem skedu;
 - urejanje in brisanje napačnih vnosov;
 - brisanje praznega odprtega skeda s strani operaterja ali administratorja;
+- administratorsko popravljanje podatkov in prijav v zaključenih skedih;
+- nadzorovano brisanje zaključenega skeda z obveznim razlogom in ohranjeno
+  revizijsko kopijo vseh podatkov;
 - zaključevanje skedov in trajni arhiv;
 - tiskanje dnevnika oziroma shranjevanje v PDF prek brskalnika;
 - mobilnim napravam prilagojen prikaz;
 - sled sprememb v podatkovni bazi;
 - SQLite podatkovna baza v trajni mapi `data`.
+
+## Popravki zaključenih skedov
+
+Administrator lahko v arhivu popravi naslov, datum, začetno in končno uro,
+operaterja ter posamezne prijave zaključenega skeda. Sprememba se zabeleži v
+revizijsko sled.
+
+Zaključeni sked lahko izbriše samo administrator. Pred brisanjem mora navesti
+razlog z najmanj 10 znaki. V tabeli `net_deletions` ostanejo razlog, datum in
+izvajalec brisanja ter kopija podatkov skeda in vseh njegovih prijav.
 
 ## Redni skedi
 

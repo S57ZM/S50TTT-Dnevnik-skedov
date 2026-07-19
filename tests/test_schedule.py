@@ -41,11 +41,39 @@ class ScheduleTests(unittest.TestCase):
             db.commit()
             return cursor.lastrowid, admin_id
 
-    def post_delete_net(self, net_id, user_id):
+    def create_closed_net(self, title, with_participant=False):
+        with flask_app.app_context():
+            db = get_db()
+            admin_id = db.execute(
+                "SELECT id FROM users WHERE role='admin' ORDER BY id LIMIT 1"
+            ).fetchone()["id"]
+            cursor = db.execute(
+                """INSERT INTO nets
+                   (title, net_date, started_at, ended_at, status, leader_id, created_at)
+                   VALUES (?, '2030-02-02', '2030-02-02 20:00:00',
+                           '2030-02-02 20:30:00', 'closed', ?, ?)""",
+                (title, admin_id, now_db()),
+            )
+            if with_participant:
+                db.execute(
+                    """INSERT INTO participants
+                       (net_id, full_name, callsign, checkin_at, created_by, created_at)
+                       VALUES (?, 'Testni Radioamater', 'S58TEST',
+                               '2030-02-02 20:05:00', ?, ?)""",
+                    (cursor.lastrowid, admin_id, now_db()),
+                )
+            db.commit()
+            return cursor.lastrowid, admin_id
+
+    def authenticated_client(self, user_id):
         client = flask_app.test_client()
         with client.session_transaction() as session:
             session["user_id"] = user_id
             session["csrf_token"] = "test-csrf-token"
+        return client
+
+    def post_delete_net(self, net_id, user_id):
+        client = self.authenticated_client(user_id)
         return client.post(
             f"/nets/{net_id}/delete",
             data={"csrf_token": "test-csrf-token"},
@@ -58,12 +86,53 @@ class ScheduleTests(unittest.TestCase):
         self.assertEqual(response.get_json()["version"], APP_VERSION)
 
     def test_login_shows_countdown_and_next_saturday_number(self):
+        displayed_saturday = next(
+            scheduled
+            for scheduled in next_scheduled_nets(include_started_today=True)
+            if scheduled["schedule_type"] == SCHEDULE_SATURDAY
+        )
+        with flask_app.app_context():
+            db = get_db()
+            admin_id = db.execute(
+                "SELECT id FROM users WHERE role='admin' ORDER BY id LIMIT 1"
+            ).fetchone()["id"]
+            cursor = db.execute(
+                """INSERT INTO nets
+                   (title, net_date, started_at, status, leader_id,
+                    schedule_type, repeater, control_callsign, created_at)
+                   VALUES (?, ?, ?, 'open', ?, ?, ?, 'S50TTT', ?)""",
+                (
+                    "Javni testni sobotni sked",
+                    displayed_saturday["date"],
+                    f"{displayed_saturday['date']} {displayed_saturday['time']}:00",
+                    admin_id,
+                    SCHEDULE_SATURDAY,
+                    displayed_saturday["repeater"],
+                    now_db(),
+                ),
+            )
+            for callsign in ("S51TEST", "S52TEST"):
+                db.execute(
+                    """INSERT INTO participants
+                       (net_id, full_name, callsign, checkin_at, created_by, created_at)
+                       VALUES (?, 'Testni udeleženec', ?, ?, ?, ?)""",
+                    (
+                        cursor.lastrowid,
+                        callsign,
+                        f"{displayed_saturday['date']} {displayed_saturday['time']}:00",
+                        admin_id,
+                        now_db(),
+                    ),
+                )
+            db.commit()
+
         response = flask_app.test_client().get("/login")
         html = response.get_data(as_text=True)
 
         self.assertEqual(response.status_code, 200)
         self.assertIn("data-countdown=", html)
-        self.assertIn("Naslednji redni sobotni sked", html)
+        self.assertIn("Redni sobotni sked", html)
+        self.assertIn('data-participant-count="2"', html)
 
     def test_next_summer_saturday_and_monthly_net(self):
         scheduled = next_scheduled_nets(datetime(2026, 7, 19, 12, 0))
@@ -139,6 +208,108 @@ class ScheduleTests(unittest.TestCase):
             self.assertIsNotNone(
                 get_db().execute("SELECT id FROM nets WHERE id=?", (net_id,)).fetchone()
             )
+
+    def test_admin_can_edit_closed_net_and_change_participant_date(self):
+        net_id, admin_id = self.create_closed_net(
+            "Napačen naslov zaključenega skeda", with_participant=True
+        )
+        client = self.authenticated_client(admin_id)
+
+        edit_page = client.get(f"/nets/{net_id}/edit")
+        detail_page = client.get(f"/nets/{net_id}")
+        archive_page = client.get("/archive")
+
+        self.assertEqual(edit_page.status_code, 200)
+        self.assertIn("Uredi zaključeni sked", edit_page.get_data(as_text=True))
+        self.assertIn("Izbriši sked", detail_page.get_data(as_text=True))
+        self.assertIn("Uredi", archive_page.get_data(as_text=True))
+
+        response = client.post(
+            f"/nets/{net_id}/edit",
+            data={
+                "csrf_token": "test-csrf-token",
+                "title": "Popravljen zaključeni sked",
+                "net_date": "2030-02-09",
+                "started_time": "20:10",
+                "ended_time": "20:45",
+                "leader_id": str(admin_id),
+            },
+        )
+
+        self.assertEqual(response.status_code, 302)
+        with flask_app.app_context():
+            db = get_db()
+            net = db.execute("SELECT * FROM nets WHERE id=?", (net_id,)).fetchone()
+            participant = db.execute(
+                "SELECT * FROM participants WHERE net_id=?", (net_id,)
+            ).fetchone()
+            audit_row = db.execute(
+                """SELECT * FROM audit_log
+                   WHERE action='update' AND entity_type='net' AND entity_id=?
+                   ORDER BY id DESC LIMIT 1""",
+                (net_id,),
+            ).fetchone()
+
+            self.assertEqual(net["title"], "Popravljen zaključeni sked")
+            self.assertEqual(net["started_at"], "2030-02-09 20:10:00")
+            self.assertEqual(net["ended_at"], "2030-02-09 20:45:00")
+            self.assertTrue(participant["checkin_at"].startswith("2030-02-09 "))
+            self.assertIn('"before"', audit_row["details"])
+            self.assertIn('"after"', audit_row["details"])
+
+    def test_closed_net_deletion_requires_a_reason(self):
+        net_id, admin_id = self.create_closed_net("Sked brez razloga za brisanje")
+        client = self.authenticated_client(admin_id)
+
+        response = client.post(
+            f"/nets/{net_id}/delete-closed",
+            data={"csrf_token": "test-csrf-token", "reason": "premalo"},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        with flask_app.app_context():
+            db = get_db()
+            self.assertIsNotNone(
+                db.execute("SELECT id FROM nets WHERE id=?", (net_id,)).fetchone()
+            )
+            self.assertIsNone(
+                db.execute(
+                    "SELECT id FROM net_deletions WHERE original_net_id=?", (net_id,)
+                ).fetchone()
+            )
+
+    def test_closed_net_deletion_keeps_reason_and_snapshot(self):
+        net_id, admin_id = self.create_closed_net(
+            "Podvojen zaključeni sked", with_participant=True
+        )
+        client = self.authenticated_client(admin_id)
+        reason = "Dnevnik je bil po pomoti ustvarjen dvakrat."
+
+        response = client.post(
+            f"/nets/{net_id}/delete-closed",
+            data={"csrf_token": "test-csrf-token", "reason": reason},
+        )
+
+        self.assertEqual(response.status_code, 302)
+        with flask_app.app_context():
+            db = get_db()
+            deletion = db.execute(
+                "SELECT * FROM net_deletions WHERE original_net_id=?", (net_id,)
+            ).fetchone()
+            audit_row = db.execute(
+                """SELECT * FROM audit_log
+                   WHERE action='delete' AND entity_type='net' AND entity_id=?
+                   ORDER BY id DESC LIMIT 1""",
+                (net_id,),
+            ).fetchone()
+
+            self.assertIsNone(
+                db.execute("SELECT id FROM nets WHERE id=?", (net_id,)).fetchone()
+            )
+            self.assertEqual(deletion["reason"], reason)
+            self.assertEqual(deletion["participant_count"], 1)
+            self.assertIn("S58TEST", deletion["snapshot"])
+            self.assertIn(reason, audit_row["details"])
 
 
 if __name__ == "__main__":
