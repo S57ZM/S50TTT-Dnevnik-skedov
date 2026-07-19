@@ -22,7 +22,7 @@ from backup import backup_path, create_backup, list_backups, verify_database
 
 
 APP_NAME = "S50TTT Dnevnik skedov"
-BASE_VERSION = "1.17.0"
+BASE_VERSION = "1.18.0"
 RELEASE_CHANNEL = os.environ.get("RELEASE_CHANNEL", "stable").strip().lower()
 if RELEASE_CHANNEL not in {"stable", "alpha"}:
     RELEASE_CHANNEL = "stable"
@@ -1871,14 +1871,71 @@ def print_report():
 @app.route("/archive")
 @login_required
 def archive():
-    rows = get_db().execute(
-        """SELECT n.*, u.full_name AS leader_name, u.callsign AS leader_callsign,
-                  COUNT(p.id) AS participant_count
-           FROM nets n JOIN users u ON u.id=n.leader_id
-           LEFT JOIN participants p ON p.net_id=n.id
-           GROUP BY n.id ORDER BY n.started_at DESC"""
+    filters = report_filters()
+    query = request.args.get("q", "").strip()[:100]
+    try:
+        page = max(1, int(request.args.get("page", "1")))
+    except (TypeError, ValueError):
+        page = 1
+
+    clauses = []
+    parameters = []
+    if filters["from_date"]:
+        clauses.append("n.net_date>=?")
+        parameters.append(filters["from_date"])
+    if filters["to_date"]:
+        clauses.append("n.net_date<=?")
+        parameters.append(filters["to_date"])
+    if filters["schedule_type"] == "other":
+        clauses.append("n.schedule_type IS NULL")
+    elif filters["schedule_type"] != "all":
+        clauses.append("n.schedule_type=?")
+        parameters.append(filters["schedule_type"])
+    if filters["status"] != "all":
+        clauses.append("n.status=?")
+        parameters.append(filters["status"])
+    if query:
+        search = f"%{query}%"
+        clauses.append(
+            """(n.title LIKE ? OR u.full_name LIKE ? OR u.callsign LIKE ?
+                 OR EXISTS (
+                     SELECT 1 FROM participants searched
+                     WHERE searched.net_id=n.id
+                       AND (searched.callsign LIKE ? OR searched.full_name LIKE ?)
+                 ))"""
+        )
+        parameters.extend([search, search, search, search, search])
+
+    where = " WHERE " + " AND ".join(clauses) if clauses else ""
+    db = get_db()
+    total = db.execute(
+        f"""SELECT COUNT(*) AS n FROM nets n
+            JOIN users u ON u.id=n.leader_id{where}""",
+        parameters,
+    ).fetchone()["n"]
+    per_page = 25
+    page_count = max(1, (total + per_page - 1) // per_page)
+    page = min(page, page_count)
+    rows = db.execute(
+        f"""SELECT n.*, u.full_name AS leader_name,
+                   u.callsign AS leader_callsign,
+                   (SELECT COUNT(*) FROM participants counted
+                    WHERE counted.net_id=n.id) AS participant_count
+            FROM nets n JOIN users u ON u.id=n.leader_id
+            {where} ORDER BY n.started_at DESC, n.id DESC LIMIT ? OFFSET ?""",
+        [*parameters, per_page, (page - 1) * per_page],
     ).fetchall()
-    return render_template("archive_v2.html", nets=rows)
+    return render_template(
+        "archive_v3.html",
+        nets=rows,
+        filters=filters,
+        query=query,
+        page=page,
+        page_count=page_count,
+        total=total,
+        has_previous=page > 1,
+        has_next=page < page_count,
+    )
 
 
 def fetch_net_deletion(deletion_id):
@@ -2625,6 +2682,8 @@ TEMPLATES["users_v2.html"] = r'''{% extends "base.html" %}{% block content %}<di
 TEMPLATES["security.html"] = r'''{% extends "base.html" %}{% block title %}Varnost prijav · {{ app_name }}{% endblock %}{% block content %}<div class="card"><h1>Varnost prijav</h1><p class="muted">Po {{ max_failures }} napačnih geslih se račun zaklene za {{ lock_minutes }} minut. Po {{ ip_max_failures }} neuspešnih poskusih z istega naslova v {{ lock_minutes }} minutah se začasno omeji tudi ta naslov.</p><div class="table-wrap"><table><thead><tr><th>Uporabnik</th><th>Zadnja uspešna prijava</th><th>Napačni poskusi</th><th>Status</th><th></th></tr></thead><tbody>{% for account in accounts %}<tr><td>{{ account['full_name'] }}<br><b>{{ account['callsign'] }}</b> · {{ account['username'] }}</td><td>{% if account['last_login_at'] %}{{ account['last_login_at']|datetime_si }}<br><span class="muted">{{ account['last_login_ip'] or '' }}</span>{% else %}–{% endif %}</td><td>{{ account['failed_login_count'] }}</td><td>{% if account['locked_until'] and account['locked_until']>now_value %}<span class="badge canceled">Zaklenjen do {{ account['locked_until']|datetime_si }}</span>{% elif account['active'] %}<span class="badge open">Aktiven</span>{% else %}<span class="badge closed">Onemogočen</span>{% endif %}</td><td>{% if account['locked_until'] or account['failed_login_count'] %}<form method="post" action="{{ url_for('unlock_user',user_id=account['id']) }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="btn btn-secondary btn-small">Odkleni</button></form>{% endif %}</td></tr>{% endfor %}</tbody></table></div></div><div class="card"><h2>Zadnjih 200 poskusov prijave</h2><form method="get" class="actions" style="margin-bottom:16px"><input name="q" value="{{ query }}" placeholder="Uporabniško ime ali IP" style="max-width:300px"><select name="result" style="max-width:220px"><option value="all">Vsi poskusi</option><option value="success" {% if selected_result=='success' %}selected{% endif %}>Uspešni</option><option value="failed" {% if selected_result=='failed' %}selected{% endif %}>Neuspešni</option><option value="limited" {% if selected_result=='limited' %}selected{% endif %}>Blokirani</option></select><button class="btn btn-primary">Filtriraj</button><a class="btn btn-secondary" href="{{ url_for('security_view') }}">Počisti</a></form>{% if attempts %}<div class="table-wrap"><table><thead><tr><th>Čas</th><th>Vpisano uporabniško ime</th><th>Naslov IP</th><th>Rezultat</th></tr></thead><tbody>{% for attempt in attempts %}<tr><td class="nowrap">{{ attempt['created_at']|datetime_si }}</td><td>{{ attempt['username'] }}{% if attempt['user_callsign'] %}<br><b>{{ attempt['user_callsign'] }}</b>{% endif %}</td><td>{{ attempt['ip_address'] }}</td><td><span class="badge {{ 'open' if attempt['success'] else 'canceled' }}">{{ attempt['reason']|login_reason_si }}</span></td></tr>{% endfor %}</tbody></table></div>{% else %}<p class="empty">Poskusov prijave še ni.</p>{% endif %}</div>{% endblock %}'''
 
 TEMPLATES["archive_v2.html"] = r'''{% extends "base.html" %}{% block content %}<div class="card"><div class="actions"><div><h1>Arhiv skedov</h1><p class="muted">Pregled odprtih in zaključenih dnevnikov.</p></div>{% if g.user['role']=='admin' %}<a class="btn btn-secondary right" href="{{ url_for('deleted_nets') }}">Koš izbrisanih skedov</a>{% endif %}</div>{% if nets %}<div class="table-wrap"><table><thead><tr><th>Datum</th><th>Sked</th><th>Status</th><th>Operater</th><th>Prijavljeni</th><th></th></tr></thead><tbody>{% for n in nets %}<tr><td class="nowrap">{{ n['net_date']|date_si }}</td><td><b>{{ n['title'] }}</b><br><span class="muted">{{ n['started_at']|time_si }}{% if n['ended_at'] %}–{{ n['ended_at']|time_si }}{% endif %}{% if n['repeater'] %} · {{ n['repeater'] }}{% endif %}</span></td><td><span class="badge {{ n['status'] }}">{{ 'Odprt' if n['status']=='open' else 'Zaključen' }}</span></td><td>{{ n['leader_name'] }} ({{ n['leader_callsign'] }})</td><td>{{ n['participant_count'] }}</td><td><div class="actions"><a class="btn btn-secondary btn-small" href="{{ url_for('net_detail',net_id=n['id']) }}">Pregled</a>{% if g.user['role']=='admin' and n['status']=='closed' %}<a class="btn btn-primary btn-small" href="{{ url_for('edit_net',net_id=n['id']) }}">Uredi</a>{% endif %}</div></td></tr>{% endfor %}</tbody></table></div>{% else %}<p class="empty">Arhiv je prazen.</p>{% endif %}</div>{% endblock %}'''
+
+TEMPLATES["archive_v3.html"] = r'''{% extends "base.html" %}{% block content %}<div class="card"><div class="actions"><div><h1>Arhiv skedov</h1><p class="muted">Poišči dnevnik po naslovu, operaterju, imenu ali klicnem znaku prijavljenega.</p></div>{% if g.user['role']=='admin' %}<a class="btn btn-secondary right" href="{{ url_for('deleted_nets') }}">Koš izbrisanih skedov</a>{% endif %}</div><form method="get" class="report-filters"><div class="field"><label>Iskanje</label><input name="q" value="{{ query }}" maxlength="100" placeholder="Naslov, ime ali klicni znak"></div><div class="field"><label>Od datuma</label><input type="date" name="from_date" value="{{ filters['from_date'] }}"></div><div class="field"><label>Do datuma</label><input type="date" name="to_date" value="{{ filters['to_date'] }}"></div><div class="field"><label>Vrsta skeda</label><select name="schedule_type"><option value="all">Vse vrste</option><option value="saturday" {% if filters['schedule_type']=='saturday' %}selected{% endif %}>Sobotni</option><option value="monthly" {% if filters['schedule_type']=='monthly' %}selected{% endif %}>Mesečni</option><option value="other" {% if filters['schedule_type']=='other' %}selected{% endif %}>Izredni</option></select></div><div class="field"><label>Status</label><select name="status"><option value="all">Vsi statusi</option><option value="closed" {% if filters['status']=='closed' %}selected{% endif %}>Zaključeni</option><option value="open" {% if filters['status']=='open' %}selected{% endif %}>Odprti</option></select></div><button class="btn btn-primary">Poišči</button><a class="btn btn-secondary" href="{{ url_for('archive') }}">Počisti</a></form></div><div class="card"><div class="actions"><h2>Najdenih skedov: {{ total }}</h2><span class="muted right">Stran {{ page }} od {{ page_count }}</span></div>{% if nets %}<div class="table-wrap"><table><thead><tr><th>Datum</th><th>Sked</th><th>Vrsta</th><th>Status</th><th>Operater</th><th>Prijavljeni</th><th></th></tr></thead><tbody>{% for n in nets %}<tr><td class="nowrap">{{ n['net_date']|date_si }}</td><td><b>{{ n['title'] }}</b><br><span class="muted">{{ n['started_at']|time_si }}{% if n['ended_at'] %}–{{ n['ended_at']|time_si }}{% endif %}{% if n['repeater'] %} · {{ n['repeater'] }}{% endif %}</span></td><td>{% if n['schedule_type']=='saturday' %}Sobotni{% elif n['schedule_type']=='monthly' %}Mesečni{% else %}Izredni{% endif %}</td><td><span class="badge {{ n['status'] }}">{{ 'Odprt' if n['status']=='open' else 'Zaključen' }}</span></td><td>{{ n['leader_name'] }} ({{ n['leader_callsign'] }})</td><td>{{ n['participant_count'] }}</td><td><div class="actions"><a class="btn btn-secondary btn-small" href="{{ url_for('net_detail',net_id=n['id']) }}">Pregled</a>{% if g.user['role']=='admin' and n['status']=='closed' %}<a class="btn btn-primary btn-small" href="{{ url_for('edit_net',net_id=n['id']) }}">Uredi</a>{% endif %}</div></td></tr>{% endfor %}</tbody></table></div><div class="actions no-print" style="margin-top:16px">{% if has_previous %}<a class="btn btn-secondary" href="{{ url_for('archive',page=page-1,q=query,from_date=filters['from_date'],to_date=filters['to_date'],schedule_type=filters['schedule_type'],status=filters['status']) }}">← Prejšnja</a>{% endif %}{% if has_next %}<a class="btn btn-secondary right" href="{{ url_for('archive',page=page+1,q=query,from_date=filters['from_date'],to_date=filters['to_date'],schedule_type=filters['schedule_type'],status=filters['status']) }}">Naslednja →</a>{% endif %}</div>{% else %}<p class="empty">Za izbrane pogoje ni skedov.</p>{% endif %}</div>{% endblock %}'''
 
 TEMPLATES["deleted_nets.html"] = r'''{% extends "base.html" %}{% block title %}Koš izbrisanih skedov · {{ app_name }}{% endblock %}{% block content %}<div class="card"><div class="actions"><div><h1>Koš izbrisanih skedov</h1><p class="muted">Administrator lahko pregleda razlog in shranjeno kopijo ter pomotoma izbrisani sked obnovi.</p></div><a class="btn btn-secondary right" href="{{ url_for('archive') }}">Nazaj v arhiv</a></div>{% if deletions %}<div class="table-wrap"><table><thead><tr><th>Izbris</th><th>Sked</th><th>Prijavljeni</th><th>Razlog</th><th>Status</th><th></th></tr></thead><tbody>{% for item in deletions %}<tr><td class="nowrap">{{ item['deleted_at']|datetime_si }}<br><span class="muted">{{ item['deleted_by_name'] }} ({{ item['deleted_by_callsign'] }})</span></td><td><b>{{ item['title'] }}</b><br>{{ item['net_date']|date_si }}</td><td>{{ item['participant_count'] }}</td><td>{{ item['reason'] }}</td><td>{% if item['restored_at'] %}<span class="badge open">Obnovljen</span><br><small>{{ item['restored_at']|datetime_si }}</small>{% else %}<span class="badge closed">V košu</span>{% endif %}</td><td><a class="btn btn-secondary btn-small" href="{{ url_for('deleted_net_detail',deletion_id=item['id']) }}">Podrobnosti</a></td></tr>{% endfor %}</tbody></table></div>{% else %}<p class="empty">Koš je prazen.</p>{% endif %}</div>{% endblock %}'''
 

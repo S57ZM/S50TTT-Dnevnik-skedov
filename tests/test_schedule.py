@@ -333,7 +333,7 @@ class ScheduleTests(unittest.TestCase):
 
     def test_alpha_channel_has_visible_warning(self):
         with patch("app.RELEASE_CHANNEL", "alpha"), patch(
-            "app.APP_VERSION", "1.17.0-alpha"
+            "app.APP_VERSION", "1.18.0-alpha"
         ):
             response = flask_app.test_client().get("/login")
             health_response = flask_app.test_client().get("/health")
@@ -341,7 +341,7 @@ class ScheduleTests(unittest.TestCase):
         html = response.get_data(as_text=True)
         self.assertIn("ALPHA TESTNA RAZLIČICA", html)
         self.assertIn("podatki niso produkcijski", html)
-        self.assertIn("različica 1.17.0-alpha", html)
+        self.assertIn("različica 1.18.0-alpha", html)
         self.assertEqual(health_response.get_json()["channel"], "alpha")
 
     def test_login_shows_countdown_and_next_saturday_number(self):
@@ -674,6 +674,76 @@ class ScheduleTests(unittest.TestCase):
             self.assertIsNotNone(
                 get_db().execute("SELECT id FROM nets WHERE id=?", (net_id,)).fetchone()
             )
+
+    def test_archive_search_filters_and_pagination(self):
+        matching_id, admin_id = self.create_closed_net(
+            "Posebni mesečni arhivski sked", with_participant=False
+        )
+        other_id, _ = self.create_closed_net(
+            "Drugi sobotni arhivski sked", with_participant=False
+        )
+        with flask_app.app_context():
+            db = get_db()
+            db.execute(
+                """UPDATE nets SET net_date='2042-03-06',
+                   started_at='2042-03-06 19:00:00',
+                   ended_at='2042-03-06 19:30:00', schedule_type=? WHERE id=?""",
+                (SCHEDULE_MONTHLY, matching_id),
+            )
+            db.execute(
+                """UPDATE nets SET net_date='2041-03-02',
+                   started_at='2041-03-02 20:00:00',
+                   ended_at='2041-03-02 20:30:00', schedule_type=? WHERE id=?""",
+                (SCHEDULE_SATURDAY, other_id),
+            )
+            db.execute(
+                """INSERT INTO participants
+                   (net_id, full_name, callsign, checkin_at, created_by, created_at)
+                   VALUES (?, 'Iskani Udeleženec', 'S59ARHIV',
+                           '2042-03-06 19:05:00', ?, ?)""",
+                (matching_id, admin_id, now_db()),
+            )
+            for day_number in range(1, 27):
+                day_value = f"2045-01-{day_number:02d}"
+                db.execute(
+                    """INSERT INTO nets
+                       (title, net_date, started_at, ended_at, status,
+                        leader_id, created_at)
+                       VALUES (?, ?, ?, ?, 'closed', ?, ?)""",
+                    (
+                        f"ARHIV-PAGE-{day_number:02d}",
+                        day_value,
+                        f"{day_value} 20:00:00",
+                        f"{day_value} 20:30:00",
+                        admin_id,
+                        now_db(),
+                    ),
+                )
+            db.commit()
+
+        client = self.authenticated_client(admin_id)
+        search_html = client.get("/archive?q=S59ARHIV").get_data(as_text=True)
+        self.assertIn("Posebni mesečni arhivski sked", search_html)
+        self.assertNotIn("Drugi sobotni arhivski sked", search_html)
+        self.assertIn("Najdenih skedov: 1", search_html)
+
+        filtered_html = client.get(
+            "/archive?from_date=2042-01-01&to_date=2042-12-31"
+            "&schedule_type=monthly&status=closed"
+        ).get_data(as_text=True)
+        self.assertIn("Posebni mesečni arhivski sked", filtered_html)
+        self.assertNotIn("Drugi sobotni arhivski sked", filtered_html)
+
+        first_page = client.get("/archive?q=ARHIV-PAGE").get_data(as_text=True)
+        second_page = client.get(
+            "/archive?q=ARHIV-PAGE&page=2"
+        ).get_data(as_text=True)
+        self.assertIn("Najdenih skedov: 26", first_page)
+        self.assertIn("Stran 1 od 2", first_page)
+        self.assertIn("Naslednja", first_page)
+        self.assertNotIn("ARHIV-PAGE-01", first_page)
+        self.assertIn("ARHIV-PAGE-01", second_page)
+        self.assertIn("Prejšnja", second_page)
 
     def test_admin_can_edit_closed_net_and_change_participant_date(self):
         net_id, admin_id = self.create_closed_net(

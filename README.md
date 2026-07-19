@@ -2,7 +2,7 @@
 
 Ločen spletni portal Radiokluba Sevnica S50TTT za vodenje skedov.
 
-Trenutna alpha različica: **1.17.0-alpha**
+Trenutna alpha različica: **1.18.0-alpha**
 
 ## Funkcije
 
@@ -34,6 +34,8 @@ Trenutna alpha različica: **1.17.0-alpha**
   revizijsko kopijo vseh podatkov;
 - administratorski koš izbrisanih skedov z obnovitvijo skeda in vseh prijav;
 - zaključevanje skedov in trajni arhiv;
+- iskanje arhiva po naslovu, operaterju, imenu ali klicnem znaku ter filtriranje
+  po datumu, vrsti in statusu;
 - tiskanje dnevnika oziroma shranjevanje v PDF prek brskalnika;
 - mobilnim napravam prilagojen prikaz;
 - sled sprememb v podatkovni bazi;
@@ -108,6 +110,10 @@ v arhivu. Pred obnovitvijo je mogoče pregledati razlog brisanja in shranjene
 prijave. Obnova ponovno ustvari zaključeni sked z vsemi udeleženci, osveži
 imenik klicnih znakov in se zabeleži v revizijsko sled. Posamezno kopijo je
 mogoče obnoviti samo enkrat; portal prepreči tudi podvajanje rednega termina.
+
+Arhiv prikazuje največ 25 rezultatov na stran. Iskanje upošteva naslov skeda,
+ime in klicni znak operaterja ter imena in klicne znake vseh prijavljenih.
+Izbrane filtre in iskalni niz ohrani tudi pri premikanju med stranmi rezultatov.
 
 ## Redni skedi
 
