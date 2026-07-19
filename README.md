@@ -2,7 +2,7 @@
 
 Ločen spletni portal Radiokluba Sevnica S50TTT za vodenje skedov.
 
-Trenutna alpha različica: **1.16.0-alpha**
+Trenutna alpha različica: **1.17.0-alpha**
 
 ## Funkcije
 
@@ -32,6 +32,7 @@ Trenutna alpha različica: **1.16.0-alpha**
 - administratorsko popravljanje podatkov in prijav v zaključenih skedih;
 - nadzorovano brisanje zaključenega skeda z obveznim razlogom in ohranjeno
   revizijsko kopijo vseh podatkov;
+- administratorski koš izbrisanih skedov z obnovitvijo skeda in vseh prijav;
 - zaključevanje skedov in trajni arhiv;
 - tiskanje dnevnika oziroma shranjevanje v PDF prek brskalnika;
 - mobilnim napravam prilagojen prikaz;
@@ -101,6 +102,12 @@ Zaključeni sked lahko izbriše samo administrator. Pred brisanjem mora navesti
 razlog z najmanj 10 znaki; obrazec za brisanje je na voljo neposredno pod
 obrazcem za popravljanje skeda. V tabeli `net_deletions` ostanejo razlog, datum
 in izvajalec brisanja ter kopija podatkov skeda in vseh njegovih prijav.
+
+Izbrisani skedi so administratorju dostopni prek gumba `Koš izbrisanih skedov`
+v arhivu. Pred obnovitvijo je mogoče pregledati razlog brisanja in shranjene
+prijave. Obnova ponovno ustvari zaključeni sked z vsemi udeleženci, osveži
+imenik klicnih znakov in se zabeleži v revizijsko sled. Posamezno kopijo je
+mogoče obnoviti samo enkrat; portal prepreči tudi podvajanje rednega termina.
 
 ## Redni skedi
 

@@ -22,7 +22,7 @@ from backup import backup_path, create_backup, list_backups, verify_database
 
 
 APP_NAME = "S50TTT Dnevnik skedov"
-BASE_VERSION = "1.16.0"
+BASE_VERSION = "1.17.0"
 RELEASE_CHANNEL = os.environ.get("RELEASE_CHANNEL", "stable").strip().lower()
 if RELEASE_CHANNEL not in {"stable", "alpha"}:
     RELEASE_CHANNEL = "stable"
@@ -398,7 +398,10 @@ def init_db():
             reason TEXT NOT NULL,
             snapshot TEXT NOT NULL,
             deleted_by INTEGER NOT NULL REFERENCES users(id),
-            deleted_at TEXT NOT NULL
+            deleted_at TEXT NOT NULL,
+            restored_by INTEGER REFERENCES users(id),
+            restored_at TEXT,
+            restored_net_id INTEGER
         );
 
         CREATE TABLE IF NOT EXISTS callsign_directory (
@@ -486,6 +489,22 @@ def init_db():
         except sqlite3.OperationalError as error:
             if "duplicate column name" not in str(error).lower():
                 raise
+    deletion_columns = {
+        row["name"] for row in db.execute("PRAGMA table_info(net_deletions)")
+    }
+    for column, declaration in {
+        "restored_by": "INTEGER REFERENCES users(id)",
+        "restored_at": "TEXT",
+        "restored_net_id": "INTEGER",
+    }.items():
+        if column not in deletion_columns:
+            try:
+                db.execute(
+                    f"ALTER TABLE net_deletions ADD COLUMN {column} {declaration}"
+                )
+            except sqlite3.OperationalError as error:
+                if "duplicate column name" not in str(error).lower():
+                    raise
     db.execute("DROP INDEX IF EXISTS idx_nets_schedule_date")
     db.execute(
         """CREATE UNIQUE INDEX IF NOT EXISTS idx_nets_schedule_date
@@ -1477,6 +1496,7 @@ def delete_closed_net(net_id):
                     "leader_name",
                     "leader_callsign",
                     "schedule_type",
+                    "scheduled_date",
                     "repeater",
                     "control_callsign",
                     "created_at",
@@ -1522,7 +1542,7 @@ def delete_closed_net(net_id):
                 ensure_ascii=False,
             ),
         )
-        flash("Zaključeni sked je izbrisan, razlog in kopija podatkov pa sta shranjena.", "success")
+        flash("Zaključeni sked je premaknjen v koš skupaj z razlogom in kopijo podatkov.", "success")
         return redirect(url_for("archive"))
 
     return render_template(
@@ -1858,7 +1878,203 @@ def archive():
            LEFT JOIN participants p ON p.net_id=n.id
            GROUP BY n.id ORDER BY n.started_at DESC"""
     ).fetchall()
-    return render_template("archive.html", nets=rows)
+    return render_template("archive_v2.html", nets=rows)
+
+
+def fetch_net_deletion(deletion_id):
+    row = get_db().execute(
+        """SELECT d.*, deleted_user.full_name AS deleted_by_name,
+                  deleted_user.callsign AS deleted_by_callsign,
+                  restored_user.full_name AS restored_by_name,
+                  restored_user.callsign AS restored_by_callsign
+           FROM net_deletions d
+           JOIN users deleted_user ON deleted_user.id=d.deleted_by
+           LEFT JOIN users restored_user ON restored_user.id=d.restored_by
+           WHERE d.id=?""",
+        (deletion_id,),
+    ).fetchone()
+    if row is None:
+        abort(404)
+    return row
+
+
+def parse_net_deletion_snapshot(deletion):
+    try:
+        snapshot = json.loads(deletion["snapshot"])
+        if not isinstance(snapshot, dict) or not isinstance(
+            snapshot.get("net"), dict
+        ) or not isinstance(
+            snapshot.get("participants"), list
+        ):
+            raise ValueError
+        return snapshot
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return None
+
+
+@app.get("/deleted-nets")
+@admin_required
+def deleted_nets():
+    rows = get_db().execute(
+        """SELECT d.*, deleted_user.full_name AS deleted_by_name,
+                  deleted_user.callsign AS deleted_by_callsign,
+                  restored_user.full_name AS restored_by_name,
+                  restored_user.callsign AS restored_by_callsign
+           FROM net_deletions d
+           JOIN users deleted_user ON deleted_user.id=d.deleted_by
+           LEFT JOIN users restored_user ON restored_user.id=d.restored_by
+           ORDER BY d.deleted_at DESC, d.id DESC"""
+    ).fetchall()
+    return render_template("deleted_nets.html", deletions=rows)
+
+
+@app.get("/deleted-nets/<int:deletion_id>")
+@admin_required
+def deleted_net_detail(deletion_id):
+    deletion = fetch_net_deletion(deletion_id)
+    snapshot = parse_net_deletion_snapshot(deletion)
+    restored_exists = False
+    if deletion["restored_net_id"]:
+        restored_exists = (
+            get_db().execute(
+                "SELECT id FROM nets WHERE id=?", (deletion["restored_net_id"],)
+            ).fetchone()
+            is not None
+        )
+    return render_template(
+        "deleted_net_detail.html",
+        deletion=deletion,
+        snapshot=snapshot,
+        restored_exists=restored_exists,
+    )
+
+
+@app.post("/deleted-nets/<int:deletion_id>/restore")
+@admin_required
+def restore_deleted_net(deletion_id):
+    deletion = fetch_net_deletion(deletion_id)
+    if deletion["restored_at"]:
+        flash("Ta izbrisani sked je že bil obnovljen.", "warning")
+        return redirect(url_for("deleted_net_detail", deletion_id=deletion_id))
+
+    snapshot = parse_net_deletion_snapshot(deletion)
+    if snapshot is None:
+        flash("Shranjena kopija skeda je poškodovana in je ni mogoče obnoviti.", "danger")
+        return redirect(url_for("deleted_net_detail", deletion_id=deletion_id))
+
+    net_data = snapshot["net"]
+    participants = snapshot["participants"]
+    db = get_db()
+    try:
+        title = str(net_data["title"]).strip()[:180]
+        net_date = date.fromisoformat(str(net_data["net_date"])).isoformat()
+        started_at = str(net_data["started_at"])
+        ended_at = net_data.get("ended_at")
+        datetime.strptime(started_at[:19], "%Y-%m-%d %H:%M:%S")
+        if ended_at:
+            datetime.strptime(str(ended_at)[:19], "%Y-%m-%d %H:%M:%S")
+        if not title:
+            raise ValueError
+
+        leader_id = net_data.get("leader_id")
+        leader = db.execute("SELECT id FROM users WHERE id=?", (leader_id,)).fetchone()
+        if leader is None:
+            leader_id = g.user["id"]
+
+        schedule_type = net_data.get("schedule_type")
+        if schedule_type not in {SCHEDULE_MONTHLY, SCHEDULE_SATURDAY}:
+            schedule_type = None
+        scheduled_date = None
+        if schedule_type:
+            scheduled_date = net_data.get("scheduled_date") or net_date
+            existing = db.execute(
+                """SELECT id FROM nets WHERE schedule_type=?
+                   AND COALESCE(scheduled_date,net_date)=?""",
+                (schedule_type, scheduled_date),
+            ).fetchone()
+            if existing:
+                flash(
+                    "Obnova ni mogoča, ker dnevnik za isti redni termin že obstaja.",
+                    "warning",
+                )
+                return redirect(
+                    url_for("deleted_net_detail", deletion_id=deletion_id)
+                )
+
+        cursor = db.execute(
+            """INSERT INTO nets
+               (title, net_date, scheduled_date, started_at, ended_at, status,
+                leader_id, schedule_type, repeater, control_callsign, created_at)
+               VALUES (?, ?, ?, ?, ?, 'closed', ?, ?, ?, ?, ?)""",
+            (
+                title,
+                net_date,
+                scheduled_date,
+                started_at,
+                ended_at,
+                leader_id,
+                schedule_type,
+                net_data.get("repeater"),
+                net_data.get("control_callsign"),
+                net_data.get("created_at") or now_db(),
+            ),
+        )
+        restored_net_id = cursor.lastrowid
+        affected_callsigns = set()
+        for participant in participants:
+            full_name = str(participant["full_name"]).strip()[:120]
+            callsign = (
+                str(participant["callsign"]).strip().upper().replace(" ", "")[:24]
+            )
+            checkin_at = str(participant["checkin_at"])
+            datetime.strptime(checkin_at[:19], "%Y-%m-%d %H:%M:%S")
+            if not full_name or not callsign:
+                raise ValueError
+            db.execute(
+                """INSERT INTO participants
+                   (net_id, full_name, callsign, checkin_at, created_by, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (
+                    restored_net_id,
+                    full_name,
+                    callsign,
+                    checkin_at,
+                    g.user["id"],
+                    now_db(),
+                ),
+            )
+            learn_callsign(db, callsign, full_name, g.user["id"], checkin_at)
+            affected_callsigns.add(callsign)
+
+        for callsign in affected_callsigns:
+            refresh_callsign_usage(db, callsign)
+        restored_at = now_db()
+        db.execute(
+            """UPDATE net_deletions
+               SET restored_by=?, restored_at=?, restored_net_id=? WHERE id=?""",
+            (g.user["id"], restored_at, restored_net_id, deletion_id),
+        )
+        db.commit()
+    except (KeyError, TypeError, ValueError, sqlite3.IntegrityError):
+        db.rollback()
+        flash("Obnova ni uspela, ker shranjeni podatki niso veljavni.", "danger")
+        return redirect(url_for("deleted_net_detail", deletion_id=deletion_id))
+
+    audit(
+        "restore",
+        "net",
+        restored_net_id,
+        json.dumps(
+            {
+                "deletion_id": deletion_id,
+                "original_net_id": deletion["original_net_id"],
+                "participant_count": len(participants),
+            },
+            ensure_ascii=False,
+        ),
+    )
+    flash("Sked in vsi prijavljeni so obnovljeni v arhiv.", "success")
+    return redirect(url_for("net_detail", net_id=restored_net_id))
 
 
 @app.route("/callsigns")
@@ -2289,6 +2505,7 @@ def audit_action_si(value):
         "unlock": "Odklep računa",
         "update_notes": "Sprememba opombe",
         "merge": "Združitev",
+        "restore": "Obnovljeno",
     }.get(value, value)
 
 
@@ -2406,6 +2623,12 @@ TEMPLATES["backups.html"] = r'''{% extends "base.html" %}{% block title %}Varnos
 TEMPLATES["users_v2.html"] = r'''{% extends "base.html" %}{% block content %}<div class="card"><div class="actions"><h1>Uporabniki</h1><a class="btn btn-primary right" href="{{ url_for('new_user') }}">＋ Novi uporabnik</a></div><div class="table-wrap"><table><thead><tr><th>Uporabnik</th><th>Ime in klicni znak</th><th>Vloga</th><th>Zadnja prijava</th><th>Varnost</th><th></th></tr></thead><tbody>{% for user in users %}<tr><td><b>{{ user['username'] }}</b><br>{{ 'Aktiven' if user['active'] else 'Onemogočen' }}</td><td>{{ user['full_name'] }}<br><b>{{ user['callsign'] }}</b></td><td><span class="badge {{ user['role'] }}">{{ 'Administrator' if user['role']=='admin' else 'Vodja skeda' }}</span></td><td>{% if user['last_login_at'] %}{{ user['last_login_at']|datetime_si }}{% if user['last_login_ip'] %}<br><span class="muted">IP: {{ user['last_login_ip'] }}</span>{% endif %}{% else %}–{% endif %}</td><td>{% if user['locked_until'] and user['locked_until']>now_value %}<span class="badge canceled">Zaklenjen</span><br><small>do {{ user['locked_until']|datetime_si }}</small>{% elif user['failed_login_count'] %}<span class="badge postponed">{{ user['failed_login_count'] }} napačnih poskusov</span>{% else %}<span class="badge open">V redu</span>{% endif %}</td><td><a class="btn btn-secondary btn-small" href="{{ url_for('edit_user',user_id=user['id']) }}">Uredi</a></td></tr>{% endfor %}</tbody></table></div></div>{% endblock %}'''
 
 TEMPLATES["security.html"] = r'''{% extends "base.html" %}{% block title %}Varnost prijav · {{ app_name }}{% endblock %}{% block content %}<div class="card"><h1>Varnost prijav</h1><p class="muted">Po {{ max_failures }} napačnih geslih se račun zaklene za {{ lock_minutes }} minut. Po {{ ip_max_failures }} neuspešnih poskusih z istega naslova v {{ lock_minutes }} minutah se začasno omeji tudi ta naslov.</p><div class="table-wrap"><table><thead><tr><th>Uporabnik</th><th>Zadnja uspešna prijava</th><th>Napačni poskusi</th><th>Status</th><th></th></tr></thead><tbody>{% for account in accounts %}<tr><td>{{ account['full_name'] }}<br><b>{{ account['callsign'] }}</b> · {{ account['username'] }}</td><td>{% if account['last_login_at'] %}{{ account['last_login_at']|datetime_si }}<br><span class="muted">{{ account['last_login_ip'] or '' }}</span>{% else %}–{% endif %}</td><td>{{ account['failed_login_count'] }}</td><td>{% if account['locked_until'] and account['locked_until']>now_value %}<span class="badge canceled">Zaklenjen do {{ account['locked_until']|datetime_si }}</span>{% elif account['active'] %}<span class="badge open">Aktiven</span>{% else %}<span class="badge closed">Onemogočen</span>{% endif %}</td><td>{% if account['locked_until'] or account['failed_login_count'] %}<form method="post" action="{{ url_for('unlock_user',user_id=account['id']) }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="btn btn-secondary btn-small">Odkleni</button></form>{% endif %}</td></tr>{% endfor %}</tbody></table></div></div><div class="card"><h2>Zadnjih 200 poskusov prijave</h2><form method="get" class="actions" style="margin-bottom:16px"><input name="q" value="{{ query }}" placeholder="Uporabniško ime ali IP" style="max-width:300px"><select name="result" style="max-width:220px"><option value="all">Vsi poskusi</option><option value="success" {% if selected_result=='success' %}selected{% endif %}>Uspešni</option><option value="failed" {% if selected_result=='failed' %}selected{% endif %}>Neuspešni</option><option value="limited" {% if selected_result=='limited' %}selected{% endif %}>Blokirani</option></select><button class="btn btn-primary">Filtriraj</button><a class="btn btn-secondary" href="{{ url_for('security_view') }}">Počisti</a></form>{% if attempts %}<div class="table-wrap"><table><thead><tr><th>Čas</th><th>Vpisano uporabniško ime</th><th>Naslov IP</th><th>Rezultat</th></tr></thead><tbody>{% for attempt in attempts %}<tr><td class="nowrap">{{ attempt['created_at']|datetime_si }}</td><td>{{ attempt['username'] }}{% if attempt['user_callsign'] %}<br><b>{{ attempt['user_callsign'] }}</b>{% endif %}</td><td>{{ attempt['ip_address'] }}</td><td><span class="badge {{ 'open' if attempt['success'] else 'canceled' }}">{{ attempt['reason']|login_reason_si }}</span></td></tr>{% endfor %}</tbody></table></div>{% else %}<p class="empty">Poskusov prijave še ni.</p>{% endif %}</div>{% endblock %}'''
+
+TEMPLATES["archive_v2.html"] = r'''{% extends "base.html" %}{% block content %}<div class="card"><div class="actions"><div><h1>Arhiv skedov</h1><p class="muted">Pregled odprtih in zaključenih dnevnikov.</p></div>{% if g.user['role']=='admin' %}<a class="btn btn-secondary right" href="{{ url_for('deleted_nets') }}">Koš izbrisanih skedov</a>{% endif %}</div>{% if nets %}<div class="table-wrap"><table><thead><tr><th>Datum</th><th>Sked</th><th>Status</th><th>Operater</th><th>Prijavljeni</th><th></th></tr></thead><tbody>{% for n in nets %}<tr><td class="nowrap">{{ n['net_date']|date_si }}</td><td><b>{{ n['title'] }}</b><br><span class="muted">{{ n['started_at']|time_si }}{% if n['ended_at'] %}–{{ n['ended_at']|time_si }}{% endif %}{% if n['repeater'] %} · {{ n['repeater'] }}{% endif %}</span></td><td><span class="badge {{ n['status'] }}">{{ 'Odprt' if n['status']=='open' else 'Zaključen' }}</span></td><td>{{ n['leader_name'] }} ({{ n['leader_callsign'] }})</td><td>{{ n['participant_count'] }}</td><td><div class="actions"><a class="btn btn-secondary btn-small" href="{{ url_for('net_detail',net_id=n['id']) }}">Pregled</a>{% if g.user['role']=='admin' and n['status']=='closed' %}<a class="btn btn-primary btn-small" href="{{ url_for('edit_net',net_id=n['id']) }}">Uredi</a>{% endif %}</div></td></tr>{% endfor %}</tbody></table></div>{% else %}<p class="empty">Arhiv je prazen.</p>{% endif %}</div>{% endblock %}'''
+
+TEMPLATES["deleted_nets.html"] = r'''{% extends "base.html" %}{% block title %}Koš izbrisanih skedov · {{ app_name }}{% endblock %}{% block content %}<div class="card"><div class="actions"><div><h1>Koš izbrisanih skedov</h1><p class="muted">Administrator lahko pregleda razlog in shranjeno kopijo ter pomotoma izbrisani sked obnovi.</p></div><a class="btn btn-secondary right" href="{{ url_for('archive') }}">Nazaj v arhiv</a></div>{% if deletions %}<div class="table-wrap"><table><thead><tr><th>Izbris</th><th>Sked</th><th>Prijavljeni</th><th>Razlog</th><th>Status</th><th></th></tr></thead><tbody>{% for item in deletions %}<tr><td class="nowrap">{{ item['deleted_at']|datetime_si }}<br><span class="muted">{{ item['deleted_by_name'] }} ({{ item['deleted_by_callsign'] }})</span></td><td><b>{{ item['title'] }}</b><br>{{ item['net_date']|date_si }}</td><td>{{ item['participant_count'] }}</td><td>{{ item['reason'] }}</td><td>{% if item['restored_at'] %}<span class="badge open">Obnovljen</span><br><small>{{ item['restored_at']|datetime_si }}</small>{% else %}<span class="badge closed">V košu</span>{% endif %}</td><td><a class="btn btn-secondary btn-small" href="{{ url_for('deleted_net_detail',deletion_id=item['id']) }}">Podrobnosti</a></td></tr>{% endfor %}</tbody></table></div>{% else %}<p class="empty">Koš je prazen.</p>{% endif %}</div>{% endblock %}'''
+
+TEMPLATES["deleted_net_detail.html"] = r'''{% extends "base.html" %}{% block title %}Izbrisani sked · {{ app_name }}{% endblock %}{% block content %}<div class="card"><div class="actions"><div><span class="badge {{ 'open' if deletion['restored_at'] else 'closed' }}">{{ 'Obnovljen' if deletion['restored_at'] else 'V košu' }}</span><h1>{{ deletion['title'] }}</h1><p>{{ deletion['net_date']|date_si }} · {{ deletion['participant_count'] }} prijavljenih</p></div><a class="btn btn-secondary right" href="{{ url_for('deleted_nets') }}">Nazaj v koš</a></div><h2>Razlog brisanja</h2><div class="flash warning">{{ deletion['reason'] }}</div><p class="muted">Izbris izvedel {{ deletion['deleted_by_name'] }} ({{ deletion['deleted_by_callsign'] }}) · {{ deletion['deleted_at']|datetime_si }}</p>{% if deletion['restored_at'] %}<p><b>Obnovil:</b> {{ deletion['restored_by_name'] }} ({{ deletion['restored_by_callsign'] }}) · {{ deletion['restored_at']|datetime_si }}</p>{% if restored_exists %}<a class="btn btn-primary" href="{{ url_for('net_detail',net_id=deletion['restored_net_id']) }}">Odpri obnovljeni sked</a>{% endif %}{% elif snapshot %}<form method="post" action="{{ url_for('restore_deleted_net',deletion_id=deletion['id']) }}" onsubmit="return confirm('Obnovim ta sked in vse prijavljene v arhiv?')"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="btn btn-success">Obnovi sked in prijavljene</button></form>{% else %}<div class="flash danger">Shranjene kopije ni mogoče prebrati, zato obnova ni na voljo.</div>{% endif %}</div>{% if snapshot %}<div class="card"><h2>Shranjeni podatki</h2><p><b>Začetek:</b> {{ snapshot['net']['started_at']|datetime_si }}{% if snapshot['net']['ended_at'] %}<br><b>Konec:</b> {{ snapshot['net']['ended_at']|datetime_si }}{% endif %}<br><b>Operater:</b> {{ snapshot['net']['leader_name'] }} ({{ snapshot['net']['leader_callsign'] }}){% if snapshot['net']['repeater'] %}<br><b>Repetitor:</b> {{ snapshot['net']['repeater'] }}{% endif %}</p><h2>Prijavljeni: {{ snapshot['participants']|length }}</h2>{% if snapshot['participants'] %}<div class="table-wrap"><table><thead><tr><th>Ura</th><th>Klicni znak</th><th>Ime in priimek</th></tr></thead><tbody>{% for participant in snapshot['participants'] %}<tr><td>{{ participant['checkin_at']|time_si }}</td><td><b>{{ participant['callsign'] }}</b></td><td>{{ participant['full_name'] }}</td></tr>{% endfor %}</tbody></table></div>{% else %}<p class="empty">Sked ni imel prijavljenih.</p>{% endif %}</div>{% endif %}{% endblock %}'''
 
 TEMPLATES["callsigns_v2.html"] = r'''{% extends "base.html" %}{% block content %}<div class="card"><div class="actions"><div><h1>Imenik klicnih znakov</h1><p class="muted">Izberi klicni znak za prikaz zgodovine sodelovanja.</p></div>{% if g.user['role']=='admin' %}<a class="btn btn-primary right" href="{{ url_for('new_callsign') }}">＋ Novi vnos</a>{% endif %}</div><form method="get" class="actions no-print" style="margin-bottom:18px"><input name="q" value="{{ query }}" placeholder="Išči po klicnem znaku ali imenu" style="max-width:360px"><button class="btn btn-secondary">Išči</button>{% if query %}<a class="btn btn-secondary" href="{{ url_for('callsigns') }}">Počisti</a>{% endif %}</form>{% if entries %}<div class="table-wrap"><table><thead><tr><th>Klicni znak</th><th>Ime in priimek</th><th>Sodelovanj</th><th>Zadnja prijava</th><th>Status</th><th></th></tr></thead><tbody>{% for entry in entries %}<tr><td><a href="{{ url_for('callsign_profile',entry_id=entry['id']) }}"><b>{{ entry['callsign'] }}</b></a></td><td>{{ entry['full_name'] }}</td><td>{{ entry['use_count'] }}</td><td>{{ entry['last_used_at']|datetime_si if entry['last_used_at'] else '–' }}</td><td><span class="badge {{ 'open' if entry['active'] else 'closed' }}">{{ 'Aktiven' if entry['active'] else 'Skrit' }}</span></td><td><div class="actions"><a class="btn btn-secondary btn-small" href="{{ url_for('callsign_profile',entry_id=entry['id']) }}">Profil</a>{% if g.user['role']=='admin' %}<a class="btn btn-secondary btn-small" href="{{ url_for('edit_callsign',entry_id=entry['id']) }}">Uredi</a>{% endif %}</div></td></tr>{% endfor %}</tbody></table></div>{% else %}<p class="empty">V imeniku ni zadetkov.</p>{% endif %}</div>{% endblock %}'''
 

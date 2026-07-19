@@ -333,7 +333,7 @@ class ScheduleTests(unittest.TestCase):
 
     def test_alpha_channel_has_visible_warning(self):
         with patch("app.RELEASE_CHANNEL", "alpha"), patch(
-            "app.APP_VERSION", "1.16.0-alpha"
+            "app.APP_VERSION", "1.17.0-alpha"
         ):
             response = flask_app.test_client().get("/login")
             health_response = flask_app.test_client().get("/health")
@@ -341,7 +341,7 @@ class ScheduleTests(unittest.TestCase):
         html = response.get_data(as_text=True)
         self.assertIn("ALPHA TESTNA RAZLIČICA", html)
         self.assertIn("podatki niso produkcijski", html)
-        self.assertIn("različica 1.16.0-alpha", html)
+        self.assertIn("različica 1.17.0-alpha", html)
         self.assertEqual(health_response.get_json()["channel"], "alpha")
 
     def test_login_shows_countdown_and_next_saturday_number(self):
@@ -940,6 +940,79 @@ class ScheduleTests(unittest.TestCase):
             self.assertEqual(deletion["participant_count"], 1)
             self.assertIn("S58TEST", deletion["snapshot"])
             self.assertIn(reason, audit_row["details"])
+
+    def test_deleted_net_can_be_reviewed_and_restored_only_once(self):
+        title = "Pomotoma izbrisani sked za obnovitev"
+        net_id, admin_id = self.create_closed_net(title, with_participant=True)
+        client = self.authenticated_client(admin_id)
+        delete_response = client.post(
+            f"/nets/{net_id}/delete-closed",
+            data={
+                "csrf_token": "test-csrf-token",
+                "reason": "Sked je bil izbrisan samo zaradi testa obnovitve.",
+            },
+        )
+        self.assertEqual(delete_response.status_code, 302)
+
+        with flask_app.app_context():
+            db = get_db()
+            deletion = db.execute(
+                """SELECT * FROM net_deletions WHERE original_net_id=?
+                   ORDER BY id DESC LIMIT 1""",
+                (net_id,),
+            ).fetchone()
+            deletion_id = deletion["id"]
+            self.assertIsNone(deletion["restored_at"])
+
+        trash_html = client.get("/deleted-nets").get_data(as_text=True)
+        detail_html = client.get(
+            f"/deleted-nets/{deletion_id}"
+        ).get_data(as_text=True)
+        self.assertIn(title, trash_html)
+        self.assertIn("Obnovi sked in prijavljene", detail_html)
+        self.assertIn("S58TEST", detail_html)
+
+        restore_response = client.post(
+            f"/deleted-nets/{deletion_id}/restore",
+            data={"csrf_token": "test-csrf-token"},
+        )
+        self.assertEqual(restore_response.status_code, 302)
+
+        with flask_app.app_context():
+            db = get_db()
+            deletion = db.execute(
+                "SELECT * FROM net_deletions WHERE id=?", (deletion_id,)
+            ).fetchone()
+            restored_net = db.execute(
+                "SELECT * FROM nets WHERE id=?", (deletion["restored_net_id"],)
+            ).fetchone()
+            restored_participant = db.execute(
+                "SELECT * FROM participants WHERE net_id=?",
+                (deletion["restored_net_id"],),
+            ).fetchone()
+            audit_row = db.execute(
+                """SELECT details FROM audit_log
+                   WHERE action='restore' AND entity_type='net' AND entity_id=?
+                   ORDER BY id DESC LIMIT 1""",
+                (deletion["restored_net_id"],),
+            ).fetchone()
+            self.assertIsNotNone(deletion["restored_at"])
+            self.assertEqual(deletion["restored_by"], admin_id)
+            self.assertEqual(restored_net["title"], title)
+            self.assertEqual(restored_net["status"], "closed")
+            self.assertEqual(restored_participant["callsign"], "S58TEST")
+            self.assertIn(f'"deletion_id": {deletion_id}', audit_row["details"])
+
+        second_restore = client.post(
+            f"/deleted-nets/{deletion_id}/restore",
+            data={"csrf_token": "test-csrf-token"},
+        )
+        self.assertEqual(second_restore.status_code, 302)
+        with flask_app.app_context():
+            count = get_db().execute(
+                "SELECT COUNT(*) AS n FROM nets WHERE title=?", (title,)
+            ).fetchone()["n"]
+            self.assertEqual(count, 1)
 
 
     def test_admin_can_cancel_and_restore_regular_net(self):
