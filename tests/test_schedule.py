@@ -12,6 +12,7 @@ os.environ["SECRET_KEY"] = "test-secret-key"
 
 from app import (  # noqa: E402
     APP_VERSION,
+    RELEASE_CHANNEL,
     SCHEDULE_MONTHLY,
     SCHEDULE_SATURDAY,
     app as flask_app,
@@ -88,7 +89,7 @@ class ScheduleTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.get_json()["version"], APP_VERSION)
-        self.assertEqual(response.get_json()["channel"], "stable")
+        self.assertEqual(response.get_json()["channel"], RELEASE_CHANNEL)
 
     def test_new_participant_is_learned_and_suggested_from_directory(self):
         net_id, admin_id = self.create_open_net("Test imenika klicnih znakov")
@@ -182,7 +183,7 @@ class ScheduleTests(unittest.TestCase):
 
     def test_alpha_channel_has_visible_warning(self):
         with patch("app.RELEASE_CHANNEL", "alpha"), patch(
-            "app.APP_VERSION", "1.12.0-alpha"
+            "app.APP_VERSION", "1.13.0-alpha"
         ):
             response = flask_app.test_client().get("/login")
             health_response = flask_app.test_client().get("/health")
@@ -190,7 +191,7 @@ class ScheduleTests(unittest.TestCase):
         html = response.get_data(as_text=True)
         self.assertIn("ALPHA TESTNA RAZLIČICA", html)
         self.assertIn("podatki niso produkcijski", html)
-        self.assertIn("različica 1.12.0-alpha", html)
+        self.assertIn("različica 1.13.0-alpha", html)
         self.assertEqual(health_response.get_json()["channel"], "alpha")
 
     def test_login_shows_countdown_and_next_saturday_number(self):
@@ -741,6 +742,89 @@ class ScheduleTests(unittest.TestCase):
                 created["title"],
             )
             self.assertIn("prestavljen", created["title"])
+
+
+    def test_statistics_csv_and_print_report_use_same_filters(self):
+        net_id, admin_id = self.create_closed_net(
+            "Statistični testni sked", with_participant=True
+        )
+        with flask_app.app_context():
+            db = get_db()
+            db.execute(
+                """UPDATE nets SET net_date='2040-03-02',
+                   started_at='2040-03-02 20:00:00',
+                   ended_at='2040-03-02 20:30:00' WHERE id=?""",
+                (net_id,),
+            )
+            db.execute(
+                "UPDATE participants SET checkin_at='2040-03-02 20:05:00' WHERE net_id=?",
+                (net_id,),
+            )
+            db.commit()
+
+        client = self.authenticated_client(admin_id)
+        query = "from_date=2040-03-01&to_date=2040-03-31&status=closed"
+        statistics_response = client.get(f"/statistics?{query}")
+        statistics_html = statistics_response.get_data(as_text=True)
+        self.assertEqual(statistics_response.status_code, 200)
+        self.assertIn("Statistika skedov", statistics_html)
+        self.assertIn("2040-03", statistics_html)
+        self.assertIn("S58TEST", statistics_html)
+        self.assertIn("Izvozi CSV", statistics_html)
+
+        csv_response = client.get(f"/reports/export.csv?{query}")
+        csv_text = csv_response.get_data(as_text=True)
+        self.assertEqual(csv_response.status_code, 200)
+        self.assertIn("text/csv", csv_response.content_type)
+        self.assertTrue(csv_text.startswith("\ufeff"))
+        self.assertIn("Statistični testni sked", csv_text)
+        self.assertIn("S58TEST", csv_text)
+
+        print_response = client.get(f"/reports/print?{query}")
+        print_html = print_response.get_data(as_text=True)
+        self.assertEqual(print_response.status_code, 200)
+        self.assertIn("Poročilo skedov Radiokluba Sevnica", print_html)
+        self.assertIn("Statistični testni sked", print_html)
+        self.assertIn("Shrani kot PDF", print_html)
+
+    def test_audit_view_is_filterable_and_admin_only(self):
+        with flask_app.app_context():
+            db = get_db()
+            admin_id = db.execute(
+                "SELECT id FROM users WHERE role='admin' ORDER BY id LIMIT 1"
+            ).fetchone()["id"]
+            db.execute(
+                """INSERT INTO audit_log
+                   (user_id, action, entity_type, entity_id, details, created_at)
+                   VALUES (?, 'report_test', 'report', 987654,
+                           'Edinstven revizijski preizkus', '2041-04-05 12:00:00')""",
+                (admin_id,),
+            )
+            db.execute(
+                """INSERT OR IGNORE INTO users
+                   (username, full_name, callsign, password_hash, role, active, created_at)
+                   VALUES ('audit-leader', 'Revizijski Vodja', 'S50AUD',
+                           'not-used-in-test', 'leader', 1, ?)""",
+                (now_db(),),
+            )
+            leader_id = db.execute(
+                "SELECT id FROM users WHERE username='audit-leader'"
+            ).fetchone()["id"]
+            db.commit()
+
+        admin_client = self.authenticated_client(admin_id)
+        response = admin_client.get(
+            "/audit?action=report_test&entity_type=report&from_date=2041-04-05&to_date=2041-04-05"
+        )
+        html = response.get_data(as_text=True)
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("Revizijska sled", html)
+        self.assertIn("Edinstven revizijski preizkus", html)
+        self.assertIn("#987654", html)
+
+        leader_client = self.authenticated_client(leader_id)
+        self.assertEqual(leader_client.get("/audit").status_code, 403)
+        self.assertEqual(leader_client.get("/reports/export.csv").status_code, 403)
 
 
 if __name__ == "__main__":

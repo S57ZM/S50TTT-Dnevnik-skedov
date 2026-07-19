@@ -2,13 +2,16 @@
 
 Ločen spletni portal Radiokluba Sevnica S50TTT za vodenje skedov.
 
-Trenutna alpha različica: **1.12.0-alpha**
+Trenutna alpha različica: **1.13.0-alpha**
 
 ## Funkcije
 
 - več uporabnikov z vlogama administrator in vodja skeda;
 - samodejni izračun naslednjega mesečnega in sobotnega rednega skeda;
 - administratorska odpoved ali prestavitev rednega skeda z obveznim razlogom;
+- statistika udeležbe po mesecih, operaterjih in klicnih znakih;
+- filtriran izvoz poročila v CSV ter priprava za PDF oziroma tiskanje;
+- administratorski pregled revizijske sledi s filtri;
 - zaklenjeno odpiranje rednega dnevnika do petka pred skedom, s predčasnim
   odklepom po petih hitrih pritiskih;
 - živ odštevalnik, številka sobotnega skeda in skupno število prijavljenih na
@@ -40,6 +43,21 @@ imenik. Ob naslednjem vnosu izbira znanega klicnega znaka samodejno izpolni ime.
 prepiše samodejno. Administrator ga lahko popravi ali skrije na strani `Imenik`.
 Ob nadgradnji se imenik enkrat dopolni tudi iz že shranjenih prijav. Vsak vnos
 hrani število uporab in čas zadnje prijave.
+
+## Statistika, poročila in revizija (alpha)
+
+Stran `Statistika` prikazuje skupno število skedov in prijav, število različnih
+klicnih znakov, povprečno udeležbo, mesečni graf, najbolj redne sodelujoče ter
+število skedov po operaterjih. Prikaz je mogoče omejiti z datumskim obdobjem,
+vrsto skeda in statusom.
+
+Administrator lahko iste filtrirane podatke izvozi v CSV, pripravljen za Excel,
+ali odpre tiskano poročilo in ga v brskalniku shrani kot PDF. Izvoz vsebuje tudi
+posamezne prijave, medtem ko je PDF-pogled oblikovan kot pregled skedov.
+
+Stran `Revizija` je dostopna samo administratorju. Omogoča filtriranje po
+dejanju, vrsti podatka, uporabniku in datumskem obdobju ter prikaže, kdo je
+spremembo izvedel, kdaj in katere podrobnosti so bile zabeležene.
 
 Administrator lahko v urejevalniku zaključenega skeda naknadno doda, popravi ali
 izbriše prijavljenega člana. Naknadno dodani klicni znaki se prav tako shranijo v

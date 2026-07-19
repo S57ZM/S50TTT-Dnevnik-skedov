@@ -1,4 +1,6 @@
+import csv
 import hmac
+import io
 import json
 import os
 import secrets
@@ -8,7 +10,8 @@ from functools import wraps
 from zoneinfo import ZoneInfo
 
 from flask import (
-    Flask, abort, flash, g, redirect, render_template, request, session, url_for
+    Flask, Response, abort, flash, g, redirect, render_template, request, session,
+    url_for,
 )
 from jinja2 import DictLoader
 from werkzeug.middleware.proxy_fix import ProxyFix
@@ -16,7 +19,7 @@ from werkzeug.security import check_password_hash, generate_password_hash
 
 
 APP_NAME = "S50TTT Dnevnik skedov"
-BASE_VERSION = "1.12.0"
+BASE_VERSION = "1.13.0"
 RELEASE_CHANNEL = os.environ.get("RELEASE_CHANNEL", "stable").strip().lower()
 if RELEASE_CHANNEL not in {"stable", "alpha"}:
     RELEASE_CHANNEL = "stable"
@@ -1322,6 +1325,263 @@ def reopen_net(net_id):
     return redirect(url_for("net_detail", net_id=net_id))
 
 
+def report_filters():
+    values = {
+        "from_date": request.args.get("from_date", "").strip(),
+        "to_date": request.args.get("to_date", "").strip(),
+        "schedule_type": request.args.get("schedule_type", "all").strip(),
+        "status": request.args.get("status", "all").strip(),
+    }
+    for key in ("from_date", "to_date"):
+        if values[key]:
+            try:
+                date.fromisoformat(values[key])
+            except ValueError:
+                values[key] = ""
+    if values["schedule_type"] not in {"all", "monthly", "saturday", "other"}:
+        values["schedule_type"] = "all"
+    if values["status"] not in {"all", "open", "closed"}:
+        values["status"] = "all"
+    return values
+
+
+def report_where(filters, alias="n"):
+    clauses = []
+    parameters = []
+    if filters["from_date"]:
+        clauses.append(f"{alias}.net_date>=?")
+        parameters.append(filters["from_date"])
+    if filters["to_date"]:
+        clauses.append(f"{alias}.net_date<=?")
+        parameters.append(filters["to_date"])
+    if filters["schedule_type"] == "other":
+        clauses.append(f"{alias}.schedule_type IS NULL")
+    elif filters["schedule_type"] != "all":
+        clauses.append(f"{alias}.schedule_type=?")
+        parameters.append(filters["schedule_type"])
+    if filters["status"] != "all":
+        clauses.append(f"{alias}.status=?")
+        parameters.append(filters["status"])
+    return (" WHERE " + " AND ".join(clauses)) if clauses else "", parameters
+
+
+def report_net_rows(filters):
+    where, parameters = report_where(filters)
+    return get_db().execute(
+        f"""SELECT n.*, u.full_name AS leader_name, u.callsign AS leader_callsign,
+                   COUNT(p.id) AS participant_count
+            FROM nets n JOIN users u ON u.id=n.leader_id
+            LEFT JOIN participants p ON p.net_id=n.id
+            {where}
+            GROUP BY n.id ORDER BY n.net_date, n.started_at""",
+        parameters,
+    ).fetchall()
+
+
+@app.route("/statistics")
+@login_required
+def statistics():
+    filters = report_filters()
+    rows = report_net_rows(filters)
+    total_participants = sum(row["participant_count"] for row in rows)
+    net_count = len(rows)
+    summary = {
+        "net_count": net_count,
+        "participant_count": total_participants,
+        "average": round(total_participants / net_count, 1) if net_count else 0,
+    }
+
+    where, parameters = report_where(filters)
+    unique_row = get_db().execute(
+        f"""SELECT COUNT(DISTINCT UPPER(p.callsign)) AS n
+            FROM nets n JOIN participants p ON p.net_id=n.id {where}""",
+        parameters,
+    ).fetchone()
+    summary["unique_callsigns"] = unique_row["n"]
+
+    monthly = {}
+    for row in rows:
+        month = row["net_date"][:7]
+        bucket = monthly.setdefault(month, {"month": month, "nets": 0, "participants": 0})
+        bucket["nets"] += 1
+        bucket["participants"] += row["participant_count"]
+    monthly_rows = list(monthly.values())
+    max_month_participants = max(
+        (item["participants"] for item in monthly_rows), default=1
+    )
+
+    participant_condition = " AND " if where else " WHERE "
+    top_participants = get_db().execute(
+        f"""SELECT UPPER(p.callsign) AS callsign, MAX(p.full_name) AS full_name,
+                   COUNT(*) AS attendance_count
+            FROM nets n JOIN participants p ON p.net_id=n.id
+            {where}{participant_condition}p.callsign<>''
+            GROUP BY UPPER(p.callsign)
+            ORDER BY attendance_count DESC, callsign LIMIT 10""",
+        parameters,
+    ).fetchall()
+    max_attendance = max(
+        (row["attendance_count"] for row in top_participants), default=1
+    )
+
+    leaders = get_db().execute(
+        f"""SELECT u.full_name, u.callsign, COUNT(DISTINCT n.id) AS net_count
+            FROM nets n JOIN users u ON u.id=n.leader_id {where}
+            GROUP BY u.id ORDER BY net_count DESC, u.callsign""",
+        parameters,
+    ).fetchall()
+    query_string = request.query_string.decode("utf-8")
+    return render_template(
+        "statistics.html",
+        filters=filters,
+        summary=summary,
+        monthly_rows=monthly_rows,
+        max_month_participants=max_month_participants,
+        top_participants=top_participants,
+        max_attendance=max_attendance,
+        leaders=leaders,
+        export_query=query_string,
+    )
+
+
+@app.route("/audit")
+@admin_required
+def audit_log_view():
+    action = request.args.get("action", "").strip()
+    entity_type = request.args.get("entity_type", "").strip()
+    from_date = request.args.get("from_date", "").strip()
+    to_date = request.args.get("to_date", "").strip()
+    try:
+        user_id = int(request.args.get("user_id", "0") or 0)
+    except ValueError:
+        user_id = 0
+    try:
+        page = max(1, int(request.args.get("page", "1")))
+    except ValueError:
+        page = 1
+
+    clauses = []
+    parameters = []
+    if action:
+        clauses.append("a.action=?")
+        parameters.append(action)
+    if entity_type:
+        clauses.append("a.entity_type=?")
+        parameters.append(entity_type)
+    if user_id:
+        clauses.append("a.user_id=?")
+        parameters.append(user_id)
+    for value, operator in ((from_date, ">="), (to_date, "<=")):
+        try:
+            valid_date = date.fromisoformat(value).isoformat() if value else ""
+        except ValueError:
+            valid_date = ""
+        if valid_date:
+            clauses.append(f"DATE(a.created_at){operator}?")
+            parameters.append(valid_date)
+    where = " WHERE " + " AND ".join(clauses) if clauses else ""
+    db = get_db()
+    total = db.execute(
+        f"SELECT COUNT(*) AS n FROM audit_log a{where}", parameters
+    ).fetchone()["n"]
+    per_page = 100
+    rows = db.execute(
+        f"""SELECT a.*, u.full_name AS user_name, u.callsign AS user_callsign
+            FROM audit_log a LEFT JOIN users u ON u.id=a.user_id
+            {where} ORDER BY a.id DESC LIMIT ? OFFSET ?""",
+        [*parameters, per_page, (page - 1) * per_page],
+    ).fetchall()
+    users_rows = db.execute(
+        "SELECT id, full_name, callsign FROM users ORDER BY full_name"
+    ).fetchall()
+    actions = db.execute(
+        "SELECT DISTINCT action FROM audit_log ORDER BY action"
+    ).fetchall()
+    entities = db.execute(
+        "SELECT DISTINCT entity_type FROM audit_log ORDER BY entity_type"
+    ).fetchall()
+    return render_template(
+        "audit.html",
+        rows=rows,
+        users=users_rows,
+        actions=actions,
+        entities=entities,
+        selected_action=action,
+        selected_entity=entity_type,
+        selected_user=user_id,
+        from_date=from_date,
+        to_date=to_date,
+        page=page,
+        total=total,
+        has_next=page * per_page < total,
+    )
+
+
+def report_participant_rows(filters):
+    where, parameters = report_where(filters)
+    return get_db().execute(
+        f"""SELECT n.net_date, n.title, n.schedule_type, n.status,
+                   n.started_at, n.ended_at, u.full_name AS leader_name,
+                   u.callsign AS leader_callsign, p.callsign,
+                   p.full_name, p.checkin_at
+            FROM nets n JOIN users u ON u.id=n.leader_id
+            LEFT JOIN participants p ON p.net_id=n.id
+            {where}
+            ORDER BY n.net_date, n.started_at, p.checkin_at, p.id""",
+        parameters,
+    ).fetchall()
+
+
+def csv_safe(value):
+    text = "" if value is None else str(value)
+    if text.startswith(("=", "+", "-", "@")):
+        return "'" + text
+    return text
+
+
+@app.route("/reports/export.csv")
+@admin_required
+def export_csv():
+    filters = report_filters()
+    rows = report_participant_rows(filters)
+    output = io.StringIO(newline="")
+    writer = csv.writer(output, delimiter=";")
+    writer.writerow(
+        [
+            "Datum", "Naslov", "Vrsta", "Status", "Začetek", "Konec",
+            "Operater", "Klicni znak operaterja", "Klicni znak prijavljenega",
+            "Ime prijavljenega", "Ura prijave",
+        ]
+    )
+    type_labels = {"monthly": "Mesečni", "saturday": "Sobotni", None: "Izredni"}
+    for row in rows:
+        writer.writerow(
+            [csv_safe(value) for value in [
+                row["net_date"], row["title"], type_labels.get(row["schedule_type"], "Izredni"),
+                "Zaključen" if row["status"] == "closed" else "Odprt",
+                row["started_at"], row["ended_at"] or "", row["leader_name"],
+                row["leader_callsign"], row["callsign"] or "",
+                row["full_name"] or "", row["checkin_at"] or "",
+            ]]
+        )
+    content = "\ufeff" + output.getvalue()
+    return Response(
+        content,
+        mimetype="text/csv; charset=utf-8",
+        headers={"Content-Disposition": "attachment; filename=skedi-izvoz.csv"},
+    )
+
+
+@app.route("/reports/print")
+@admin_required
+def print_report():
+    filters = report_filters()
+    rows = report_net_rows(filters)
+    return render_template(
+        "print_report.html", filters=filters, rows=rows, generated_at=now_db()
+    )
+
+
 @app.route("/archive")
 @login_required
 def archive():
@@ -1540,6 +1800,30 @@ def datetime_si(value):
     return datetime.strptime(value[:19], "%Y-%m-%d %H:%M:%S").strftime("%d. %m. %Y ob %H:%M")
 
 
+@app.template_filter("audit_action_si")
+def audit_action_si(value):
+    return {
+        "create": "Ustvarjeno",
+        "update": "Spremenjeno",
+        "delete": "Izbrisano",
+        "close": "Zaključeno",
+        "reopen": "Ponovno odprto",
+        "learn": "Dodano v imenik",
+        "password_change": "Sprememba gesla",
+    }.get(value, value)
+
+
+@app.template_filter("audit_entity_si")
+def audit_entity_si(value):
+    return {
+        "net": "Sked",
+        "participant": "Prijava",
+        "callsign": "Klicni znak",
+        "user": "Uporabnik",
+        "schedule_exception": "Sprememba urnika",
+    }.get(value, value)
+
+
 TEMPLATES = {
 "base.html": r'''<!doctype html>
 <html lang="sl"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -1607,6 +1891,27 @@ TEMPLATES.update({
 <div class="card"><div class="actions"><h2>Zadnji zaključeni skedi</h2><a class="btn btn-secondary right" href="{{ url_for('archive') }}">Celoten arhiv</a></div>{% if recent %}<div class="table-wrap"><table><thead><tr><th>Sked</th><th>Vodja</th><th>Prijavljeni</th><th></th></tr></thead><tbody>{% for n in recent %}<tr><td><b>{{ n['title'] }}</b><br><span class="muted">{{ n['net_date']|date_si }} ob {{ n['started_at']|time_si }}</span></td><td>{{ n['leader_callsign'] }}</td><td>{{ n['participant_count'] }}</td><td><a class="btn btn-secondary btn-small" href="{{ url_for('net_detail',net_id=n['id']) }}">Pregled</a></td></tr>{% endfor %}</tbody></table></div>{% else %}<p class="empty">V arhivu še ni skedov.</p>{% endif %}</div>{% endblock %}''',
 "schedule_exception.html": r'''{% extends "base.html" %}{% block content %}<div class="card" style="max-width:680px"><h1>Odpovej ali prestavi redni sked</h1><p><b>{{ scheduled['label'] }}</b><br>Redni termin: {{ scheduled['date']|date_si }} ob {{ scheduled['time'] }}</p><p class="muted">Spremembo lahko naredi samo administrator. Razlog in vsaka sprememba se shranita v revizijsko sled.</p><form method="post"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><div class="field"><label>Sprememba</label><select name="action" id="exception-action" required><option value="postponed" {% if exception and exception['action']=='postponed' %}selected{% endif %}>Prestavi na drug termin</option><option value="canceled" {% if exception and exception['action']=='canceled' %}selected{% endif %}>Odpovej sked</option></select></div><div id="postponed-fields" class="grid"><div class="field"><label>Novi datum</label><input type="date" name="new_date" value="{{ exception['new_date'] if exception and exception['new_date'] else scheduled['date'] }}"></div><div class="field"><label>Nova ura</label><input type="time" name="new_time" value="{{ exception['new_time'] if exception and exception['new_time'] else scheduled['time'] }}"></div></div><div class="field"><label>Razlog</label><textarea name="reason" minlength="10" maxlength="1000" required placeholder="Na primer: dogodek kluba, praznik, tehnične težave …">{{ exception['reason'] if exception else '' }}</textarea><small class="muted">Najmanj 10 znakov.</small></div><div class="actions"><button class="btn btn-primary">Shrani spremembo</button><a class="btn btn-secondary" href="{{ url_for('dashboard') }}">Prekliči</a></div></form>{% if exception %}<div class="danger-zone"><form method="post" action="{{ url_for('delete_schedule_exception',schedule_type=scheduled['schedule_type'],scheduled_date=scheduled['date']) }}" onsubmit="return confirm('Odstranim spremembo in povrnem običajni termin?')"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="btn btn-danger">Razveljavi spremembo</button></form></div>{% endif %}</div><script>(function(){const action=document.getElementById('exception-action');const fields=document.getElementById('postponed-fields');function update(){fields.hidden=action.value!=='postponed';fields.querySelectorAll('input').forEach(function(input){input.required=action.value==='postponed'})}action.addEventListener('change',update);update()})();</script>{% endblock %}'''
 })
+
+TEMPLATES.update({
+"statistics.html": r'''{% extends "base.html" %}{% block title %}Statistika · {{ app_name }}{% endblock %}{% block content %}
+<div class="card"><div class="actions"><div><h1>Statistika skedov</h1><p class="muted">Pregled udeležbe za izbrano obdobje in vrsto skeda.</p></div>{% if g.user['role']=='admin' %}<div class="actions right no-print"><a class="btn btn-secondary" href="{{ url_for('export_csv') }}{% if export_query %}?{{ export_query }}{% endif %}">Izvozi CSV</a><a class="btn btn-secondary" href="{{ url_for('print_report') }}{% if export_query %}?{{ export_query }}{% endif %}" target="_blank">PDF / tiskanje</a></div>{% endif %}</div><form method="get" class="report-filters no-print"><div class="field"><label>Od datuma</label><input type="date" name="from_date" value="{{ filters['from_date'] }}"></div><div class="field"><label>Do datuma</label><input type="date" name="to_date" value="{{ filters['to_date'] }}"></div><div class="field"><label>Vrsta skeda</label><select name="schedule_type"><option value="all">Vse vrste</option><option value="saturday" {% if filters['schedule_type']=='saturday' %}selected{% endif %}>Sobotni</option><option value="monthly" {% if filters['schedule_type']=='monthly' %}selected{% endif %}>Mesečni</option><option value="other" {% if filters['schedule_type']=='other' %}selected{% endif %}>Izredni</option></select></div><div class="field"><label>Status</label><select name="status"><option value="all">Vsi statusi</option><option value="closed" {% if filters['status']=='closed' %}selected{% endif %}>Zaključeni</option><option value="open" {% if filters['status']=='open' %}selected{% endif %}>Odprti</option></select></div><button class="btn btn-primary">Prikaži</button><a class="btn btn-secondary" href="{{ url_for('statistics') }}">Počisti</a></form></div>
+<div class="stats-grid"><div class="card stat"><span>Skedov</span><strong>{{ summary['net_count'] }}</strong></div><div class="card stat"><span>Vseh prijav</span><strong>{{ summary['participant_count'] }}</strong></div><div class="card stat"><span>Različnih klicnih znakov</span><strong>{{ summary['unique_callsigns'] }}</strong></div><div class="card stat"><span>Povprečno na sked</span><strong>{{ summary['average'] }}</strong></div></div>
+<div class="grid"><div class="card"><h2>Udeležba po mesecih</h2>{% if monthly_rows %}<div class="bar-chart" role="img" aria-label="Število prijav po mesecih">{% for item in monthly_rows %}<div class="bar-row"><span>{{ item['month'] }}</span><div class="bar-track"><i style="width:{{ (item['participants'] * 100 / max_month_participants)|round }}%"></i></div><b>{{ item['participants'] }}</b><small>{{ item['nets'] }} skedov</small></div>{% endfor %}</div>{% else %}<p class="empty">Za izbrane filtre ni podatkov.</p>{% endif %}</div><div class="card"><h2>Najbolj redni sodelujoči</h2>{% if top_participants %}<div class="bar-chart" role="img" aria-label="Najbolj redni sodelujoči po številu prijav">{% for item in top_participants %}<div class="bar-row"><span><b>{{ item['callsign'] }}</b><br><small>{{ item['full_name'] }}</small></span><div class="bar-track"><i style="width:{{ (item['attendance_count'] * 100 / max_attendance)|round }}%"></i></div><b>{{ item['attendance_count'] }}</b></div>{% endfor %}</div>{% else %}<p class="empty">Za izbrane filtre ni prijavljenih.</p>{% endif %}</div></div>
+<div class="card"><h2>Skedi po operaterjih</h2>{% if leaders %}<div class="table-wrap"><table><thead><tr><th>Operater</th><th>Klicni znak</th><th>Število skedov</th></tr></thead><tbody>{% for leader in leaders %}<tr><td>{{ leader['full_name'] }}</td><td><b>{{ leader['callsign'] }}</b></td><td>{{ leader['net_count'] }}</td></tr>{% endfor %}</tbody></table></div>{% else %}<p class="empty">Za izbrane filtre ni podatkov.</p>{% endif %}</div>{% endblock %}''',
+"audit.html": r'''{% extends "base.html" %}{% block title %}Revizijska sled · {{ app_name }}{% endblock %}{% block content %}<div class="card"><h1>Revizijska sled</h1><p class="muted">Zabeležene spremembe uporabnikov, skedov, prijav, imenika in rednega urnika. Prikazanih je največ 100 zapisov na stran.</p><form method="get" class="report-filters"><div class="field"><label>Dejanje</label><select name="action"><option value="">Vsa dejanja</option>{% for item in actions %}<option value="{{ item['action'] }}" {% if selected_action==item['action'] %}selected{% endif %}>{{ item['action']|audit_action_si }}</option>{% endfor %}</select></div><div class="field"><label>Vrsta podatka</label><select name="entity_type"><option value="">Vse vrste</option>{% for item in entities %}<option value="{{ item['entity_type'] }}" {% if selected_entity==item['entity_type'] %}selected{% endif %}>{{ item['entity_type']|audit_entity_si }}</option>{% endfor %}</select></div><div class="field"><label>Uporabnik</label><select name="user_id"><option value="">Vsi uporabniki</option>{% for user in users %}<option value="{{ user['id'] }}" {% if selected_user==user['id'] %}selected{% endif %}>{{ user['full_name'] }} ({{ user['callsign'] }})</option>{% endfor %}</select></div><div class="field"><label>Od datuma</label><input type="date" name="from_date" value="{{ from_date }}"></div><div class="field"><label>Do datuma</label><input type="date" name="to_date" value="{{ to_date }}"></div><button class="btn btn-primary">Filtriraj</button><a class="btn btn-secondary" href="{{ url_for('audit_log_view') }}">Počisti</a></form></div><div class="card"><div class="actions"><h2>Zapisi: {{ total }}</h2><span class="muted right">Stran {{ page }}</span></div>{% if rows %}<div class="table-wrap"><table><thead><tr><th>Čas</th><th>Uporabnik</th><th>Dejanje</th><th>Podatek</th><th>Podrobnosti</th></tr></thead><tbody>{% for row in rows %}<tr><td class="nowrap">{{ row['created_at']|datetime_si }}</td><td>{{ row['user_name'] or 'Sistem' }}{% if row['user_callsign'] %}<br><b>{{ row['user_callsign'] }}</b>{% endif %}</td><td><span class="badge leader">{{ row['action']|audit_action_si }}</span></td><td>{{ row['entity_type']|audit_entity_si }}{% if row['entity_id'] %} #{{ row['entity_id'] }}{% endif %}</td><td>{% if row['details'] %}<details><summary>Prikaži</summary><code class="audit-details">{{ row['details'] }}</code></details>{% else %}–{% endif %}</td></tr>{% endfor %}</tbody></table></div><div class="actions no-print" style="margin-top:16px">{% if page>1 %}<a class="btn btn-secondary" href="{{ url_for('audit_log_view',page=page-1,action=selected_action,entity_type=selected_entity,user_id=selected_user or '',from_date=from_date,to_date=to_date) }}">← Prejšnja</a>{% endif %}{% if has_next %}<a class="btn btn-secondary right" href="{{ url_for('audit_log_view',page=page+1,action=selected_action,entity_type=selected_entity,user_id=selected_user or '',from_date=from_date,to_date=to_date) }}">Naslednja →</a>{% endif %}</div>{% else %}<p class="empty">Ni revizijskih zapisov za izbrane filtre.</p>{% endif %}</div>{% endblock %}''',
+"print_report.html": r'''{% extends "base.html" %}{% block title %}Poročilo skedov · {{ app_name }}{% endblock %}{% block content %}<div class="card print-report"><div class="actions no-print"><button class="btn btn-primary" onclick="window.print()">Shrani kot PDF / natisni</button><button class="btn btn-secondary" onclick="window.close()">Zapri</button></div><h1>Poročilo skedov Radiokluba Sevnica S50TTT</h1><p class="muted">Izdelano: {{ generated_at|datetime_si }}{% if filters['from_date'] %} · od {{ filters['from_date']|date_si }}{% endif %}{% if filters['to_date'] %} · do {{ filters['to_date']|date_si }}{% endif %}</p>{% if rows %}<div class="table-wrap"><table><thead><tr><th>Datum</th><th>Sked</th><th>Status</th><th>Operater</th><th>Prijavljeni</th></tr></thead><tbody>{% for row in rows %}<tr><td class="nowrap">{{ row['net_date']|date_si }}</td><td><b>{{ row['title'] }}</b><br>{{ row['started_at']|time_si }}{% if row['ended_at'] %}–{{ row['ended_at']|time_si }}{% endif %}</td><td>{{ 'Zaključen' if row['status']=='closed' else 'Odprt' }}</td><td>{{ row['leader_name'] }} ({{ row['leader_callsign'] }})</td><td>{{ row['participant_count'] }}</td></tr>{% endfor %}</tbody><tfoot><tr><th colspan="4">Skupaj</th><th>{{ rows|sum(attribute='participant_count') }}</th></tr></tfoot></table></div>{% else %}<p class="empty">Za izbrane filtre ni podatkov.</p>{% endif %}</div>{% endblock %}'''
+})
+
+TEMPLATES["base.html"] = TEMPLATES["base.html"].replace(
+    '<a href="{{ url_for(\'callsigns\') }}">Imenik</a>',
+    '<a href="{{ url_for(\'callsigns\') }}">Imenik</a><a href="{{ url_for(\'statistics\') }}">Statistika</a>',
+).replace(
+    '<a href="{{ url_for(\'users\') }}">Uporabniki</a>',
+    '<a href="{{ url_for(\'users\') }}">Uporabniki</a><a href="{{ url_for(\'audit_log_view\') }}">Revizija</a>',
+).replace(
+    '</style>',
+    r'''.report-filters{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;align-items:end}.report-filters .field{margin:0}.stats-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:14px}.stat{text-align:center}.stat span{display:block;color:#65717c}.stat strong{display:block;font-size:2rem;margin-top:5px}.bar-chart{display:grid;gap:12px}.bar-row{display:grid;grid-template-columns:minmax(95px,1.2fr) minmax(110px,3fr) 42px minmax(62px,auto);gap:9px;align-items:center}.bar-track{height:13px;background:#e7edf2;border-radius:999px;overflow:hidden}.bar-track i{display:block;height:100%;min-width:2px;background:var(--blue);border-radius:999px}.bar-row small{color:#65717c}.audit-details{display:block;white-space:pre-wrap;overflow-wrap:anywhere;max-width:420px;margin-top:7px}.print-report{max-width:none}@media(max-width:700px){.stats-grid{grid-template-columns:1fr 1fr}.bar-row{grid-template-columns:minmax(85px,1.3fr) minmax(80px,2fr) 34px}.bar-row>small{display:none}.report-filters{grid-template-columns:1fr}}@media print{.stats-grid{grid-template-columns:repeat(4,1fr)}.print-report table{font-size:10pt}}</style>''',
+)
 
 app.jinja_loader = DictLoader(TEMPLATES)
 
