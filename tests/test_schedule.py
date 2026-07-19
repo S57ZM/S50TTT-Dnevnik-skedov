@@ -180,7 +180,7 @@ class ScheduleTests(unittest.TestCase):
 
     def test_alpha_channel_has_visible_warning(self):
         with patch("app.RELEASE_CHANNEL", "alpha"), patch(
-            "app.APP_VERSION", "1.10.0-alpha"
+            "app.APP_VERSION", "1.11.0-alpha"
         ):
             response = flask_app.test_client().get("/login")
             health_response = flask_app.test_client().get("/health")
@@ -188,7 +188,7 @@ class ScheduleTests(unittest.TestCase):
         html = response.get_data(as_text=True)
         self.assertIn("ALPHA TESTNA RAZLIČICA", html)
         self.assertIn("podatki niso produkcijski", html)
-        self.assertIn("različica 1.10.0-alpha", html)
+        self.assertIn("različica 1.11.0-alpha", html)
         self.assertEqual(health_response.get_json()["channel"], "alpha")
 
     def test_login_shows_countdown_and_next_saturday_number(self):
@@ -482,6 +482,79 @@ class ScheduleTests(unittest.TestCase):
             self.assertTrue(participant["checkin_at"].startswith("2030-02-09 "))
             self.assertIn('"before"', audit_row["details"])
             self.assertIn('"after"', audit_row["details"])
+
+    def test_admin_can_add_and_delete_participant_in_closed_net_editor(self):
+        net_id, admin_id = self.create_closed_net("Zaključeni sked za naknadni vnos")
+        client = self.authenticated_client(admin_id)
+
+        editor_response = client.get(f"/nets/{net_id}/edit")
+        editor_html = editor_response.get_data(as_text=True)
+        self.assertIn("Dodaj prijavljenega", editor_html)
+        self.assertIn('name="return_to" value="net_edit"', editor_html)
+
+        add_response = client.post(
+            f"/nets/{net_id}/participants",
+            data={
+                "csrf_token": "test-csrf-token",
+                "return_to": "net_edit",
+                "callsign": "S54CLOSED",
+                "full_name": "Naknadno Dodani Član",
+                "checkin_time": "20:15",
+            },
+        )
+        self.assertEqual(add_response.status_code, 302)
+        self.assertTrue(add_response.headers["Location"].endswith(f"/nets/{net_id}/edit"))
+
+        with flask_app.app_context():
+            db = get_db()
+            participant = db.execute(
+                "SELECT * FROM participants WHERE net_id=? AND callsign='S54CLOSED'",
+                (net_id,),
+            ).fetchone()
+            directory_entry = db.execute(
+                "SELECT * FROM callsign_directory WHERE callsign='S54CLOSED'"
+            ).fetchone()
+            self.assertIsNotNone(participant)
+            self.assertEqual(directory_entry["full_name"], "Naknadno Dodani Član")
+            participant_id = participant["id"]
+
+        delete_response = client.post(
+            f"/participants/{participant_id}/delete",
+            data={"csrf_token": "test-csrf-token", "return_to": "net_edit"},
+        )
+        self.assertEqual(delete_response.status_code, 302)
+        self.assertTrue(
+            delete_response.headers["Location"].endswith(f"/nets/{net_id}/edit")
+        )
+
+        with flask_app.app_context():
+            db = get_db()
+            self.assertIsNone(
+                db.execute(
+                    "SELECT id FROM participants WHERE id=?", (participant_id,)
+                ).fetchone()
+            )
+            leader_cursor = db.execute(
+                """INSERT INTO users
+                   (username, full_name, callsign, password_hash, role, active, created_at)
+                   VALUES ('closed-leader', 'Testni Vodja', 'S53LEAD',
+                           'not-used-in-test', 'leader', 1, ?)""",
+                (now_db(),),
+            )
+            db.commit()
+            leader_id = leader_cursor.lastrowid
+
+        leader_client = self.authenticated_client(leader_id)
+        forbidden_response = leader_client.post(
+            f"/nets/{net_id}/participants",
+            data={
+                "csrf_token": "test-csrf-token",
+                "callsign": "S52NOADMIN",
+                "full_name": "Nedovoljeni Vnos",
+                "checkin_time": "20:20",
+            },
+        )
+        self.assertEqual(forbidden_response.status_code, 403)
 
     def test_closed_net_deletion_requires_a_reason(self):
         net_id, admin_id = self.create_closed_net("Sked brez razloga za brisanje")

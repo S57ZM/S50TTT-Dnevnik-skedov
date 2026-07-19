@@ -2,7 +2,7 @@
 
 Ločen spletni portal Radiokluba Sevnica S50TTT za vodenje skedov.
 
-Trenutna alpha različica: **1.10.0-alpha**
+Trenutna alpha različica: **1.11.0-alpha**
 
 ## Funkcije
 
@@ -39,6 +39,10 @@ imenik. Ob naslednjem vnosu izbira znanega klicnega znaka samodejno izpolni ime.
 prepiše samodejno. Administrator ga lahko popravi ali skrije na strani `Imenik`.
 Ob nadgradnji se imenik enkrat dopolni tudi iz že shranjenih prijav. Vsak vnos
 hrani število uporab in čas zadnje prijave.
+
+Administrator lahko v urejevalniku zaključenega skeda naknadno doda, popravi ali
+izbriše prijavljenega člana. Naknadno dodani klicni znaki se prav tako shranijo v
+imenik, vsi posegi pa ostanejo v revizijski sledi.
 
 ## Popravki zaključenih skedov
 

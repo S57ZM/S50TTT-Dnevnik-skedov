@@ -16,7 +16,7 @@ from werkzeug.security import check_password_hash, generate_password_hash
 
 
 APP_NAME = "S50TTT Dnevnik skedov"
-BASE_VERSION = "1.10.0"
+BASE_VERSION = "1.11.0"
 RELEASE_CHANNEL = os.environ.get("RELEASE_CHANNEL", "stable").strip().lower()
 if RELEASE_CHANNEL not in {"stable", "alpha"}:
     RELEASE_CHANNEL = "stable"
@@ -664,6 +664,16 @@ def edit_net(net_id):
     users = db.execute(
         "SELECT * FROM users ORDER BY active DESC, full_name"
     ).fetchall()
+    participants = db.execute(
+        """SELECT p.*, u.full_name AS entered_by_name
+           FROM participants p JOIN users u ON u.id=p.created_by
+           WHERE p.net_id=? ORDER BY p.checkin_at, p.id""",
+        (net_id,),
+    ).fetchall()
+    directory_entries = db.execute(
+        """SELECT callsign, full_name FROM callsign_directory
+           WHERE active=1 ORDER BY callsign"""
+    ).fetchall()
     if request.method == "POST":
         title = request.form.get("title", "").strip()
         net_date = request.form.get("net_date", "").strip()
@@ -745,26 +755,39 @@ def edit_net(net_id):
         flash("Podatki zaključenega skeda so popravljeni.", "success")
         return redirect(url_for("net_detail", net_id=net_id))
 
-    return render_template("net_edit.html", net=net, users=users)
+    return render_template(
+        "net_edit.html",
+        net=net,
+        users=users,
+        participants=participants,
+        directory_entries=directory_entries,
+        now=now_local(),
+    )
+
+
+def participant_return_url(net_id):
+    if request.form.get("return_to") == "net_edit" and g.user["role"] == "admin":
+        return url_for("edit_net", net_id=net_id)
+    return url_for("net_detail", net_id=net_id)
 
 
 @app.post("/nets/<int:net_id>/participants")
 @login_required
 def add_participant(net_id):
     net = fetch_net(net_id)
-    if net["status"] != "open":
-        abort(409, "Zaključenega skeda ni mogoče spreminjati.")
+    if net["status"] != "open" and g.user["role"] != "admin":
+        abort(403)
     full_name = request.form.get("full_name", "").strip()
     callsign = request.form.get("callsign", "").strip().upper().replace(" ", "")
     checkin_time = request.form.get("checkin_time", now_local().strftime("%H:%M"))
     if not full_name or not callsign:
         flash("Vpiši ime in klicni znak.", "danger")
-        return redirect(url_for("net_detail", net_id=net_id))
+        return redirect(participant_return_url(net_id))
     try:
         datetime.strptime(checkin_time, "%H:%M")
     except ValueError:
         flash("Ura prijave ni veljavna.", "danger")
-        return redirect(url_for("net_detail", net_id=net_id))
+        return redirect(participant_return_url(net_id))
     db = get_db()
     checkin_at = f"{net['net_date']} {checkin_time}:00"
     try:
@@ -787,12 +810,12 @@ def add_participant(net_id):
         db.commit()
     except sqlite3.IntegrityError:
         flash(f"Klicni znak {callsign} je v tem skedu že vpisan.", "warning")
-        return redirect(url_for("net_detail", net_id=net_id))
+        return redirect(participant_return_url(net_id))
     audit("create", "participant", cur.lastrowid, f"{callsign} – {full_name}")
     if directory_created:
         audit("learn", "callsign", directory_id, f"{callsign} – {full_name}")
     flash(f"Dodan: {callsign} – {full_name}", "success")
-    return redirect(url_for("net_detail", net_id=net_id))
+    return redirect(participant_return_url(net_id))
 
 
 def fetch_participant(participant_id):
@@ -807,6 +830,7 @@ def fetch_participant(participant_id):
 def edit_participant(participant_id):
     participant = fetch_participant(participant_id)
     net = fetch_net(participant["net_id"])
+    return_to = request.form.get("return_to") or request.args.get("return_to", "")
     if net["status"] != "open" and g.user["role"] != "admin":
         abort(403)
     if request.method == "POST":
@@ -833,8 +857,15 @@ def edit_participant(participant_id):
             return redirect(request.url)
         audit("update", "participant", participant_id, f"{callsign} – {full_name}")
         flash("Vnos je popravljen.", "success")
+        if return_to == "net_edit" and g.user["role"] == "admin":
+            return redirect(url_for("edit_net", net_id=net["id"]))
         return redirect(url_for("net_detail", net_id=net["id"]))
-    return render_template("participant_edit.html", participant=participant, net=net)
+    return render_template(
+        "participant_edit.html",
+        participant=participant,
+        net=net,
+        return_to=return_to,
+    )
 
 
 @app.post("/participants/<int:participant_id>/delete")
@@ -848,7 +879,7 @@ def delete_participant(participant_id):
     get_db().commit()
     audit("delete", "participant", participant_id, f"{participant['callsign']} – {participant['full_name']}")
     flash("Vnos je izbrisan.", "success")
-    return redirect(url_for("net_detail", net_id=net["id"]))
+    return redirect(participant_return_url(net["id"]))
 
 
 @app.post("/nets/<int:net_id>/delete")
@@ -1224,7 +1255,7 @@ main{max-width:1100px;margin:24px auto;padding:0 16px}.card{background:white;bor
 label{display:block;font-weight:700;margin:0 0 6px}.field{margin-bottom:14px}input,select,textarea{width:100%;padding:11px 12px;border:1px solid #aebdca;border-radius:9px;background:white;font:inherit}input:focus,select:focus,textarea:focus{outline:3px solid #bddcff;border-color:var(--blue)}textarea{min-height:120px;resize:vertical}
 .btn{display:inline-block;border:0;border-radius:9px;padding:10px 15px;font-weight:750;cursor:pointer;text-decoration:none;font:inherit}.btn-primary{background:var(--blue);color:white}.btn-primary:hover{background:var(--blue2)}.btn-secondary{background:#e6edf3;color:#1d2b36}.btn-danger{background:#fee4e2;color:var(--danger)}.btn-success{background:#daf5e6;color:#075f34}.btn-locked,.btn-locked:hover{background:#d7dde3;color:#66727c}.btn-small{padding:7px 10px;font-size:.9rem}
 table{width:100%;border-collapse:collapse}th,td{text-align:left;padding:11px 9px;border-bottom:1px solid var(--line)}th{background:var(--light);font-size:.88rem}tr:last-child td{border-bottom:0}.table-wrap{overflow-x:auto}.badge{display:inline-block;padding:4px 9px;border-radius:999px;font-size:.8rem;font-weight:750}.open{background:#d8f3e5;color:#075f34}.closed{background:#e7ebef;color:#45525d}.admin{background:#e5ddff;color:#4f2c90}.leader{background:#ddebfa;color:#164f7c}
-.flash{padding:12px 14px;border-radius:9px;margin-bottom:14px;background:#e7edf2}.flash.success{background:#dff5e9;color:#075f34}.flash.danger{background:#fee4e2;color:#8f1d14}.flash.warning{background:#fff1c7;color:#704b00}.muted{color:#65717c}.big-number{font-size:2rem;font-weight:850}.login{max-width:430px;margin:6vh auto 18px}.login-schedule{max-width:620px;margin:0 auto 24px;text-align:center}.login-stats{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:18px;padding-top:16px;border-top:1px solid #ffffff55}.login-stat{padding:12px;border-radius:10px;background:#ffffff18}.login-stat span,.login-stat small{display:block}.login-stat strong{display:block;font-size:1.7rem;margin:4px 0}.login-stat small{color:#dbeeff}.login-history-title{margin:20px 0 -6px;font-weight:750}.login-history-count{font-weight:750;margin-top:5px}.danger-zone{margin-top:26px;padding-top:22px;border-top:2px solid #f2b8b5}.danger-zone h2{color:var(--danger)}.inline{display:inline}.right{margin-left:auto}.empty{text-align:center;padding:30px;color:#65717c}.nowrap{white-space:nowrap}
+.flash{padding:12px 14px;border-radius:9px;margin-bottom:14px;background:#e7edf2}.flash.success{background:#dff5e9;color:#075f34}.flash.danger{background:#fee4e2;color:#8f1d14}.flash.warning{background:#fff1c7;color:#704b00}.muted{color:#65717c}.big-number{font-size:2rem;font-weight:850}.login{max-width:430px;margin:6vh auto 18px}.login-schedule{max-width:620px;margin:0 auto 24px;text-align:center}.login-stats{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:18px;padding-top:16px;border-top:1px solid #ffffff55}.login-stat{padding:12px;border-radius:10px;background:#ffffff18}.login-stat span,.login-stat small{display:block}.login-stat strong{display:block;font-size:1.7rem;margin:4px 0}.login-stat small{color:#dbeeff}.login-history-title{margin:20px 0 -6px;font-weight:750}.login-history-count{font-weight:750;margin-top:5px}.edit-section{margin-top:28px;padding-top:22px;border-top:1px solid var(--line)}.danger-zone{margin-top:26px;padding-top:22px;border-top:2px solid #f2b8b5}.danger-zone h2{color:var(--danger)}.inline{display:inline}.right{margin-left:auto}.empty{text-align:center;padding:30px;color:#65717c}.nowrap{white-space:nowrap}
 @media(max-width:700px){main{margin-top:14px}.card{padding:15px}.nav{gap:12px}.user{width:100%;order:3}th,td{padding:9px 6px}.hide-mobile{display:none}.btn{width:100%;text-align:center}.actions form{width:100%}.actions .btn-small{width:auto}.brand{width:100%}}
 @media print{header,.no-print,.flash,.footer{display:none!important}body{background:white}main{max-width:none;margin:0;padding:0}.card{border:0;box-shadow:none;padding:0}table{font-size:11pt}a{color:black;text-decoration:none}}
 </style></head><body>
@@ -1248,8 +1279,12 @@ table{width:100%;border-collapse:collapse}th,td{text-align:left;padding:11px 9px
 {% if net['status']=='open' %}<div class="card no-print"><h2>Dodaj prijavljenega</h2><form method="post" action="{{ url_for('add_participant',net_id=net['id']) }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><div class="grid"><div class="field"><label>Klicni znak</label><input id="participant-callsign" name="callsign" list="callsign-options" required autofocus autocomplete="off" style="text-transform:uppercase"><datalist id="callsign-options">{% for entry in directory_entries %}<option value="{{ entry['callsign'] }}" data-full-name="{{ entry['full_name'] }}">{{ entry['full_name'] }}</option>{% endfor %}</datalist><small class="muted">Začni tipkati; znani klicni znak bo izpolnil ime.</small></div><div class="field"><label>Ime in priimek</label><input id="participant-full-name" name="full_name" required autocomplete="off"></div><div class="field"><label>Ura prijave</label><input type="time" name="checkin_time" value="{{ now.strftime('%H:%M') }}" required></div></div><button class="btn btn-primary">＋ Dodaj v dnevnik</button></form></div><script>(function(){const callsign=document.getElementById('participant-callsign');const fullName=document.getElementById('participant-full-name');const options=document.querySelectorAll('#callsign-options option');if(!callsign||!fullName)return;const directory={};options.forEach(function(option){directory[option.value.toUpperCase()]=option.dataset.fullName});let lastAutofill='';function suggest(){const value=callsign.value.trim().toUpperCase().replace(/\s+/g,'');callsign.value=value;const knownName=directory[value];if(knownName&&(!fullName.value||fullName.value===lastAutofill)){fullName.value=knownName;lastAutofill=knownName}}callsign.addEventListener('input',suggest);callsign.addEventListener('change',suggest)})();</script>{% endif %}
 <div class="card"><h2>Prijavljeni: {{ participants|length }}</h2>{% if participants %}<div class="table-wrap"><table><thead><tr><th>Št.</th><th>Ura</th><th>Klicni znak</th><th>Ime in priimek</th><th class="no-print">Vnesel</th>{% if can_edit_participants %}<th class="no-print"></th>{% endif %}</tr></thead><tbody>{% for p in participants %}<tr><td>{{ loop.index }}</td><td class="nowrap">{{ p['checkin_at']|time_si }}</td><td><b>{{ p['callsign'] }}</b></td><td>{{ p['full_name'] }}</td><td class="no-print">{{ p['entered_by_name'] }}</td>{% if can_edit_participants %}<td class="no-print"><div class="actions"><a class="btn btn-secondary btn-small" href="{{ url_for('edit_participant',participant_id=p['id']) }}">Uredi</a><form method="post" action="{{ url_for('delete_participant',participant_id=p['id']) }}" onsubmit="return confirm('Izbrišem {{ p['callsign'] }}?')"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="btn btn-danger btn-small">Izbriši</button></form></div></td>{% endif %}</tr>{% endfor %}</tbody></table></div>{% else %}<p class="empty">V tem skedu še ni prijavljenih.</p>{% endif %}</div>
 {% endblock %}''',
-"participant_edit.html": r'''{% extends "base.html" %}{% block content %}<div class="card"><h1>Uredi prijavo</h1><p>{{ net['title'] }}</p><form method="post"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><div class="field"><label>Ime in priimek</label><input name="full_name" value="{{ participant['full_name'] }}" required></div><div class="field"><label>Klicni znak</label><input name="callsign" value="{{ participant['callsign'] }}" required style="text-transform:uppercase"></div><div class="field"><label>Ura prijave</label><input type="time" name="checkin_time" value="{{ participant['checkin_at']|time_si }}" required></div><div class="actions"><button class="btn btn-primary">Shrani</button><a class="btn btn-secondary" href="{{ url_for('net_detail',net_id=net['id']) }}">Prekliči</a></div></form></div>{% endblock %}''',
-"net_edit.html": r'''{% extends "base.html" %}{% block content %}<div class="card" style="max-width:760px"><h1>Uredi zaključeni sked</h1><p class="muted">Vsak popravek se zabeleži v revizijsko sled podatkovne baze.</p><form method="post"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><div class="field"><label>Naslov skeda</label><input name="title" value="{{ net['title'] }}" required></div><div class="grid"><div class="field"><label>Datum</label><input type="date" name="net_date" value="{{ net['net_date'] }}" required></div><div class="field"><label>Začetna ura</label><input type="time" name="started_time" value="{{ net['started_at']|time_si }}" required></div><div class="field"><label>Končna ura</label><input type="time" name="ended_time" value="{{ net['ended_at']|time_si }}" required></div></div><div class="field"><label>Operater</label><select name="leader_id" required>{% for user in users %}<option value="{{ user['id'] }}" {% if user['id']==net['leader_id'] %}selected{% endif %}>{{ user['full_name'] }} ({{ user['callsign'] }}){% if not user['active'] %} – neaktiven{% endif %}</option>{% endfor %}</select></div><div class="actions"><button class="btn btn-primary">Shrani popravke</button><a class="btn btn-secondary" href="{{ url_for('net_detail',net_id=net['id']) }}">Prekliči</a></div></form><div class="danger-zone"><h2>Izbris skeda</h2><p class="muted">Izbris je dovoljen samo z navedenim razlogom. Kopija skeda in vseh prijav ostane shranjena v revizijski tabeli.</p><form method="post" action="{{ url_for('delete_closed_net',net_id=net['id']) }}" onsubmit="return confirm('Res trajno izbrišem ta zaključeni sked?')"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><div class="field"><label>Razlog brisanja</label><textarea name="reason" minlength="10" maxlength="1000" required placeholder="Na primer: podvojen dnevnik, odprt za napačen datum …"></textarea><small class="muted">Najmanj 10 znakov.</small></div><button class="btn btn-danger">Trajno izbriši sked</button></form></div></div>{% endblock %}''',
+"participant_edit.html": r'''{% extends "base.html" %}{% block content %}<div class="card"><h1>Uredi prijavo</h1><p>{{ net['title'] }}</p><form method="post"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="return_to" value="{{ return_to }}"><div class="field"><label>Ime in priimek</label><input name="full_name" value="{{ participant['full_name'] }}" required></div><div class="field"><label>Klicni znak</label><input name="callsign" value="{{ participant['callsign'] }}" required style="text-transform:uppercase"></div><div class="field"><label>Ura prijave</label><input type="time" name="checkin_time" value="{{ participant['checkin_at']|time_si }}" required></div><div class="actions"><button class="btn btn-primary">Shrani</button><a class="btn btn-secondary" href="{{ url_for('edit_net',net_id=net['id']) if return_to=='net_edit' else url_for('net_detail',net_id=net['id']) }}">Prekliči</a></div></form></div>{% endblock %}''',
+"net_edit.html": r'''{% extends "base.html" %}{% block content %}<div class="card" style="max-width:900px"><h1>Uredi zaključeni sked</h1><p class="muted">Vsak popravek se zabeleži v revizijsko sled podatkovne baze.</p><form method="post"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><div class="field"><label>Naslov skeda</label><input name="title" value="{{ net['title'] }}" required></div><div class="grid"><div class="field"><label>Datum</label><input type="date" name="net_date" value="{{ net['net_date'] }}" required></div><div class="field"><label>Začetna ura</label><input type="time" name="started_time" value="{{ net['started_at']|time_si }}" required></div><div class="field"><label>Končna ura</label><input type="time" name="ended_time" value="{{ net['ended_at']|time_si }}" required></div></div><div class="field"><label>Operater</label><select name="leader_id" required>{% for user in users %}<option value="{{ user['id'] }}" {% if user['id']==net['leader_id'] %}selected{% endif %}>{{ user['full_name'] }} ({{ user['callsign'] }}){% if not user['active'] %} – neaktiven{% endif %}</option>{% endfor %}</select></div><div class="actions"><button class="btn btn-primary">Shrani popravke</button><a class="btn btn-secondary" href="{{ url_for('net_detail',net_id=net['id']) }}">Prekliči</a></div></form>
+<div class="edit-section"><h2>Dodaj prijavljenega</h2><form method="post" action="{{ url_for('add_participant',net_id=net['id']) }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="return_to" value="net_edit"><div class="grid"><div class="field"><label>Klicni znak</label><input id="edit-participant-callsign" name="callsign" list="edit-callsign-options" required autocomplete="off" style="text-transform:uppercase"><datalist id="edit-callsign-options">{% for entry in directory_entries %}<option value="{{ entry['callsign'] }}" data-full-name="{{ entry['full_name'] }}">{{ entry['full_name'] }}</option>{% endfor %}</datalist></div><div class="field"><label>Ime in priimek</label><input id="edit-participant-full-name" name="full_name" required autocomplete="off"></div><div class="field"><label>Ura prijave</label><input type="time" name="checkin_time" value="{{ net['started_at']|time_si }}" required></div></div><button class="btn btn-primary">＋ Dodaj prijavljenega</button></form></div>
+<div class="edit-section"><h2>Prijavljeni: {{ participants|length }}</h2>{% if participants %}<div class="table-wrap"><table><thead><tr><th>Ura</th><th>Klicni znak</th><th>Ime in priimek</th><th></th></tr></thead><tbody>{% for p in participants %}<tr><td>{{ p['checkin_at']|time_si }}</td><td><b>{{ p['callsign'] }}</b></td><td>{{ p['full_name'] }}</td><td><div class="actions"><a class="btn btn-secondary btn-small" href="{{ url_for('edit_participant',participant_id=p['id'],return_to='net_edit') }}">Uredi</a><form method="post" action="{{ url_for('delete_participant',participant_id=p['id']) }}" onsubmit="return confirm('Izbrišem {{ p['callsign'] }} iz zaključenega skeda?')"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="return_to" value="net_edit"><button class="btn btn-danger btn-small">Izbriši</button></form></div></td></tr>{% endfor %}</tbody></table></div>{% else %}<p class="empty">V skedu ni prijavljenih.</p>{% endif %}</div>
+<script>(function(){const callsign=document.getElementById('edit-participant-callsign');const fullName=document.getElementById('edit-participant-full-name');const options=document.querySelectorAll('#edit-callsign-options option');if(!callsign||!fullName)return;const directory={};options.forEach(function(option){directory[option.value.toUpperCase()]=option.dataset.fullName});let lastAutofill='';function suggest(){const value=callsign.value.trim().toUpperCase().replace(/\s+/g,'');callsign.value=value;const knownName=directory[value];if(knownName&&(!fullName.value||fullName.value===lastAutofill)){fullName.value=knownName;lastAutofill=knownName}}callsign.addEventListener('input',suggest);callsign.addEventListener('change',suggest)})();</script>
+<div class="danger-zone"><h2>Izbris skeda</h2><p class="muted">Izbris je dovoljen samo z navedenim razlogom. Kopija skeda in vseh prijav ostane shranjena v revizijski tabeli.</p><form method="post" action="{{ url_for('delete_closed_net',net_id=net['id']) }}" onsubmit="return confirm('Res trajno izbrišem ta zaključeni sked?')"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><div class="field"><label>Razlog brisanja</label><textarea name="reason" minlength="10" maxlength="1000" required placeholder="Na primer: podvojen dnevnik, odprt za napačen datum …"></textarea><small class="muted">Najmanj 10 znakov.</small></div><button class="btn btn-danger">Trajno izbriši sked</button></form></div></div>{% endblock %}''',
 "net_delete.html": r'''{% extends "base.html" %}{% block content %}<div class="card" style="max-width:680px"><h1>Izbriši zaključeni sked</h1><p><b>{{ net['title'] }}</b><br>{{ net['net_date']|date_si }} · {{ participant_count }} prijavljenih</p><div class="flash warning">Sked bo odstranjen iz arhiva. Razlog, podatki skeda in kopija vseh prijav bodo trajno shranjeni v revizijski tabeli.</div><form method="post" onsubmit="return confirm('Res izbrišem ta zaključeni sked?')"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><div class="field"><label>Razlog brisanja</label><textarea name="reason" minlength="10" maxlength="1000" required placeholder="Na primer: podvojen dnevnik, odprt za napačen datum …">{{ reason }}</textarea><small class="muted">Najmanj 10 znakov. Razlog se zabeleži skupaj z administratorjem in časom brisanja.</small></div><div class="actions"><button class="btn btn-danger">Trajno izbriši sked</button><a class="btn btn-secondary" href="{{ url_for('net_detail',net_id=net['id']) }}">Prekliči</a></div></form></div>{% endblock %}''',
 "archive.html": r'''{% extends "base.html" %}{% block content %}<div class="card"><h1>Arhiv skedov</h1>{% if nets %}<div class="table-wrap"><table><thead><tr><th>Datum</th><th>Sked</th><th>Status</th><th>Operater</th><th>Prijavljeni</th><th></th></tr></thead><tbody>{% for n in nets %}<tr><td class="nowrap">{{ n['net_date']|date_si }}</td><td><b>{{ n['title'] }}</b><br><span class="muted">{{ n['started_at']|time_si }}{% if n['ended_at'] %}–{{ n['ended_at']|time_si }}{% endif %}{% if n['repeater'] %} · {{ n['repeater'] }}{% endif %}</span></td><td><span class="badge {{ n['status'] }}">{{ 'Odprt' if n['status']=='open' else 'Zaključen' }}</span></td><td>{{ n['leader_name'] }} ({{ n['leader_callsign'] }})</td><td>{{ n['participant_count'] }}</td><td><div class="actions"><a class="btn btn-secondary btn-small" href="{{ url_for('net_detail',net_id=n['id']) }}">Pregled</a>{% if g.user['role']=='admin' and n['status']=='closed' %}<a class="btn btn-primary btn-small" href="{{ url_for('edit_net',net_id=n['id']) }}">Uredi</a>{% endif %}</div></td></tr>{% endfor %}</tbody></table></div>{% else %}<p class="empty">Arhiv je prazen.</p>{% endif %}</div>{% endblock %}''',
 "callsigns.html": r'''{% extends "base.html" %}{% block content %}<div class="card"><div class="actions"><div><h1>Imenik klicnih znakov</h1><p class="muted">Imenik se samodejno dopolnjuje z novimi prijavljenimi.</p></div>{% if g.user['role']=='admin' %}<a class="btn btn-primary right" href="{{ url_for('new_callsign') }}">＋ Novi vnos</a>{% endif %}</div><form method="get" class="actions no-print" style="margin-bottom:18px"><input name="q" value="{{ query }}" placeholder="Išči po klicnem znaku ali imenu" style="max-width:360px"><button class="btn btn-secondary">Išči</button>{% if query %}<a class="btn btn-secondary" href="{{ url_for('callsigns') }}">Počisti</a>{% endif %}</form>{% if entries %}<div class="table-wrap"><table><thead><tr><th>Klicni znak</th><th>Ime in priimek</th><th>Uporab</th><th>Zadnja prijava</th><th>Status</th>{% if g.user['role']=='admin' %}<th></th>{% endif %}</tr></thead><tbody>{% for entry in entries %}<tr><td><b>{{ entry['callsign'] }}</b></td><td>{{ entry['full_name'] }}</td><td>{{ entry['use_count'] }}</td><td>{{ entry['last_used_at']|datetime_si if entry['last_used_at'] else '–' }}</td><td><span class="badge {{ 'open' if entry['active'] else 'closed' }}">{{ 'Aktiven' if entry['active'] else 'Skrit' }}</span></td>{% if g.user['role']=='admin' %}<td><a class="btn btn-secondary btn-small" href="{{ url_for('edit_callsign',entry_id=entry['id']) }}">Uredi</a></td>{% endif %}</tr>{% endfor %}</tbody></table></div>{% else %}<p class="empty">V imeniku ni zadetkov.</p>{% endif %}</div>{% endblock %}''',
