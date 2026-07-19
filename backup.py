@@ -61,7 +61,7 @@ def prune_backups(retention=BACKUP_RETENTION):
 
 
 def create_backup(kind="auto"):
-    if kind not in {"auto", "manual", "pre-restore"}:
+    if kind not in {"auto", "manual", "pre-restore", "pre-import"}:
         raise ValueError("Neveljavna vrsta varnostne kopije.")
     if not DATABASE_PATH.is_file():
         raise FileNotFoundError(f"Podatkovna baza ne obstaja: {DATABASE_PATH}")

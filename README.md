@@ -2,7 +2,7 @@
 
 Ločen spletni portal Radiokluba Sevnica S50TTT za vodenje skedov.
 
-Trenutna alpha različica: **1.19.0-alpha**
+Trenutna alpha različica: **1.20.0-alpha**
 
 ## Funkcije
 
@@ -11,6 +11,7 @@ Trenutna alpha različica: **1.19.0-alpha**
 - administratorska odpoved ali prestavitev rednega skeda z obveznim razlogom;
 - statistika udeležbe po mesecih, operaterjih in klicnih znakih;
 - filtriran izvoz poročila v CSV ter priprava za PDF oziroma tiskanje;
+- varen administratorski uvoz zgodovinskih skedov iz CSV s predogledom;
 - administratorski pregled revizijske sledi s filtri;
 - dnevne preverjene varnostne kopije z 30-dnevno hrambo in ročnim prenosom;
 - zaščita prijave z začasnim zaklepom, beleženjem poskusov in ročnim odklepom;
@@ -123,6 +124,20 @@ z dolžino do 5000 znakov. Drugi vodje ga lahko preberejo, ne morejo pa ga
 spreminjati. Po zaključku ga lahko naknadno popravi samo administrator.
 Zapisnik je vključen v tiskanje oziroma PDF, CSV-izvoz, kopijo izbrisanega skeda
 in obnovitev iz koša. Vsako shranjevanje se zabeleži v revizijsko sled.
+
+## Uvoz zgodovinskih skedov iz CSV
+
+Administrator lahko na strani `Uvoz` prenese pripravljeno CSV-predlogo in vanjo
+vnese starejše skede. Vsak prijavljeni je v svoji vrstici, vrstice istega skeda
+pa imajo enake podatke o datumu, času, operaterju in naslovu. Podprti so sobotni,
+mesečni in izredni skedi, vključno z zapisnikom.
+
+Portal pred uvozom preveri obliko datumov in ur, obstoj operaterja, pravilnost
+rednega termina, podvojene klicne znake in morebitni že obstoječi dnevnik. Nato
+prikaže predogled brez spremembe baze. Ob potrditvi samodejno izdela preverjeno
+kopijo `pre-import`, celoten uvoz izvede v eni transakciji, dopolni imenik
+klicnih znakov ter dejanje zabeleži v revizijo. Če katerikoli zapis ni veljaven,
+se ne uvozi nič.
 
 ## Redni skedi
 

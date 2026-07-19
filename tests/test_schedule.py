@@ -1,3 +1,4 @@
+import io
 import os
 import sqlite3
 import tempfile
@@ -333,7 +334,7 @@ class ScheduleTests(unittest.TestCase):
 
     def test_alpha_channel_has_visible_warning(self):
         with patch("app.RELEASE_CHANNEL", "alpha"), patch(
-            "app.APP_VERSION", "1.19.0-alpha"
+            "app.APP_VERSION", "1.20.0-alpha"
         ):
             response = flask_app.test_client().get("/login")
             health_response = flask_app.test_client().get("/health")
@@ -341,7 +342,7 @@ class ScheduleTests(unittest.TestCase):
         html = response.get_data(as_text=True)
         self.assertIn("ALPHA TESTNA RAZLIČICA", html)
         self.assertIn("podatki niso produkcijski", html)
-        self.assertIn("različica 1.19.0-alpha", html)
+        self.assertIn("različica 1.20.0-alpha", html)
         self.assertEqual(health_response.get_json()["channel"], "alpha")
 
     def test_login_shows_countdown_and_next_saturday_number(self):
@@ -642,6 +643,236 @@ class ScheduleTests(unittest.TestCase):
 
         next_saturday = next_saturday_net(datetime(2026, 7, 25, 21, 1))
         self.assertEqual(next_saturday["sequence_number"], 396)
+
+    def test_csv_import_rejects_invalid_file_and_is_admin_only(self):
+        with flask_app.app_context():
+            db = get_db()
+            admin_id = db.execute(
+                "SELECT id FROM users WHERE role='admin' ORDER BY id LIMIT 1"
+            ).fetchone()["id"]
+            before_count = db.execute(
+                "SELECT COUNT(*) AS n FROM csv_imports"
+            ).fetchone()["n"]
+            db.execute(
+                """INSERT OR IGNORE INTO users
+                   (username, full_name, callsign, password_hash,
+                    role, active, created_at)
+                   VALUES ('import-leader', 'Vodja Brez Uvoza', 'S50CSV',
+                           'not-used-in-test', 'leader', 1, ?)""",
+                (now_db(),),
+            )
+            leader_id = db.execute(
+                "SELECT id FROM users WHERE username='import-leader'"
+            ).fetchone()["id"]
+            db.commit()
+
+        admin_client = self.authenticated_client(admin_id)
+        template_response = admin_client.get("/imports/csv/template")
+        self.assertEqual(template_response.status_code, 200)
+        self.assertIn("datum;zacetek;konec", template_response.get_data(as_text=True))
+
+        invalid_csv = "datum;zacetek\n2033-01-01;20:00\n"
+        response = admin_client.post(
+            "/imports/csv",
+            data={
+                "csrf_token": "test-csrf-token",
+                "csv_file": (io.BytesIO(invalid_csv.encode("utf-8")), "napaka.csv"),
+            },
+            content_type="multipart/form-data",
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("Manjkajo obvezni stolpci", response.get_data(as_text=True))
+        with flask_app.app_context():
+            after_count = get_db().execute(
+                "SELECT COUNT(*) AS n FROM csv_imports"
+            ).fetchone()["n"]
+            self.assertEqual(after_count, before_count)
+
+        leader_client = self.authenticated_client(leader_id)
+        self.assertEqual(leader_client.get("/imports/csv").status_code, 403)
+        self.assertEqual(leader_client.get("/imports/csv/template").status_code, 403)
+
+    def test_csv_import_preview_and_confirm_are_atomic(self):
+        with flask_app.app_context():
+            db = get_db()
+            admin = db.execute(
+                "SELECT id, callsign FROM users WHERE role='admin' ORDER BY id LIMIT 1"
+            ).fetchone()
+            admin_id = admin["id"]
+            operator_callsign = admin["callsign"]
+            db.execute(
+                """DELETE FROM nets WHERE schedule_type=?
+                   AND COALESCE(scheduled_date,net_date)='2033-01-01'""",
+                (SCHEDULE_SATURDAY,),
+            )
+            db.commit()
+
+        csv_text = (
+            "datum;zacetek;konec;naslov;vrsta;operater;"
+            "klicni_znak;ime;prijava;opombe\n"
+            f"2033-01-01;20:00;20:45;;sobotni;{operator_callsign};"
+            "S56IMP1;Prvi Uvoženi;20:04;Zgodovinska opomba\n"
+            f"2033-01-01;20:00;20:45;;sobotni;{operator_callsign};"
+            "S56IMP2;Drugi Uvoženi;20:09;Zgodovinska opomba\n"
+        )
+        client = self.authenticated_client(admin_id)
+        preview_response = client.post(
+            "/imports/csv",
+            data={
+                "csrf_token": "test-csrf-token",
+                "csv_file": (io.BytesIO(csv_text.encode("utf-8")), "zgodovina.csv"),
+            },
+            content_type="multipart/form-data",
+        )
+        self.assertEqual(preview_response.status_code, 302)
+
+        with flask_app.app_context():
+            db = get_db()
+            batch = db.execute(
+                """SELECT * FROM csv_imports WHERE filename='zgodovina.csv'
+                   ORDER BY id DESC LIMIT 1"""
+            ).fetchone()
+            import_id = batch["id"]
+            self.assertEqual(batch["status"], "pending")
+            self.assertEqual(batch["net_count"], 1)
+            self.assertEqual(batch["participant_count"], 2)
+            self.assertIsNone(
+                db.execute(
+                    """SELECT id FROM nets WHERE schedule_type=?
+                       AND COALESCE(scheduled_date,net_date)='2033-01-01'""",
+                    (SCHEDULE_SATURDAY,),
+                ).fetchone()
+            )
+
+        preview_html = client.get(
+            f"/imports/csv/{import_id}"
+        ).get_data(as_text=True)
+        self.assertIn("Predogled – baza še ni spremenjena", preview_html)
+        self.assertIn("S56IMP1", preview_html)
+        self.assertIn("S56IMP2", preview_html)
+
+        confirm_response = client.post(
+            f"/imports/csv/{import_id}/confirm",
+            data={"csrf_token": "test-csrf-token"},
+        )
+        self.assertEqual(confirm_response.status_code, 302)
+
+        with flask_app.app_context():
+            db = get_db()
+            batch = db.execute(
+                "SELECT * FROM csv_imports WHERE id=?", (import_id,)
+            ).fetchone()
+            imported_net = db.execute(
+                """SELECT * FROM nets WHERE schedule_type=?
+                   AND COALESCE(scheduled_date,net_date)='2033-01-01'""",
+                (SCHEDULE_SATURDAY,),
+            ).fetchone()
+            participants = db.execute(
+                "SELECT callsign FROM participants WHERE net_id=? ORDER BY callsign",
+                (imported_net["id"],),
+            ).fetchall()
+            directory_entry = db.execute(
+                "SELECT * FROM callsign_directory WHERE callsign='S56IMP1'"
+            ).fetchone()
+            audit_row = db.execute(
+                """SELECT details FROM audit_log
+                   WHERE action='import' AND entity_type='csv_import' AND entity_id=?
+                   ORDER BY id DESC LIMIT 1""",
+                (import_id,),
+            ).fetchone()
+            self.assertEqual(batch["status"], "imported")
+            self.assertIsNone(batch["data_json"])
+            self.assertEqual(imported_net["status"], "closed")
+            self.assertEqual(imported_net["notes"], "Zgodovinska opomba")
+            self.assertEqual(
+                [row["callsign"] for row in participants], ["S56IMP1", "S56IMP2"]
+            )
+            self.assertEqual(directory_entry["use_count"], 1)
+            self.assertIn("zgodovina.csv", audit_row["details"])
+
+        self.assertTrue(
+            any(
+                item["name"].startswith("pre-import-")
+                for item in backup_tools.list_backups()
+            )
+        )
+        self.assertEqual(
+            client.post(
+                f"/imports/csv/{import_id}/confirm",
+                data={"csrf_token": "test-csrf-token"},
+            ).status_code,
+            404,
+        )
+
+    def test_csv_import_rolls_back_if_conflict_appears_after_preview(self):
+        with flask_app.app_context():
+            db = get_db()
+            admin = db.execute(
+                "SELECT id, callsign FROM users WHERE role='admin' ORDER BY id LIMIT 1"
+            ).fetchone()
+            admin_id = admin["id"]
+            operator_callsign = admin["callsign"]
+            db.execute(
+                "DELETE FROM nets WHERE title='CSV konflikt po predogledu'"
+            )
+            db.commit()
+
+        csv_text = (
+            "datum;zacetek;konec;naslov;vrsta;operater;"
+            "klicni_znak;ime;prijava;opombe\n"
+            f"2034-04-15;20:00;20:30;CSV konflikt po predogledu;izredni;"
+            f"{operator_callsign};S56ROLL;Ne sme biti uvožen;20:05;\n"
+        )
+        client = self.authenticated_client(admin_id)
+        response = client.post(
+            "/imports/csv",
+            data={
+                "csrf_token": "test-csrf-token",
+                "csv_file": (io.BytesIO(csv_text.encode("utf-8")), "konflikt.csv"),
+            },
+            content_type="multipart/form-data",
+        )
+        self.assertEqual(response.status_code, 302)
+
+        with flask_app.app_context():
+            db = get_db()
+            batch = db.execute(
+                """SELECT * FROM csv_imports WHERE filename='konflikt.csv'
+                   ORDER BY id DESC LIMIT 1"""
+            ).fetchone()
+            import_id = batch["id"]
+            db.execute(
+                """INSERT INTO nets
+                   (title, net_date, started_at, ended_at, status,
+                    leader_id, created_at)
+                   VALUES ('CSV konflikt po predogledu', '2034-04-15',
+                           '2034-04-15 20:00:00', '2034-04-15 20:30:00',
+                           'closed', ?, ?)""",
+                (admin_id, now_db()),
+            )
+            db.commit()
+
+        confirm = client.post(
+            f"/imports/csv/{import_id}/confirm",
+            data={"csrf_token": "test-csrf-token"},
+        )
+        self.assertEqual(confirm.status_code, 302)
+        self.assertTrue(confirm.headers["Location"].endswith(f"/imports/csv/{import_id}"))
+        with flask_app.app_context():
+            db = get_db()
+            batch = db.execute(
+                "SELECT * FROM csv_imports WHERE id=?", (import_id,)
+            ).fetchone()
+            net_count = db.execute(
+                "SELECT COUNT(*) AS n FROM nets WHERE title='CSV konflikt po predogledu'"
+            ).fetchone()["n"]
+            participant = db.execute(
+                "SELECT id FROM participants WHERE callsign='S56ROLL'"
+            ).fetchone()
+            self.assertEqual(batch["status"], "pending")
+            self.assertIsNotNone(batch["data_json"])
+            self.assertEqual(net_count, 1)
+            self.assertIsNone(participant)
 
     def test_empty_open_net_can_be_deleted(self):
         net_id, admin_id = self.create_open_net("Prazen testni sked")

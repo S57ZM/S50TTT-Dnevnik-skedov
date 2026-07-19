@@ -6,6 +6,7 @@ import json
 import os
 import secrets
 import sqlite3
+import unicodedata
 from datetime import date, datetime, timedelta
 from functools import wraps
 from zoneinfo import ZoneInfo
@@ -22,7 +23,7 @@ from backup import backup_path, create_backup, list_backups, verify_database
 
 
 APP_NAME = "S50TTT Dnevnik skedov"
-BASE_VERSION = "1.19.0"
+BASE_VERSION = "1.20.0"
 RELEASE_CHANNEL = os.environ.get("RELEASE_CHANNEL", "stable").strip().lower()
 if RELEASE_CHANNEL not in {"stable", "alpha"}:
     RELEASE_CHANNEL = "stable"
@@ -435,6 +436,20 @@ def init_db():
             CHECK(action='canceled' OR (new_date IS NOT NULL AND new_time IS NOT NULL))
         );
 
+        CREATE TABLE IF NOT EXISTS csv_imports (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            filename TEXT NOT NULL,
+            data_json TEXT,
+            net_count INTEGER NOT NULL,
+            participant_count INTEGER NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending'
+                CHECK(status IN ('pending', 'imported', 'canceled')),
+            created_by INTEGER NOT NULL REFERENCES users(id),
+            created_at TEXT NOT NULL,
+            imported_by INTEGER REFERENCES users(id),
+            imported_at TEXT
+        );
+
         CREATE INDEX IF NOT EXISTS idx_nets_date ON nets(net_date DESC);
         CREATE INDEX IF NOT EXISTS idx_participants_net ON participants(net_id, checkin_at);
         CREATE INDEX IF NOT EXISTS idx_net_deletions_date
@@ -447,6 +462,8 @@ def init_db():
             ON login_attempts(created_at DESC);
         CREATE INDEX IF NOT EXISTS idx_login_attempts_ip
             ON login_attempts(ip_address, created_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_csv_imports_created
+            ON csv_imports(created_at DESC);
         """
     )
 
@@ -1831,6 +1848,532 @@ def download_backup(name):
     )
 
 
+def normalize_csv_header(value):
+    value = unicodedata.normalize("NFKD", str(value or ""))
+    value = value.encode("ascii", "ignore").decode("ascii").lower().strip()
+    normalized = "".join(character if character.isalnum() else "_" for character in value)
+    while "__" in normalized:
+        normalized = normalized.replace("__", "_")
+    aliases = {
+        "zacetna_ura": "zacetek",
+        "koncna_ura": "konec",
+        "klicni_znak": "klicni_znak",
+        "klicniznak": "klicni_znak",
+        "ura_prijave": "prijava",
+        "opomba": "opombe",
+    }
+    normalized = normalized.strip("_")
+    return aliases.get(normalized, normalized)
+
+
+def parse_import_date(value):
+    compact = str(value or "").strip()
+    for pattern in ("%Y-%m-%d", "%d.%m.%Y", "%d. %m. %Y"):
+        try:
+            return datetime.strptime(compact, pattern).date()
+        except ValueError:
+            continue
+    raise ValueError
+
+
+def parse_import_time(value):
+    compact = str(value or "").strip()
+    for pattern in ("%H:%M", "%H:%M:%S"):
+        try:
+            return datetime.strptime(compact, pattern).time().replace(second=0)
+        except ValueError:
+            continue
+    raise ValueError
+
+
+def parse_csv_import(upload):
+    errors = []
+
+    def add_error(line_number, message):
+        if len(errors) < 100:
+            errors.append({"line": line_number, "message": message})
+
+    raw = upload.read(1024 * 1024 + 1)
+    if not raw:
+        return None, [{"line": 0, "message": "Izbrana datoteka je prazna."}]
+    if len(raw) > 1024 * 1024:
+        return None, [{"line": 0, "message": "Datoteka je večja od 1 MB."}]
+    try:
+        text = raw.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        return None, [{"line": 0, "message": "Datoteka mora biti shranjena kot UTF-8 CSV."}]
+    if "\x00" in text:
+        return None, [{"line": 0, "message": "Datoteka ni veljaven besedilni CSV."}]
+
+    try:
+        dialect = csv.Sniffer().sniff(text[:4096], delimiters=";,\t")
+        reader = csv.DictReader(io.StringIO(text), dialect=dialect)
+    except csv.Error:
+        reader = csv.DictReader(io.StringIO(text), delimiter=";")
+    if not reader.fieldnames:
+        return None, [{"line": 1, "message": "CSV nima glave stolpcev."}]
+
+    header_pairs = [
+        (original, normalize_csv_header(original)) for original in reader.fieldnames
+    ]
+    normalized_header_list = [normalized for _original, normalized in header_pairs if normalized]
+    normalized_headers = set(normalized_header_list)
+    if len(normalized_header_list) != len(normalized_headers):
+        return None, [
+            {"line": 1, "message": "CSV vsebuje podvojena imena stolpcev."}
+        ]
+    required_headers = {"datum", "zacetek", "operater", "klicni_znak", "ime"}
+    missing = sorted(required_headers - normalized_headers)
+    if missing:
+        return None, [
+            {
+                "line": 1,
+                "message": "Manjkajo obvezni stolpci: " + ", ".join(missing) + ".",
+            }
+        ]
+
+    db = get_db()
+    operator_map = {}
+    for user in db.execute(
+        "SELECT id, username, full_name, callsign, active FROM users ORDER BY active DESC, id"
+    ).fetchall():
+        for key in (user["username"], user["callsign"]):
+            operator_map.setdefault(str(key).strip().casefold(), user)
+
+    type_map = {
+        "": None,
+        "izredni": None,
+        "other": None,
+        "sobotni": SCHEDULE_SATURDAY,
+        "saturday": SCHEDULE_SATURDAY,
+        "mesecni": SCHEDULE_MONTHLY,
+        "monthly": SCHEDULE_MONTHLY,
+    }
+    try:
+        source_rows = list(reader)
+    except csv.Error:
+        return None, [{"line": 0, "message": "CSV vsebuje nepravilne narekovaje ali vrstice."}]
+
+    groups = {}
+    input_row_count = 0
+    for line_number, source_row in enumerate(source_rows, start=2):
+        row = {
+            normalized: str(source_row.get(original) or "").strip()
+            for original, normalized in header_pairs
+            if normalized
+        }
+        if not any(row.values()):
+            continue
+        input_row_count += 1
+        if input_row_count > 3000:
+            add_error(line_number, "Uvoz je omejen na največ 3000 podatkovnih vrstic.")
+            break
+
+        try:
+            net_date_value = parse_import_date(row.get("datum"))
+        except ValueError:
+            add_error(line_number, "Datum mora biti v obliki LLLL-MM-DD ali DD.MM.LLLL.")
+            continue
+        try:
+            start_time_value = parse_import_time(row.get("zacetek"))
+        except ValueError:
+            add_error(line_number, "Začetek mora biti v obliki UU:MM.")
+            continue
+
+        end_time_value = None
+        if row.get("konec"):
+            try:
+                end_time_value = parse_import_time(row["konec"])
+            except ValueError:
+                add_error(line_number, "Konec mora biti prazen ali v obliki UU:MM.")
+                continue
+
+        type_key = normalize_csv_header(row.get("vrsta", ""))
+        if type_key not in type_map:
+            add_error(line_number, "Vrsta mora biti sobotni, mesečni ali izredni.")
+            continue
+        schedule_type = type_map[type_key]
+        scheduled = None
+        if schedule_type:
+            scheduled = scheduled_net_for_date(schedule_type, net_date_value)
+            if scheduled is None:
+                label = "sobota" if schedule_type == SCHEDULE_SATURDAY else "prvi četrtek v mesecu"
+                add_error(line_number, f"Datum ne ustreza rednemu terminu ({label}).")
+                continue
+
+        operator_key = row.get("operater", "").strip().casefold()
+        operator = operator_map.get(operator_key)
+        if operator is None:
+            add_error(
+                line_number,
+                f"Operater {row.get('operater') or '–'} ni uporabnik portala.",
+            )
+            continue
+
+        title = row.get("naslov", "").strip()[:180]
+        if not title:
+            title = (
+                scheduled["title"]
+                if scheduled
+                else f"Sked {net_date_value.strftime('%d. %m. %Y')}"
+            )
+        start_at = datetime.combine(net_date_value, start_time_value)
+        end_at = None
+        if end_time_value:
+            end_at = datetime.combine(net_date_value, end_time_value)
+            if end_at < start_at:
+                end_at += timedelta(days=1)
+
+        if schedule_type:
+            group_key = f"regular:{schedule_type}:{net_date_value.isoformat()}"
+        else:
+            group_key = "manual:" + "|".join(
+                (
+                    net_date_value.isoformat(),
+                    start_time_value.strftime("%H:%M"),
+                    title.casefold(),
+                    str(operator["id"]),
+                )
+            )
+        notes = row.get("opombe", "").strip()[:5000] or None
+        group = groups.get(group_key)
+        if group is None:
+            group = {
+                "title": title,
+                "net_date": net_date_value.isoformat(),
+                "started_at": start_at.strftime("%Y-%m-%d %H:%M:%S"),
+                "ended_at": end_at.strftime("%Y-%m-%d %H:%M:%S") if end_at else None,
+                "leader_id": operator["id"],
+                "leader_label": f"{operator['full_name']} ({operator['callsign']})",
+                "schedule_type": schedule_type,
+                "scheduled_date": net_date_value.isoformat() if schedule_type else None,
+                "repeater": scheduled["repeater"] if scheduled else None,
+                "control_callsign": scheduled["control_callsign"] if scheduled else None,
+                "notes": notes,
+                "participants": [],
+                "callsigns": [],
+                "first_line": line_number,
+            }
+            groups[group_key] = group
+        else:
+            current_values = (
+                title,
+                start_at.strftime("%Y-%m-%d %H:%M:%S"),
+                end_at.strftime("%Y-%m-%d %H:%M:%S") if end_at else None,
+                operator["id"],
+                notes,
+            )
+            stored_values = (
+                group["title"],
+                group["started_at"],
+                group["ended_at"],
+                group["leader_id"],
+                group["notes"],
+            )
+            if current_values != stored_values:
+                add_error(
+                    line_number,
+                    "Vrstice istega skeda imajo različne podatke o skedu.",
+                )
+                continue
+
+        callsign = row.get("klicni_znak", "").strip().upper().replace(" ", "")[:24]
+        full_name = row.get("ime", "").strip()[:120]
+        if bool(callsign) != bool(full_name):
+            add_error(line_number, "Klicni znak in ime morata biti oba izpolnjena ali oba prazna.")
+            continue
+        if callsign:
+            if callsign.casefold() in {value.casefold() for value in group["callsigns"]}:
+                add_error(line_number, f"Klicni znak {callsign} je v istem skedu podvojen.")
+                continue
+            checkin_time_value = start_time_value
+            if row.get("prijava"):
+                try:
+                    checkin_time_value = parse_import_time(row["prijava"])
+                except ValueError:
+                    add_error(line_number, "Ura prijave mora biti v obliki UU:MM.")
+                    continue
+            checkin_at = datetime.combine(net_date_value, checkin_time_value)
+            if end_at and end_at.date() > net_date_value and checkin_at < start_at:
+                checkin_at += timedelta(days=1)
+            group["participants"].append(
+                {
+                    "callsign": callsign,
+                    "full_name": full_name,
+                    "checkin_at": checkin_at.strftime("%Y-%m-%d %H:%M:%S"),
+                    "line": line_number,
+                }
+            )
+            group["callsigns"].append(callsign)
+
+    nets = list(groups.values())
+    if not nets and not errors:
+        add_error(0, "CSV ne vsebuje nobenega skeda.")
+    if not errors:
+        for net in nets:
+            if net["schedule_type"]:
+                existing = db.execute(
+                    """SELECT id FROM nets WHERE schedule_type=?
+                       AND COALESCE(scheduled_date,net_date)=?""",
+                    (net["schedule_type"], net["scheduled_date"]),
+                ).fetchone()
+            else:
+                existing = db.execute(
+                    """SELECT id FROM nets
+                       WHERE title=? AND net_date=? AND started_at=?""",
+                    (net["title"], net["net_date"], net["started_at"]),
+                ).fetchone()
+            if existing:
+                add_error(
+                    net["first_line"],
+                    f"Sked že obstaja v portalu (ID {existing['id']}).",
+                )
+
+    for net in nets:
+        net.pop("callsigns", None)
+    result = {
+        "nets": nets,
+        "net_count": len(nets),
+        "participant_count": sum(len(net["participants"]) for net in nets),
+        "input_row_count": input_row_count,
+    }
+    return result, errors
+
+
+def fetch_csv_import(import_id, pending_only=False):
+    clauses = ["id=?", "created_by=?"]
+    parameters = [import_id, g.user["id"]]
+    if pending_only:
+        clauses.append("status='pending'")
+    row = get_db().execute(
+        f"SELECT * FROM csv_imports WHERE {' AND '.join(clauses)}", parameters
+    ).fetchone()
+    if row is None:
+        abort(404)
+    return row
+
+
+@app.route("/imports/csv", methods=["GET", "POST"])
+@admin_required
+def csv_import_view():
+    errors = []
+    if request.method == "POST":
+        upload = request.files.get("csv_file")
+        if upload is None or not upload.filename:
+            errors.append({"line": 0, "message": "Izberi CSV-datoteko."})
+        elif not upload.filename.lower().endswith(".csv"):
+            errors.append({"line": 0, "message": "Datoteka mora imeti končnico .csv."})
+        else:
+            parsed, errors = parse_csv_import(upload)
+            if not errors:
+                db = get_db()
+                db.execute(
+                    "DELETE FROM csv_imports WHERE status='pending' AND created_by=?",
+                    (g.user["id"],),
+                )
+                cursor = db.execute(
+                    """INSERT INTO csv_imports
+                       (filename, data_json, net_count, participant_count,
+                        status, created_by, created_at)
+                       VALUES (?, ?, ?, ?, 'pending', ?, ?)""",
+                    (
+                        upload.filename[:180],
+                        json.dumps(parsed, ensure_ascii=False),
+                        parsed["net_count"],
+                        parsed["participant_count"],
+                        g.user["id"],
+                        now_db(),
+                    ),
+                )
+                db.commit()
+                return redirect(url_for("csv_import_preview", import_id=cursor.lastrowid))
+    return render_template("csv_import.html", errors=errors)
+
+
+@app.get("/imports/csv/template")
+@admin_required
+def csv_import_template():
+    output = io.StringIO(newline="")
+    writer = csv.writer(output, delimiter=";")
+    writer.writerow(
+        [
+            "datum", "zacetek", "konec", "naslov", "vrsta", "operater",
+            "klicni_znak", "ime", "prijava", "opombe",
+        ]
+    )
+    writer.writerow(
+        [
+            "2026-07-25", "21:00", "21:45", "", "sobotni",
+            g.user["callsign"], "S51ABC", "Janez Novak", "21:03",
+            "Primer zgodovinskega skeda",
+        ]
+    )
+    writer.writerow(
+        [
+            "2026-07-25", "21:00", "21:45", "", "sobotni",
+            g.user["callsign"], "S52XYZ", "Maja Kovač", "21:08",
+            "Primer zgodovinskega skeda",
+        ]
+    )
+    return Response(
+        "\ufeff" + output.getvalue(),
+        mimetype="text/csv; charset=utf-8",
+        headers={"Content-Disposition": "attachment; filename=predloga-uvoz-skedov.csv"},
+    )
+
+
+@app.get("/imports/csv/<int:import_id>")
+@admin_required
+def csv_import_preview(import_id):
+    batch = fetch_csv_import(import_id, pending_only=True)
+    try:
+        parsed = json.loads(batch["data_json"])
+    except (json.JSONDecodeError, TypeError):
+        abort(404)
+    return render_template("csv_import_preview.html", batch=batch, parsed=parsed)
+
+
+@app.post("/imports/csv/<int:import_id>/cancel")
+@admin_required
+def cancel_csv_import(import_id):
+    batch = fetch_csv_import(import_id, pending_only=True)
+    db = get_db()
+    db.execute(
+        "UPDATE csv_imports SET status='canceled', data_json=NULL WHERE id=?",
+        (batch["id"],),
+    )
+    db.commit()
+    flash("Predogled uvoza je preklican; podatki niso bili spremenjeni.", "success")
+    return redirect(url_for("csv_import_view"))
+
+
+@app.post("/imports/csv/<int:import_id>/confirm")
+@admin_required
+def confirm_csv_import(import_id):
+    batch = fetch_csv_import(import_id, pending_only=True)
+    try:
+        parsed = json.loads(batch["data_json"])
+        nets = parsed["nets"]
+        if not isinstance(nets, list) or not nets:
+            raise ValueError
+    except (json.JSONDecodeError, KeyError, TypeError, ValueError):
+        flash("Shranjeni predogled ni veljaven; pripravi uvoz znova.", "danger")
+        return redirect(url_for("csv_import_view"))
+
+    try:
+        backup = create_backup("pre-import")
+    except (OSError, sqlite3.Error, RuntimeError) as error:
+        flash(f"Uvoz je ustavljen, ker varnostna kopija ni uspela: {error}", "danger")
+        return redirect(url_for("csv_import_preview", import_id=import_id))
+    audit("create", "backup", None, backup.name)
+
+    db = get_db()
+    created_net_ids = []
+    affected_callsigns = set()
+    try:
+        db.execute("BEGIN IMMEDIATE")
+        for net in nets:
+            leader = db.execute(
+                "SELECT id FROM users WHERE id=?", (net["leader_id"],)
+            ).fetchone()
+            if leader is None:
+                raise ValueError("Operater ne obstaja več.")
+            if net["schedule_type"]:
+                conflict = db.execute(
+                    """SELECT id FROM nets WHERE schedule_type=?
+                       AND COALESCE(scheduled_date,net_date)=?""",
+                    (net["schedule_type"], net["scheduled_date"]),
+                ).fetchone()
+            else:
+                conflict = db.execute(
+                    """SELECT id FROM nets
+                       WHERE title=? AND net_date=? AND started_at=?""",
+                    (net["title"], net["net_date"], net["started_at"]),
+                ).fetchone()
+            if conflict:
+                raise ValueError(f"Sked {net['title']} že obstaja.")
+
+            cursor = db.execute(
+                """INSERT INTO nets
+                   (title, net_date, scheduled_date, started_at, ended_at, status,
+                    leader_id, schedule_type, repeater, control_callsign,
+                    notes, created_at)
+                   VALUES (?, ?, ?, ?, ?, 'closed', ?, ?, ?, ?, ?, ?)""",
+                (
+                    net["title"],
+                    net["net_date"],
+                    net["scheduled_date"],
+                    net["started_at"],
+                    net["ended_at"],
+                    net["leader_id"],
+                    net["schedule_type"],
+                    net["repeater"],
+                    net["control_callsign"],
+                    net["notes"],
+                    now_db(),
+                ),
+            )
+            net_id = cursor.lastrowid
+            created_net_ids.append(net_id)
+            for participant in net["participants"]:
+                db.execute(
+                    """INSERT INTO participants
+                       (net_id, full_name, callsign, checkin_at,
+                        created_by, created_at)
+                       VALUES (?, ?, ?, ?, ?, ?)""",
+                    (
+                        net_id,
+                        participant["full_name"],
+                        participant["callsign"],
+                        participant["checkin_at"],
+                        g.user["id"],
+                        now_db(),
+                    ),
+                )
+                learn_callsign(
+                    db,
+                    participant["callsign"],
+                    participant["full_name"],
+                    g.user["id"],
+                    participant["checkin_at"],
+                )
+                affected_callsigns.add(participant["callsign"])
+        for callsign in affected_callsigns:
+            refresh_callsign_usage(db, callsign)
+        imported_at = now_db()
+        db.execute(
+            """UPDATE csv_imports SET status='imported', data_json=NULL,
+               imported_by=?, imported_at=? WHERE id=? AND status='pending'""",
+            (g.user["id"], imported_at, import_id),
+        )
+        db.commit()
+    except (KeyError, TypeError, ValueError, sqlite3.Error) as error:
+        db.rollback()
+        flash(f"Uvoz ni uspel in ni spremenil baze: {error}", "danger")
+        return redirect(url_for("csv_import_preview", import_id=import_id))
+
+    audit(
+        "import",
+        "csv_import",
+        import_id,
+        json.dumps(
+            {
+                "filename": batch["filename"],
+                "net_count": len(created_net_ids),
+                "participant_count": parsed["participant_count"],
+                "backup": backup.name,
+            },
+            ensure_ascii=False,
+        ),
+    )
+    flash(
+        f"Uvoženih je {len(created_net_ids)} skedov in "
+        f"{parsed['participant_count']} prijavljenih.",
+        "success",
+    )
+    return redirect(url_for("archive"))
+
+
 def report_participant_rows(filters):
     where, parameters = report_where(filters)
     return get_db().execute(
@@ -2592,6 +3135,7 @@ def audit_action_si(value):
         "update_notes": "Sprememba opombe",
         "merge": "Združitev",
         "restore": "Obnovljeno",
+        "import": "Uvoženo",
     }.get(value, value)
 
 
@@ -2604,6 +3148,7 @@ def audit_entity_si(value):
         "user": "Uporabnik",
         "schedule_exception": "Sprememba urnika",
         "backup": "Varnostna kopija",
+        "csv_import": "CSV-uvoz",
     }.get(value, value)
 
 
@@ -2704,7 +3249,11 @@ TEMPLATES.update({
 "print_report.html": r'''{% extends "base.html" %}{% block title %}Poročilo skedov · {{ app_name }}{% endblock %}{% block content %}<div class="card print-report"><div class="actions no-print"><button class="btn btn-primary" onclick="window.print()">Shrani kot PDF / natisni</button><button class="btn btn-secondary" onclick="window.close()">Zapri</button></div><h1>Poročilo skedov Radiokluba Sevnica S50TTT</h1><p class="muted">Izdelano: {{ generated_at|datetime_si }}{% if filters['from_date'] %} · od {{ filters['from_date']|date_si }}{% endif %}{% if filters['to_date'] %} · do {{ filters['to_date']|date_si }}{% endif %}</p>{% if rows %}<div class="table-wrap"><table><thead><tr><th>Datum</th><th>Sked</th><th>Status</th><th>Operater</th><th>Prijavljeni</th></tr></thead><tbody>{% for row in rows %}<tr><td class="nowrap">{{ row['net_date']|date_si }}</td><td><b>{{ row['title'] }}</b><br>{{ row['started_at']|time_si }}{% if row['ended_at'] %}–{{ row['ended_at']|time_si }}{% endif %}</td><td>{{ 'Zaključen' if row['status']=='closed' else 'Odprt' }}</td><td>{{ row['leader_name'] }} ({{ row['leader_callsign'] }})</td><td>{{ row['participant_count'] }}</td></tr>{% endfor %}</tbody><tfoot><tr><th colspan="4">Skupaj</th><th>{{ rows|sum(attribute='participant_count') }}</th></tr></tfoot></table></div>{% else %}<p class="empty">Za izbrane filtre ni podatkov.</p>{% endif %}</div>{% endblock %}'''
 })
 
-TEMPLATES["backups.html"] = r'''{% extends "base.html" %}{% block title %}Varnostne kopije · {{ app_name }}{% endblock %}{% block content %}<div class="card"><div class="actions"><div><h1>Varnostne kopije</h1><p class="muted">Portal vsak dan izdela preverjeno kopijo SQLite baze in ohrani zadnjih 30 kopij.</p></div><form class="right" method="post" action="{{ url_for('create_backup_view') }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="btn btn-primary">Izdelaj kopijo zdaj</button></form></div></div><div class="card"><h2>Shranjene kopije: {{ backups|length }}</h2>{% if backups %}<div class="table-wrap"><table><thead><tr><th>Datoteka</th><th>Čas izdelave</th><th>Velikost</th><th></th></tr></thead><tbody>{% for backup in backups %}<tr><td><b>{{ backup['name'] }}</b>{% if backup['name'].startswith('auto-') %}<br><span class="muted">Samodejna</span>{% elif backup['name'].startswith('pre-restore-') %}<br><span class="muted">Pred obnovo</span>{% else %}<br><span class="muted">Ročna</span>{% endif %}</td><td class="nowrap">{{ backup['modified_at']|datetime_si }}</td><td>{{ backup['size']|filesize_si }}</td><td><a class="btn btn-secondary btn-small" href="{{ url_for('download_backup',name=backup['name']) }}">Prenesi</a></td></tr>{% endfor %}</tbody></table></div>{% else %}<p class="empty">Varnostna kopija še ni bila izdelana.</p>{% endif %}</div><div class="card"><h2>Obnovitev baze</h2><div class="flash warning">Obnovitev namenoma ni mogoča med delovanjem portala. Najprej prenesi izbrano kopijo tudi na drugo napravo, nato portal in storitev za kopije ustavi ter uporabi dokumentirani ukaz na strežniku.</div><p class="muted">Pred obnovitvijo orodje preveri kopijo in samodejno izdela še varnostno kopijo trenutne baze.</p></div>{% endblock %}'''
+TEMPLATES["backups.html"] = r'''{% extends "base.html" %}{% block title %}Varnostne kopije · {{ app_name }}{% endblock %}{% block content %}<div class="card"><div class="actions"><div><h1>Varnostne kopije</h1><p class="muted">Portal vsak dan izdela preverjeno kopijo SQLite baze in ohrani zadnjih 30 kopij.</p></div><form class="right" method="post" action="{{ url_for('create_backup_view') }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="btn btn-primary">Izdelaj kopijo zdaj</button></form></div></div><div class="card"><h2>Shranjene kopije: {{ backups|length }}</h2>{% if backups %}<div class="table-wrap"><table><thead><tr><th>Datoteka</th><th>Čas izdelave</th><th>Velikost</th><th></th></tr></thead><tbody>{% for backup in backups %}<tr><td><b>{{ backup['name'] }}</b>{% if backup['name'].startswith('auto-') %}<br><span class="muted">Samodejna</span>{% elif backup['name'].startswith('pre-restore-') %}<br><span class="muted">Pred obnovo</span>{% elif backup['name'].startswith('pre-import-') %}<br><span class="muted">Pred CSV-uvozom</span>{% else %}<br><span class="muted">Ročna</span>{% endif %}</td><td class="nowrap">{{ backup['modified_at']|datetime_si }}</td><td>{{ backup['size']|filesize_si }}</td><td><a class="btn btn-secondary btn-small" href="{{ url_for('download_backup',name=backup['name']) }}">Prenesi</a></td></tr>{% endfor %}</tbody></table></div>{% else %}<p class="empty">Varnostna kopija še ni bila izdelana.</p>{% endif %}</div><div class="card"><h2>Obnovitev baze</h2><div class="flash warning">Obnovitev namenoma ni mogoča med delovanjem portala. Najprej prenesi izbrano kopijo tudi na drugo napravo, nato portal in storitev za kopije ustavi ter uporabi dokumentirani ukaz na strežniku.</div><p class="muted">Pred obnovitvijo orodje preveri kopijo in samodejno izdela še varnostno kopijo trenutne baze.</p></div>{% endblock %}'''
+
+TEMPLATES["csv_import.html"] = r'''{% extends "base.html" %}{% block title %}CSV-uvoz skedov · {{ app_name }}{% endblock %}{% block content %}<div class="card"><div class="actions"><div><h1>Uvoz starejših skedov iz CSV</h1><p class="muted">Najprej se prikaže predogled. Do potrditve se podatkovna baza ne spremeni.</p></div><a class="btn btn-secondary right" href="{{ url_for('csv_import_template') }}">Prenesi CSV-predlogo</a></div>{% if errors %}<div class="flash danger"><b>Uvoz vsebuje napake in ni bil shranjen.</b></div><div class="table-wrap"><table><thead><tr><th>Vrstica</th><th>Napaka</th></tr></thead><tbody>{% for error in errors %}<tr><td>{{ error['line'] or '–' }}</td><td>{{ error['message'] }}</td></tr>{% endfor %}</tbody></table></div>{% endif %}<form method="post" enctype="multipart/form-data"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><div class="field"><label>CSV-datoteka</label><input type="file" name="csv_file" accept=".csv,text/csv" required><small class="muted">Največ 1 MB in 3000 vrstic; kodiranje UTF-8.</small></div><button class="btn btn-primary">Preveri in prikaži predogled</button></form></div><div class="card"><h2>Oblika datoteke</h2><p>Obvezni stolpci so <code>datum</code>, <code>zacetek</code>, <code>operater</code>, <code>klicni_znak</code> in <code>ime</code>. Dodatni stolpci so <code>konec</code>, <code>naslov</code>, <code>vrsta</code>, <code>prijava</code> in <code>opombe</code>.</p><ul><li>Vsak prijavljeni je v svoji vrstici.</li><li>Vrstice istega skeda morajo imeti enak datum, čas, naslov, operaterja in opombo.</li><li>Za sked brez prijavljenih pusti klicni znak in ime prazna.</li><li>Operater mora že obstajati med uporabniki portala; uporabi njegovo uporabniško ime ali klicni znak.</li><li>Vrsta je <code>sobotni</code>, <code>mesecni</code> ali <code>izredni</code>.</li></ul></div>{% endblock %}'''
+
+TEMPLATES["csv_import_preview.html"] = r'''{% extends "base.html" %}{% block title %}Predogled CSV-uvoza · {{ app_name }}{% endblock %}{% block content %}<div class="card"><span class="badge postponed">Predogled – baza še ni spremenjena</span><h1>Predogled CSV-uvoza</h1><p><b>{{ batch['filename'] }}</b><br>{{ parsed['net_count'] }} skedov · {{ parsed['participant_count'] }} prijavljenih · {{ parsed['input_row_count'] }} vrstic CSV</p><div class="flash warning">Ob potrditvi se najprej samodejno izdela preverjena varnostna kopija. Nato se celoten uvoz izvede naenkrat.</div><div class="actions"><form method="post" action="{{ url_for('confirm_csv_import',import_id=batch['id']) }}" onsubmit="return confirm('Uvozim vse prikazane skede in prijavljene?')"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="btn btn-success">Potrdi celoten uvoz</button></form><form method="post" action="{{ url_for('cancel_csv_import',import_id=batch['id']) }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="btn btn-secondary">Prekliči</button></form></div></div>{% for net in parsed['nets'] %}<div class="card"><div class="actions"><div><span class="badge leader">{{ 'Sobotni' if net['schedule_type']=='saturday' else ('Mesečni' if net['schedule_type']=='monthly' else 'Izredni') }}</span><h2>{{ net['title'] }}</h2><p>{{ net['net_date']|date_si }} · {{ net['started_at']|time_si }}{% if net['ended_at'] %}–{{ net['ended_at']|time_si }}{% endif %}<br>Operater: <b>{{ net['leader_label'] }}</b></p></div><span class="big-number right">{{ net['participants']|length }}</span></div>{% if net['notes'] %}<div class="net-notes muted">{{ net['notes'] }}</div>{% endif %}{% if net['participants'] %}<div class="table-wrap"><table><thead><tr><th>Vrstica</th><th>Prijava</th><th>Klicni znak</th><th>Ime</th></tr></thead><tbody>{% for participant in net['participants'] %}<tr><td>{{ participant['line'] }}</td><td>{{ participant['checkin_at']|time_si }}</td><td><b>{{ participant['callsign'] }}</b></td><td>{{ participant['full_name'] }}</td></tr>{% endfor %}</tbody></table></div>{% else %}<p class="empty">Brez prijavljenih.</p>{% endif %}</div>{% endfor %}{% endblock %}'''
 
 TEMPLATES["users_v2.html"] = r'''{% extends "base.html" %}{% block content %}<div class="card"><div class="actions"><h1>Uporabniki</h1><a class="btn btn-primary right" href="{{ url_for('new_user') }}">＋ Novi uporabnik</a></div><div class="table-wrap"><table><thead><tr><th>Uporabnik</th><th>Ime in klicni znak</th><th>Vloga</th><th>Zadnja prijava</th><th>Varnost</th><th></th></tr></thead><tbody>{% for user in users %}<tr><td><b>{{ user['username'] }}</b><br>{{ 'Aktiven' if user['active'] else 'Onemogočen' }}</td><td>{{ user['full_name'] }}<br><b>{{ user['callsign'] }}</b></td><td><span class="badge {{ user['role'] }}">{{ 'Administrator' if user['role']=='admin' else 'Vodja skeda' }}</span></td><td>{% if user['last_login_at'] %}{{ user['last_login_at']|datetime_si }}{% if user['last_login_ip'] %}<br><span class="muted">IP: {{ user['last_login_ip'] }}</span>{% endif %}{% else %}–{% endif %}</td><td>{% if user['locked_until'] and user['locked_until']>now_value %}<span class="badge canceled">Zaklenjen</span><br><small>do {{ user['locked_until']|datetime_si }}</small>{% elif user['failed_login_count'] %}<span class="badge postponed">{{ user['failed_login_count'] }} napačnih poskusov</span>{% else %}<span class="badge open">V redu</span>{% endif %}</td><td><a class="btn btn-secondary btn-small" href="{{ url_for('edit_user',user_id=user['id']) }}">Uredi</a></td></tr>{% endfor %}</tbody></table></div></div>{% endblock %}'''
 
@@ -2749,7 +3298,7 @@ TEMPLATES["base.html"] = TEMPLATES["base.html"].replace(
     '<a href="{{ url_for(\'callsigns\') }}">Imenik</a><a href="{{ url_for(\'statistics\') }}">Statistika</a>',
 ).replace(
     '<a href="{{ url_for(\'users\') }}">Uporabniki</a>',
-    '<a href="{{ url_for(\'users\') }}">Uporabniki</a><a href="{{ url_for(\'audit_log_view\') }}">Revizija</a><a href="{{ url_for(\'security_view\') }}">Varnost</a><a href="{{ url_for(\'backups_view\') }}">Kopije</a>',
+    '<a href="{{ url_for(\'users\') }}">Uporabniki</a><a href="{{ url_for(\'audit_log_view\') }}">Revizija</a><a href="{{ url_for(\'security_view\') }}">Varnost</a><a href="{{ url_for(\'backups_view\') }}">Kopije</a><a href="{{ url_for(\'csv_import_view\') }}">Uvoz</a>',
 ).replace(
     '</style>',
     r'''.report-filters{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;align-items:end}.report-filters .field{margin:0}.stats-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:14px}.stat{text-align:center}.stat span{display:block;color:#65717c}.stat strong{display:block;font-size:2rem;margin-top:5px}.stat .profile-date{font-size:1.25rem}.bar-chart{display:grid;gap:12px}.bar-row{display:grid;grid-template-columns:minmax(95px,1.2fr) minmax(110px,3fr) 42px minmax(62px,auto);gap:9px;align-items:center}.bar-track{height:13px;background:#e7edf2;border-radius:999px;overflow:hidden}.bar-track i{display:block;height:100%;min-width:2px;background:var(--blue);border-radius:999px}.bar-row small{color:#65717c}.audit-details{display:block;white-space:pre-wrap;overflow-wrap:anywhere;max-width:420px;margin-top:7px}.net-notes{white-space:pre-wrap;overflow-wrap:anywhere;line-height:1.55}.notes-preview{display:none}.print-report{max-width:none}@media(max-width:700px){.stats-grid{grid-template-columns:1fr 1fr}.bar-row{grid-template-columns:minmax(85px,1.3fr) minmax(80px,2fr) 34px}.bar-row>small{display:none}.report-filters{grid-template-columns:1fr}}@media print{.stats-grid{grid-template-columns:repeat(4,1fr)}.print-report table{font-size:10pt}.notes-preview{display:block}}</style>''',
