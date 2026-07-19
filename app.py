@@ -22,7 +22,7 @@ from backup import backup_path, create_backup, list_backups, verify_database
 
 
 APP_NAME = "S50TTT Dnevnik skedov"
-BASE_VERSION = "1.15.0"
+BASE_VERSION = "1.16.0"
 RELEASE_CHANNEL = os.environ.get("RELEASE_CHANNEL", "stable").strip().lower()
 if RELEASE_CHANNEL not in {"stable", "alpha"}:
     RELEASE_CHANNEL = "stable"
@@ -408,6 +408,7 @@ def init_db():
             active INTEGER NOT NULL DEFAULT 1,
             use_count INTEGER NOT NULL DEFAULT 0,
             last_used_at TEXT,
+            notes TEXT,
             created_by INTEGER NOT NULL REFERENCES users(id),
             created_at TEXT NOT NULL,
             updated_by INTEGER REFERENCES users(id),
@@ -476,6 +477,15 @@ def init_db():
             except sqlite3.OperationalError as error:
                 if "duplicate column name" not in str(error).lower():
                     raise
+    directory_columns = {
+        row["name"] for row in db.execute("PRAGMA table_info(callsign_directory)")
+    }
+    if "notes" not in directory_columns:
+        try:
+            db.execute("ALTER TABLE callsign_directory ADD COLUMN notes TEXT")
+        except sqlite3.OperationalError as error:
+            if "duplicate column name" not in str(error).lower():
+                raise
     db.execute("DROP INDEX IF EXISTS idx_nets_schedule_date")
     db.execute(
         """CREATE UNIQUE INDEX IF NOT EXISTS idx_nets_schedule_date
@@ -550,6 +560,19 @@ def learn_callsign(db, callsign, full_name, user_id, used_at):
         (callsign[:24], full_name[:120], used_at, user_id, now_db()),
     )
     return cursor.lastrowid, True
+
+
+def refresh_callsign_usage(db, callsign):
+    usage = db.execute(
+        """SELECT COUNT(*) AS use_count, MAX(checkin_at) AS last_used_at
+           FROM participants WHERE callsign=? COLLATE NOCASE""",
+        (callsign,),
+    ).fetchone()
+    db.execute(
+        """UPDATE callsign_directory SET use_count=?, last_used_at=?
+           WHERE callsign=? COLLATE NOCASE""",
+        (usage["use_count"], usage["last_used_at"], callsign),
+    )
 
 
 @app.before_request
@@ -1184,6 +1207,16 @@ def edit_net(net_id):
         if ended_at < started_at:
             ended_at += timedelta(days=1)
 
+        affected_callsigns = []
+        if net_date != net["net_date"]:
+            affected_callsigns = [
+                row["callsign"]
+                for row in db.execute(
+                    "SELECT DISTINCT callsign FROM participants WHERE net_id=?",
+                    (net_id,),
+                ).fetchall()
+            ]
+
         before = {
             "title": net["title"],
             "net_date": net["net_date"],
@@ -1227,6 +1260,8 @@ def edit_net(net_id):
                             participant["id"],
                         ),
                     )
+                for callsign in affected_callsigns:
+                    refresh_callsign_usage(db, callsign)
             audit(
                 "update",
                 "net",
@@ -1329,11 +1364,17 @@ def edit_participant(participant_id):
         try:
             datetime.strptime(checkin_time, "%H:%M")
             db = get_db()
+            checkin_at = f"{net['net_date']} {checkin_time}:00"
             db.execute(
                 """UPDATE participants SET full_name=?, callsign=?, checkin_at=?,
                    updated_by=?, updated_at=? WHERE id=?""",
-                (full_name[:120], callsign[:24], f"{net['net_date']} {checkin_time}:00", g.user["id"], now_db(), participant_id),
+                (full_name[:120], callsign[:24], checkin_at, g.user["id"], now_db(), participant_id),
             )
+            directory_id, directory_created = learn_callsign(
+                db, callsign, full_name, g.user["id"], checkin_at
+            )
+            refresh_callsign_usage(db, participant["callsign"])
+            refresh_callsign_usage(db, callsign)
             db.commit()
         except ValueError:
             flash("Ura prijave ni veljavna.", "danger")
@@ -1342,6 +1383,8 @@ def edit_participant(participant_id):
             flash(f"Klicni znak {callsign} je v tem skedu že vpisan.", "warning")
             return redirect(request.url)
         audit("update", "participant", participant_id, f"{callsign} – {full_name}")
+        if directory_created:
+            audit("learn", "callsign", directory_id, f"{callsign} – {full_name}")
         flash("Vnos je popravljen.", "success")
         if return_to == "net_edit" and g.user["role"] == "admin":
             return redirect(url_for("edit_net", net_id=net["id"]))
@@ -1361,8 +1404,10 @@ def delete_participant(participant_id):
     net = fetch_net(participant["net_id"])
     if net["status"] != "open" and g.user["role"] != "admin":
         abort(403)
-    get_db().execute("DELETE FROM participants WHERE id=?", (participant_id,))
-    get_db().commit()
+    db = get_db()
+    db.execute("DELETE FROM participants WHERE id=?", (participant_id,))
+    refresh_callsign_usage(db, participant["callsign"])
+    db.commit()
     audit("delete", "participant", participant_id, f"{participant['callsign']} – {participant['full_name']}")
     flash("Vnos je izbrisan.", "success")
     return redirect(participant_return_url(net["id"]))
@@ -1461,6 +1506,8 @@ def delete_closed_net(net_id):
             ),
         )
         db.execute("DELETE FROM nets WHERE id=?", (net_id,))
+        for callsign in {participant["callsign"] for participant in participants}:
+            refresh_callsign_usage(db, callsign)
         audit(
             "delete",
             "net",
@@ -1829,7 +1876,7 @@ def callsigns():
             ORDER BY active DESC, callsign""",
         parameters,
     ).fetchall()
-    return render_template("callsigns.html", entries=rows, query=query)
+    return render_template("callsigns_v2.html", entries=rows, query=query)
 
 
 def fetch_callsign_entry(entry_id):
@@ -1839,6 +1886,139 @@ def fetch_callsign_entry(entry_id):
     if row is None:
         abort(404)
     return row
+
+
+@app.route("/callsigns/<int:entry_id>", methods=["GET", "POST"])
+@login_required
+def callsign_profile(entry_id):
+    entry = fetch_callsign_entry(entry_id)
+    db = get_db()
+    if request.method == "POST":
+        if g.user["role"] != "admin":
+            abort(403)
+        notes = request.form.get("notes", "").strip()[:2000]
+        db.execute(
+            """UPDATE callsign_directory SET notes=?, updated_by=?, updated_at=?
+               WHERE id=?""",
+            (notes or None, g.user["id"], now_db(), entry_id),
+        )
+        db.commit()
+        audit("update_notes", "callsign", entry_id, entry["callsign"])
+        flash("Interna opomba je shranjena.", "success")
+        return redirect(url_for("callsign_profile", entry_id=entry_id))
+
+    history = db.execute(
+        """SELECT p.id AS participant_id, p.checkin_at, p.full_name AS entered_name,
+                  n.id AS net_id, n.title, n.net_date, n.started_at, n.status,
+                  n.schedule_type, u.full_name AS leader_name,
+                  u.callsign AS leader_callsign
+           FROM participants p JOIN nets n ON n.id=p.net_id
+           JOIN users u ON u.id=n.leader_id
+           WHERE p.callsign=? COLLATE NOCASE
+           ORDER BY n.net_date DESC, p.checkin_at DESC""",
+        (entry["callsign"],),
+    ).fetchall()
+    yearly = db.execute(
+        """SELECT SUBSTR(n.net_date,1,4) AS year, COUNT(*) AS attendance_count
+           FROM participants p JOIN nets n ON n.id=p.net_id
+           WHERE p.callsign=? COLLATE NOCASE
+           GROUP BY SUBSTR(n.net_date,1,4) ORDER BY year DESC""",
+        (entry["callsign"],),
+    ).fetchall()
+    summary = {
+        "attendance_count": len(history),
+        "first_checkin": history[-1]["checkin_at"] if history else None,
+        "last_checkin": history[0]["checkin_at"] if history else None,
+        "years_count": len(yearly),
+    }
+    return render_template(
+        "callsign_profile.html",
+        entry=entry,
+        history=history,
+        yearly=yearly,
+        summary=summary,
+    )
+
+
+@app.route("/callsigns/<int:entry_id>/merge", methods=["GET", "POST"])
+@admin_required
+def merge_callsign(entry_id):
+    source = fetch_callsign_entry(entry_id)
+    db = get_db()
+    targets = db.execute(
+        """SELECT id, callsign, full_name FROM callsign_directory
+           WHERE id<>? ORDER BY active DESC, callsign""",
+        (entry_id,),
+    ).fetchall()
+    if request.method == "POST":
+        try:
+            target_id = int(request.form.get("target_id", ""))
+        except (TypeError, ValueError):
+            target_id = 0
+        target = db.execute(
+            "SELECT * FROM callsign_directory WHERE id=? AND id<>?",
+            (target_id, entry_id),
+        ).fetchone()
+        if target is None:
+            flash("Izberi veljaven ciljni klicni znak.", "danger")
+        else:
+            source_callsign = source["callsign"]
+            target_callsign = target["callsign"]
+            source_count = db.execute(
+                """SELECT COUNT(*) AS n FROM participants
+                   WHERE callsign=? COLLATE NOCASE""",
+                (source_callsign,),
+            ).fetchone()["n"]
+            duplicate_ids = db.execute(
+                """SELECT source.id FROM participants source
+                   WHERE source.callsign=? COLLATE NOCASE
+                     AND EXISTS (
+                         SELECT 1 FROM participants target
+                         WHERE target.net_id=source.net_id
+                           AND target.callsign=? COLLATE NOCASE
+                     )""",
+                (source_callsign, target_callsign),
+            ).fetchall()
+            duplicate_count = len(duplicate_ids)
+            for participant in duplicate_ids:
+                db.execute("DELETE FROM participants WHERE id=?", (participant["id"],))
+            db.execute(
+                """UPDATE participants SET callsign=?, updated_by=?, updated_at=?
+                   WHERE callsign=? COLLATE NOCASE""",
+                (target_callsign, g.user["id"], now_db(), source_callsign),
+            )
+            notes = target["notes"] or ""
+            if source["notes"]:
+                separator = "\n\n" if notes else ""
+                notes += f"{separator}[Združeno iz {source_callsign}] {source['notes']}"
+            db.execute(
+                """UPDATE callsign_directory SET notes=?, updated_by=?, updated_at=?
+                   WHERE id=?""",
+                (notes[:2000] or None, g.user["id"], now_db(), target_id),
+            )
+            db.execute("DELETE FROM callsign_directory WHERE id=?", (entry_id,))
+            refresh_callsign_usage(db, target_callsign)
+            db.commit()
+            audit(
+                "merge",
+                "callsign",
+                target_id,
+                json.dumps(
+                    {
+                        "source": source_callsign,
+                        "target": target_callsign,
+                        "moved_participations": source_count - duplicate_count,
+                        "removed_duplicates": duplicate_count,
+                    },
+                    ensure_ascii=False,
+                ),
+            )
+            flash(
+                f"Klicni znak {source_callsign} je združen v {target_callsign}.",
+                "success",
+            )
+            return redirect(url_for("callsign_profile", entry_id=target_id))
+    return render_template("callsign_merge.html", source=source, targets=targets)
 
 
 @app.route("/callsigns/new", methods=["GET", "POST"])
@@ -1872,19 +2052,20 @@ def new_callsign():
 def edit_callsign(entry_id):
     entry = fetch_callsign_entry(entry_id)
     if request.method == "POST":
-        callsign = request.form.get("callsign", "").strip().upper().replace(" ", "")
+        callsign = request.form.get("callsign", "").strip().upper().replace(" ", "")[:24]
         full_name = request.form.get("full_name", "").strip()
         active = 1 if request.form.get("active") == "1" else 0
         if not callsign or not full_name:
             flash("Vpiši klicni znak in ime.", "danger")
         else:
             try:
-                get_db().execute(
+                db = get_db()
+                db.execute(
                     """UPDATE callsign_directory
                        SET callsign=?, full_name=?, active=?, updated_by=?, updated_at=?
                        WHERE id=?""",
                     (
-                        callsign[:24],
+                        callsign,
                         full_name[:120],
                         active,
                         g.user["id"],
@@ -1892,13 +2073,24 @@ def edit_callsign(entry_id):
                         entry_id,
                     ),
                 )
-                get_db().commit()
+                if callsign != entry["callsign"]:
+                    db.execute(
+                        """UPDATE participants SET callsign=?, updated_by=?, updated_at=?
+                           WHERE callsign=? COLLATE NOCASE""",
+                        (callsign, g.user["id"], now_db(), entry["callsign"]),
+                    )
+                    refresh_callsign_usage(db, callsign)
+                db.commit()
                 audit("update", "callsign", entry_id, f"{callsign} – {full_name}")
                 flash("Vnos v imeniku je posodobljen.", "success")
-                return redirect(url_for("callsigns"))
+                return redirect(url_for("callsign_profile", entry_id=entry_id))
             except sqlite3.IntegrityError:
                 get_db().rollback()
-                flash("Ta klicni znak je že v imeniku.", "warning")
+                flash(
+                    "Tega klicnega znaka ni mogoče preimenovati. Če že obstaja, "
+                    "uporabi funkcijo Združi.",
+                    "warning",
+                )
     return render_template("callsign_form.html", entry=entry)
 
 
@@ -2095,6 +2287,8 @@ def audit_action_si(value):
         "password_change": "Sprememba gesla",
         "login_locked": "Blokirana prijava",
         "unlock": "Odklep računa",
+        "update_notes": "Sprememba opombe",
+        "merge": "Združitev",
     }.get(value, value)
 
 
@@ -2213,6 +2407,12 @@ TEMPLATES["users_v2.html"] = r'''{% extends "base.html" %}{% block content %}<di
 
 TEMPLATES["security.html"] = r'''{% extends "base.html" %}{% block title %}Varnost prijav · {{ app_name }}{% endblock %}{% block content %}<div class="card"><h1>Varnost prijav</h1><p class="muted">Po {{ max_failures }} napačnih geslih se račun zaklene za {{ lock_minutes }} minut. Po {{ ip_max_failures }} neuspešnih poskusih z istega naslova v {{ lock_minutes }} minutah se začasno omeji tudi ta naslov.</p><div class="table-wrap"><table><thead><tr><th>Uporabnik</th><th>Zadnja uspešna prijava</th><th>Napačni poskusi</th><th>Status</th><th></th></tr></thead><tbody>{% for account in accounts %}<tr><td>{{ account['full_name'] }}<br><b>{{ account['callsign'] }}</b> · {{ account['username'] }}</td><td>{% if account['last_login_at'] %}{{ account['last_login_at']|datetime_si }}<br><span class="muted">{{ account['last_login_ip'] or '' }}</span>{% else %}–{% endif %}</td><td>{{ account['failed_login_count'] }}</td><td>{% if account['locked_until'] and account['locked_until']>now_value %}<span class="badge canceled">Zaklenjen do {{ account['locked_until']|datetime_si }}</span>{% elif account['active'] %}<span class="badge open">Aktiven</span>{% else %}<span class="badge closed">Onemogočen</span>{% endif %}</td><td>{% if account['locked_until'] or account['failed_login_count'] %}<form method="post" action="{{ url_for('unlock_user',user_id=account['id']) }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="btn btn-secondary btn-small">Odkleni</button></form>{% endif %}</td></tr>{% endfor %}</tbody></table></div></div><div class="card"><h2>Zadnjih 200 poskusov prijave</h2><form method="get" class="actions" style="margin-bottom:16px"><input name="q" value="{{ query }}" placeholder="Uporabniško ime ali IP" style="max-width:300px"><select name="result" style="max-width:220px"><option value="all">Vsi poskusi</option><option value="success" {% if selected_result=='success' %}selected{% endif %}>Uspešni</option><option value="failed" {% if selected_result=='failed' %}selected{% endif %}>Neuspešni</option><option value="limited" {% if selected_result=='limited' %}selected{% endif %}>Blokirani</option></select><button class="btn btn-primary">Filtriraj</button><a class="btn btn-secondary" href="{{ url_for('security_view') }}">Počisti</a></form>{% if attempts %}<div class="table-wrap"><table><thead><tr><th>Čas</th><th>Vpisano uporabniško ime</th><th>Naslov IP</th><th>Rezultat</th></tr></thead><tbody>{% for attempt in attempts %}<tr><td class="nowrap">{{ attempt['created_at']|datetime_si }}</td><td>{{ attempt['username'] }}{% if attempt['user_callsign'] %}<br><b>{{ attempt['user_callsign'] }}</b>{% endif %}</td><td>{{ attempt['ip_address'] }}</td><td><span class="badge {{ 'open' if attempt['success'] else 'canceled' }}">{{ attempt['reason']|login_reason_si }}</span></td></tr>{% endfor %}</tbody></table></div>{% else %}<p class="empty">Poskusov prijave še ni.</p>{% endif %}</div>{% endblock %}'''
 
+TEMPLATES["callsigns_v2.html"] = r'''{% extends "base.html" %}{% block content %}<div class="card"><div class="actions"><div><h1>Imenik klicnih znakov</h1><p class="muted">Izberi klicni znak za prikaz zgodovine sodelovanja.</p></div>{% if g.user['role']=='admin' %}<a class="btn btn-primary right" href="{{ url_for('new_callsign') }}">＋ Novi vnos</a>{% endif %}</div><form method="get" class="actions no-print" style="margin-bottom:18px"><input name="q" value="{{ query }}" placeholder="Išči po klicnem znaku ali imenu" style="max-width:360px"><button class="btn btn-secondary">Išči</button>{% if query %}<a class="btn btn-secondary" href="{{ url_for('callsigns') }}">Počisti</a>{% endif %}</form>{% if entries %}<div class="table-wrap"><table><thead><tr><th>Klicni znak</th><th>Ime in priimek</th><th>Sodelovanj</th><th>Zadnja prijava</th><th>Status</th><th></th></tr></thead><tbody>{% for entry in entries %}<tr><td><a href="{{ url_for('callsign_profile',entry_id=entry['id']) }}"><b>{{ entry['callsign'] }}</b></a></td><td>{{ entry['full_name'] }}</td><td>{{ entry['use_count'] }}</td><td>{{ entry['last_used_at']|datetime_si if entry['last_used_at'] else '–' }}</td><td><span class="badge {{ 'open' if entry['active'] else 'closed' }}">{{ 'Aktiven' if entry['active'] else 'Skrit' }}</span></td><td><div class="actions"><a class="btn btn-secondary btn-small" href="{{ url_for('callsign_profile',entry_id=entry['id']) }}">Profil</a>{% if g.user['role']=='admin' %}<a class="btn btn-secondary btn-small" href="{{ url_for('edit_callsign',entry_id=entry['id']) }}">Uredi</a>{% endif %}</div></td></tr>{% endfor %}</tbody></table></div>{% else %}<p class="empty">V imeniku ni zadetkov.</p>{% endif %}</div>{% endblock %}'''
+
+TEMPLATES["callsign_profile.html"] = r'''{% extends "base.html" %}{% block title %}{{ entry['callsign'] }} · {{ app_name }}{% endblock %}{% block content %}<div class="card"><div class="actions"><div><span class="badge {{ 'open' if entry['active'] else 'closed' }}">{{ 'Aktiven' if entry['active'] else 'Skrit' }}</span><h1>{{ entry['callsign'] }}</h1><h2>{{ entry['full_name'] }}</h2></div>{% if g.user['role']=='admin' %}<div class="actions right"><a class="btn btn-secondary" href="{{ url_for('edit_callsign',entry_id=entry['id']) }}">Uredi podatke</a><a class="btn btn-danger" href="{{ url_for('merge_callsign',entry_id=entry['id']) }}">Združi klicni znak</a></div>{% endif %}</div></div><div class="stats-grid"><div class="card stat"><span>Sodelovanj</span><strong>{{ summary['attendance_count'] }}</strong></div><div class="card stat"><span>Aktivnih let</span><strong>{{ summary['years_count'] }}</strong></div><div class="card stat"><span>Prvo sodelovanje</span><strong class="profile-date">{{ summary['first_checkin']|date_si if summary['first_checkin'] else '–' }}</strong></div><div class="card stat"><span>Zadnje sodelovanje</span><strong class="profile-date">{{ summary['last_checkin']|date_si if summary['last_checkin'] else '–' }}</strong></div></div>{% if g.user['role']=='admin' %}<div class="card"><h2>Interna opomba</h2><p class="muted">Opomba je vidna samo administratorjem in se zabeleži v revizijsko sled.</p><form method="post"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><textarea name="notes" maxlength="2000" placeholder="Neobvezna interna opomba …">{{ entry['notes'] or '' }}</textarea><button class="btn btn-primary" style="margin-top:10px">Shrani opombo</button></form></div>{% endif %}<div class="grid"><div class="card"><h2>Sodelovanja po letih</h2>{% if yearly %}<div class="table-wrap"><table><thead><tr><th>Leto</th><th>Sodelovanj</th></tr></thead><tbody>{% for item in yearly %}<tr><td>{{ item['year'] }}</td><td><b>{{ item['attendance_count'] }}</b></td></tr>{% endfor %}</tbody></table></div>{% else %}<p class="empty">Sodelovanj še ni.</p>{% endif %}</div><div class="card"><h2>Podatki imenika</h2><p>Vnos ustvarjen: <b>{{ entry['created_at']|datetime_si }}</b>{% if entry['updated_at'] %}<br>Zadnja sprememba: <b>{{ entry['updated_at']|datetime_si }}</b>{% endif %}</p><a class="btn btn-secondary" href="{{ url_for('callsigns') }}">Nazaj v imenik</a></div></div><div class="card"><h2>Zgodovina skedov</h2>{% if history %}<div class="table-wrap"><table><thead><tr><th>Datum</th><th>Sked</th><th>Prijava</th><th>Operater</th><th></th></tr></thead><tbody>{% for item in history %}<tr><td class="nowrap">{{ item['net_date']|date_si }}</td><td><b>{{ item['title'] }}</b><br><span class="badge {{ item['status'] }}">{{ 'Zaključen' if item['status']=='closed' else 'Odprt' }}</span></td><td>{{ item['checkin_at']|time_si }}</td><td>{{ item['leader_name'] }} ({{ item['leader_callsign'] }})</td><td><a class="btn btn-secondary btn-small" href="{{ url_for('net_detail',net_id=item['net_id']) }}">Pregled</a></td></tr>{% endfor %}</tbody></table></div>{% else %}<p class="empty">Ta klicni znak še ni sodeloval v shranjenem skedu.</p>{% endif %}</div>{% endblock %}'''
+
+TEMPLATES["callsign_merge.html"] = r'''{% extends "base.html" %}{% block content %}<div class="card" style="max-width:680px"><h1>Združi klicni znak</h1><p>Vir: <b>{{ source['callsign'] }}</b> · {{ source['full_name'] }}</p><div class="flash warning">Vsa sodelovanja vira bodo prenesena na izbrani ciljni klicni znak, vir pa bo odstranjen iz imenika. Če sta oba znaka v istem skedu, se podvojena prijava odstrani. Dejanje se zabeleži v revizijo.</div>{% if targets %}<form method="post" onsubmit="return confirm('Res združim {{ source['callsign'] }} z izbranim klicnim znakom?')"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><div class="field"><label>Ciljni klicni znak</label><select name="target_id" required><option value="">Izberi …</option>{% for target in targets %}<option value="{{ target['id'] }}">{{ target['callsign'] }} · {{ target['full_name'] }}</option>{% endfor %}</select></div><div class="actions"><button class="btn btn-danger">Združi</button><a class="btn btn-secondary" href="{{ url_for('callsign_profile',entry_id=source['id']) }}">Prekliči</a></div></form>{% else %}<p class="empty">V imeniku ni drugega klicnega znaka, s katerim bi ga lahko združil.</p>{% endif %}</div>{% endblock %}'''
+
 TEMPLATES["base.html"] = TEMPLATES["base.html"].replace(
     '<a href="{{ url_for(\'callsigns\') }}">Imenik</a>',
     '<a href="{{ url_for(\'callsigns\') }}">Imenik</a><a href="{{ url_for(\'statistics\') }}">Statistika</a>',
@@ -2221,7 +2421,7 @@ TEMPLATES["base.html"] = TEMPLATES["base.html"].replace(
     '<a href="{{ url_for(\'users\') }}">Uporabniki</a><a href="{{ url_for(\'audit_log_view\') }}">Revizija</a><a href="{{ url_for(\'security_view\') }}">Varnost</a><a href="{{ url_for(\'backups_view\') }}">Kopije</a>',
 ).replace(
     '</style>',
-    r'''.report-filters{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;align-items:end}.report-filters .field{margin:0}.stats-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:14px}.stat{text-align:center}.stat span{display:block;color:#65717c}.stat strong{display:block;font-size:2rem;margin-top:5px}.bar-chart{display:grid;gap:12px}.bar-row{display:grid;grid-template-columns:minmax(95px,1.2fr) minmax(110px,3fr) 42px minmax(62px,auto);gap:9px;align-items:center}.bar-track{height:13px;background:#e7edf2;border-radius:999px;overflow:hidden}.bar-track i{display:block;height:100%;min-width:2px;background:var(--blue);border-radius:999px}.bar-row small{color:#65717c}.audit-details{display:block;white-space:pre-wrap;overflow-wrap:anywhere;max-width:420px;margin-top:7px}.print-report{max-width:none}@media(max-width:700px){.stats-grid{grid-template-columns:1fr 1fr}.bar-row{grid-template-columns:minmax(85px,1.3fr) minmax(80px,2fr) 34px}.bar-row>small{display:none}.report-filters{grid-template-columns:1fr}}@media print{.stats-grid{grid-template-columns:repeat(4,1fr)}.print-report table{font-size:10pt}}</style>''',
+    r'''.report-filters{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;align-items:end}.report-filters .field{margin:0}.stats-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:14px}.stat{text-align:center}.stat span{display:block;color:#65717c}.stat strong{display:block;font-size:2rem;margin-top:5px}.stat .profile-date{font-size:1.25rem}.bar-chart{display:grid;gap:12px}.bar-row{display:grid;grid-template-columns:minmax(95px,1.2fr) minmax(110px,3fr) 42px minmax(62px,auto);gap:9px;align-items:center}.bar-track{height:13px;background:#e7edf2;border-radius:999px;overflow:hidden}.bar-track i{display:block;height:100%;min-width:2px;background:var(--blue);border-radius:999px}.bar-row small{color:#65717c}.audit-details{display:block;white-space:pre-wrap;overflow-wrap:anywhere;max-width:420px;margin-top:7px}.print-report{max-width:none}@media(max-width:700px){.stats-grid{grid-template-columns:1fr 1fr}.bar-row{grid-template-columns:minmax(85px,1.3fr) minmax(80px,2fr) 34px}.bar-row>small{display:none}.report-filters{grid-template-columns:1fr}}@media print{.stats-grid{grid-template-columns:repeat(4,1fr)}.print-report table{font-size:10pt}}</style>''',
 )
 
 app.jinja_loader = DictLoader(TEMPLATES)

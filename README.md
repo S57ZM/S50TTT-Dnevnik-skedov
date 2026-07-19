@@ -2,7 +2,7 @@
 
 Ločen spletni portal Radiokluba Sevnica S50TTT za vodenje skedov.
 
-Trenutna alpha različica: **1.15.0-alpha**
+Trenutna alpha različica: **1.16.0-alpha**
 
 ## Funkcije
 
@@ -14,6 +14,9 @@ Trenutna alpha različica: **1.15.0-alpha**
 - administratorski pregled revizijske sledi s filtri;
 - dnevne preverjene varnostne kopije z 30-dnevno hrambo in ročnim prenosom;
 - zaščita prijave z začasnim zaklepom, beleženjem poskusov in ročnim odklepom;
+- profil klicnega znaka z zgodovino udeležb, letnim pregledom in internimi
+  administratorskimi opombami;
+- nadzorovano združevanje podvojenih klicnih znakov z revizijsko sledjo;
 - zaklenjeno odpiranje rednega dnevnika do petka pred skedom, s predčasnim
   odklepom po petih hitrih pritiskih;
 - živ odštevalnik, številka sobotnega skeda in skupno število prijavljenih na
@@ -45,6 +48,13 @@ imenik. Ob naslednjem vnosu izbira znanega klicnega znaka samodejno izpolni ime.
 prepiše samodejno. Administrator ga lahko popravi ali skrije na strani `Imenik`.
 Ob nadgradnji se imenik enkrat dopolni tudi iz že shranjenih prijav. Vsak vnos
 hrani število uporab in čas zadnje prijave.
+
+Klik na klicni znak odpre njegov profil s številom sodelovanj, prvim in zadnjim
+sodelovanjem, pregledom po letih ter seznamom vseh skedov. Interno opombo vidi
+in ureja samo administrator. Če je ista postaja v imeniku zapisana dvakrat,
+lahko administrator napačni vnos združi v pravilnega. Sodelovanja in opomba se
+prenesejo, morebitna dvojna prijava v istem skedu pa se odstrani. Združitev je
+zabeležena v revizijski sledi.
 
 ## Statistika, poročila in revizija (alpha)
 

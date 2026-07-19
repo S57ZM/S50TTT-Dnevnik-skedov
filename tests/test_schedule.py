@@ -185,9 +185,155 @@ class ScheduleTests(unittest.TestCase):
             self.assertEqual(entry["active"], 0)
             self.assertEqual(entry["full_name"], "Popravljen Ročni Vnos")
 
+    def test_callsign_profile_shows_history_and_keeps_notes_admin_only(self):
+        net_id, admin_id = self.create_open_net("Profilni testni sked")
+        admin_client = self.authenticated_client(admin_id)
+        response = admin_client.post(
+            f"/nets/{net_id}/participants",
+            data={
+                "csrf_token": "test-csrf-token",
+                "callsign": "S58PROFILE",
+                "full_name": "Profilni Radioamater",
+                "checkin_time": "20:17",
+            },
+        )
+        self.assertEqual(response.status_code, 302)
+
+        with flask_app.app_context():
+            db = get_db()
+            entry_id = db.execute(
+                "SELECT id FROM callsign_directory WHERE callsign='S58PROFILE'"
+            ).fetchone()["id"]
+            db.execute(
+                """INSERT OR IGNORE INTO users
+                   (username, full_name, callsign, password_hash, role, active, created_at)
+                   VALUES ('profile-leader', 'Profilni Vodja', 'S50PRF',
+                           'not-used-in-test', 'leader', 1, ?)""",
+                (now_db(),),
+            )
+            leader_id = db.execute(
+                "SELECT id FROM users WHERE username='profile-leader'"
+            ).fetchone()["id"]
+            db.commit()
+
+        profile_response = admin_client.get(f"/callsigns/{entry_id}")
+        profile_html = profile_response.get_data(as_text=True)
+        self.assertEqual(profile_response.status_code, 200)
+        self.assertIn("S58PROFILE", profile_html)
+        self.assertIn("Profilni testni sked", profile_html)
+        self.assertIn("Sodelovanja po letih", profile_html)
+
+        note = "Interna testna opomba, vidna samo administratorju."
+        note_response = admin_client.post(
+            f"/callsigns/{entry_id}",
+            data={"csrf_token": "test-csrf-token", "notes": note},
+        )
+        self.assertEqual(note_response.status_code, 302)
+        with flask_app.app_context():
+            db = get_db()
+            entry = db.execute(
+                "SELECT notes FROM callsign_directory WHERE id=?", (entry_id,)
+            ).fetchone()
+            audit_row = db.execute(
+                """SELECT id FROM audit_log
+                   WHERE action='update_notes' AND entity_type='callsign'
+                     AND entity_id=?""",
+                (entry_id,),
+            ).fetchone()
+            self.assertEqual(entry["notes"], note)
+            self.assertIsNotNone(audit_row)
+
+        leader_client = self.authenticated_client(leader_id)
+        leader_html = leader_client.get(f"/callsigns/{entry_id}").get_data(as_text=True)
+        self.assertNotIn(note, leader_html)
+        self.assertNotIn("Interna opomba", leader_html)
+        self.assertEqual(
+            leader_client.post(
+                f"/callsigns/{entry_id}",
+                data={"csrf_token": "test-csrf-token", "notes": "Nedovoljeno"},
+            ).status_code,
+            403,
+        )
+
+    def test_admin_can_merge_duplicate_callsigns_without_duplicate_attendance(self):
+        first_net_id, admin_id = self.create_open_net("Prvi sked za združitev")
+        second_net_id, _ = self.create_open_net("Drugi sked za združitev")
+        with flask_app.app_context():
+            db = get_db()
+            source = db.execute(
+                """INSERT INTO callsign_directory
+                   (callsign, full_name, active, use_count, notes, created_by, created_at)
+                   VALUES ('S58OLD', 'Staro Ime', 1, 2, 'Opomba starega vnosa', ?, ?)""",
+                (admin_id, now_db()),
+            )
+            target = db.execute(
+                """INSERT INTO callsign_directory
+                   (callsign, full_name, active, use_count, notes, created_by, created_at)
+                   VALUES ('S58NEW', 'Pravo Ime', 1, 1, 'Ciljna opomba', ?, ?)""",
+                (admin_id, now_db()),
+            )
+            source_id = source.lastrowid
+            target_id = target.lastrowid
+            for net_id, callsign, checkin_time in (
+                (first_net_id, "S58OLD", "20:05"),
+                (second_net_id, "S58OLD", "20:06"),
+                (second_net_id, "S58NEW", "20:07"),
+            ):
+                db.execute(
+                    """INSERT INTO participants
+                       (net_id, full_name, callsign, checkin_at, created_by, created_at)
+                       VALUES (?, 'Test združitve', ?, ?, ?, ?)""",
+                    (
+                        net_id,
+                        callsign,
+                        f"2030-01-05 {checkin_time}:00",
+                        admin_id,
+                        now_db(),
+                    ),
+                )
+            db.commit()
+
+        client = self.authenticated_client(admin_id)
+        response = client.post(
+            f"/callsigns/{source_id}/merge",
+            data={"csrf_token": "test-csrf-token", "target_id": target_id},
+        )
+        self.assertEqual(response.status_code, 302)
+        self.assertTrue(response.headers["Location"].endswith(f"/callsigns/{target_id}"))
+
+        with flask_app.app_context():
+            db = get_db()
+            self.assertIsNone(
+                db.execute(
+                    "SELECT id FROM callsign_directory WHERE id=?", (source_id,)
+                ).fetchone()
+            )
+            target_entry = db.execute(
+                "SELECT * FROM callsign_directory WHERE id=?", (target_id,)
+            ).fetchone()
+            attendance = db.execute(
+                "SELECT net_id FROM participants WHERE callsign='S58NEW' ORDER BY net_id"
+            ).fetchall()
+            audit_row = db.execute(
+                """SELECT details FROM audit_log
+                   WHERE action='merge' AND entity_type='callsign' AND entity_id=?
+                   ORDER BY id DESC LIMIT 1""",
+                (target_id,),
+            ).fetchone()
+            self.assertEqual(len(attendance), 2)
+            self.assertEqual(len({row["net_id"] for row in attendance}), 2)
+            self.assertEqual(target_entry["use_count"], 2)
+            self.assertIn("Opomba starega vnosa", target_entry["notes"])
+            self.assertIn('"removed_duplicates": 1', audit_row["details"])
+
+        self.assertEqual(client.get(f"/callsigns/{source_id}").status_code, 404)
+        profile_html = client.get(f"/callsigns/{target_id}").get_data(as_text=True)
+        self.assertIn("Prvi sked za združitev", profile_html)
+        self.assertIn("Drugi sked za združitev", profile_html)
+
     def test_alpha_channel_has_visible_warning(self):
         with patch("app.RELEASE_CHANNEL", "alpha"), patch(
-            "app.APP_VERSION", "1.15.0-alpha"
+            "app.APP_VERSION", "1.16.0-alpha"
         ):
             response = flask_app.test_client().get("/login")
             health_response = flask_app.test_client().get("/health")
@@ -195,7 +341,7 @@ class ScheduleTests(unittest.TestCase):
         html = response.get_data(as_text=True)
         self.assertIn("ALPHA TESTNA RAZLIČICA", html)
         self.assertIn("podatki niso produkcijski", html)
-        self.assertIn("različica 1.15.0-alpha", html)
+        self.assertIn("različica 1.16.0-alpha", html)
         self.assertEqual(health_response.get_json()["channel"], "alpha")
 
     def test_login_shows_countdown_and_next_saturday_number(self):
