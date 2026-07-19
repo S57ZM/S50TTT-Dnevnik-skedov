@@ -9,8 +9,11 @@ services:
     env_file: .env.alpha
     environment:
       RELEASE_CHANNEL: alpha
+      BACKUP_DIR: /app/backups
+      BACKUP_RETENTION: 30
     volumes:
       - ./data-alpha:/app/data
+      - ./backups-alpha:/app/backups
     ports:
       - "${BIND_IP:-0.0.0.0}:${ALPHA_PORT:-8024}:8000"
     healthcheck:
@@ -19,3 +22,22 @@ services:
       timeout: 5s
       retries: 3
       start_period: 15s
+
+  backup-alpha:
+    build: .
+    container_name: s50ttt-skedi-alpha-backup
+    restart: unless-stopped
+    user: "${PUID}:${PGID}"
+    env_file: .env.alpha
+    environment:
+      RELEASE_CHANNEL: alpha
+      BACKUP_DIR: /app/backups
+      BACKUP_RETENTION: 30
+      BACKUP_INTERVAL_SECONDS: 86400
+    volumes:
+      - ./data-alpha:/app/data
+      - ./backups-alpha:/app/backups
+    command: ["python", "backup.py", "schedule"]
+    depends_on:
+      skedi-alpha:
+        condition: service_healthy

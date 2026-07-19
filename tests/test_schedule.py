@@ -1,12 +1,15 @@
 import os
+import sqlite3
 import tempfile
 import unittest
 from datetime import date, datetime, timedelta
+from pathlib import Path
 from unittest.mock import patch
 
 
 TEST_DATA = tempfile.TemporaryDirectory()
 os.environ["DATABASE_PATH"] = os.path.join(TEST_DATA.name, "test-skedi.db")
+os.environ["BACKUP_DIR"] = os.path.join(TEST_DATA.name, "backups")
 os.environ["ADMIN_PASSWORD"] = "test-password-123"
 os.environ["SECRET_KEY"] = "test-secret-key"
 
@@ -28,6 +31,7 @@ from app import (  # noqa: E402
     saturday_start_time,
     scheduled_net_for_date,
 )
+import backup as backup_tools  # noqa: E402
 
 
 class ScheduleTests(unittest.TestCase):
@@ -183,7 +187,7 @@ class ScheduleTests(unittest.TestCase):
 
     def test_alpha_channel_has_visible_warning(self):
         with patch("app.RELEASE_CHANNEL", "alpha"), patch(
-            "app.APP_VERSION", "1.13.0-alpha"
+            "app.APP_VERSION", "1.14.0-alpha"
         ):
             response = flask_app.test_client().get("/login")
             health_response = flask_app.test_client().get("/health")
@@ -191,7 +195,7 @@ class ScheduleTests(unittest.TestCase):
         html = response.get_data(as_text=True)
         self.assertIn("ALPHA TESTNA RAZLIČICA", html)
         self.assertIn("podatki niso produkcijski", html)
-        self.assertIn("različica 1.13.0-alpha", html)
+        self.assertIn("različica 1.14.0-alpha", html)
         self.assertEqual(health_response.get_json()["channel"], "alpha")
 
     def test_login_shows_countdown_and_next_saturday_number(self):
@@ -558,6 +562,92 @@ class ScheduleTests(unittest.TestCase):
             },
         )
         self.assertEqual(forbidden_response.status_code, 403)
+
+    def test_admin_can_create_and_download_verified_backup(self):
+        with flask_app.app_context():
+            db = get_db()
+            admin_id = db.execute(
+                "SELECT id FROM users WHERE role='admin' ORDER BY id LIMIT 1"
+            ).fetchone()["id"]
+            db.execute(
+                """INSERT OR IGNORE INTO users
+                   (username, full_name, callsign, password_hash, role, active, created_at)
+                   VALUES ('backup-leader', 'Vodja Brez Kopij', 'S50BKP',
+                           'not-used-in-test', 'leader', 1, ?)""",
+                (now_db(),),
+            )
+            leader_id = db.execute(
+                "SELECT id FROM users WHERE username='backup-leader'"
+            ).fetchone()["id"]
+            db.commit()
+
+        admin_client = self.authenticated_client(admin_id)
+        response = admin_client.post(
+            "/backups/create", data={"csrf_token": "test-csrf-token"}
+        )
+        self.assertEqual(response.status_code, 302)
+
+        page_response = admin_client.get("/backups")
+        html = page_response.get_data(as_text=True)
+        self.assertEqual(page_response.status_code, 200)
+        self.assertIn("Varnostne kopije", html)
+        self.assertIn("manual-skedi-", html)
+        self.assertIn("Nova varnostna kopija", response.headers.get("Location", "") + html)
+
+        backup_names = sorted(
+            (
+                name
+                for name in os.listdir(os.environ["BACKUP_DIR"])
+                if name.endswith(".sqlite3")
+            ),
+            reverse=True,
+        )
+        self.assertTrue(backup_names)
+        download_response = admin_client.get(
+            f"/backups/{backup_names[0]}/download"
+        )
+        self.assertEqual(download_response.status_code, 200)
+        self.assertTrue(download_response.data.startswith(b"SQLite format 3"))
+        self.assertIn("attachment", download_response.headers["Content-Disposition"])
+        download_response.close()
+
+        with flask_app.app_context():
+            audit_row = get_db().execute(
+                """SELECT details FROM audit_log
+                   WHERE action='create' AND entity_type='backup'
+                   ORDER BY id DESC LIMIT 1"""
+            ).fetchone()
+            self.assertIn("manual-skedi-", audit_row["details"])
+
+        leader_client = self.authenticated_client(leader_id)
+        self.assertEqual(leader_client.get("/backups").status_code, 403)
+
+    def test_backup_restore_is_verified_and_keeps_safety_copy(self):
+        with tempfile.TemporaryDirectory() as directory:
+            database_path = Path(directory) / "restore-test.db"
+            backup_directory = Path(directory) / "copies"
+            with sqlite3.connect(database_path) as connection:
+                connection.execute("CREATE TABLE marker(value TEXT NOT NULL)")
+                connection.execute("INSERT INTO marker(value) VALUES ('original')")
+
+            with patch("backup.DATABASE_PATH", database_path), patch(
+                "backup.BACKUP_DIR", backup_directory
+            ):
+                created = backup_tools.create_backup("manual")
+                self.assertTrue(backup_tools.verify_database(created))
+                with sqlite3.connect(database_path) as connection:
+                    connection.execute("UPDATE marker SET value='changed'")
+
+                backup_tools.restore_backup(created.name, confirmed=True)
+                with sqlite3.connect(database_path) as connection:
+                    value = connection.execute("SELECT value FROM marker").fetchone()[0]
+                self.assertEqual(value, "original")
+                self.assertTrue(
+                    any(
+                        item["name"].startswith("pre-restore-")
+                        for item in backup_tools.list_backups()
+                    )
+                )
 
     def test_closed_net_deletion_requires_a_reason(self):
         net_id, admin_id = self.create_closed_net("Sked brez razloga za brisanje")

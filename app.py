@@ -10,16 +10,18 @@ from functools import wraps
 from zoneinfo import ZoneInfo
 
 from flask import (
-    Flask, Response, abort, flash, g, redirect, render_template, request, session,
-    url_for,
+    Flask, Response, abort, flash, g, redirect, render_template, request, send_file,
+    session, url_for,
 )
 from jinja2 import DictLoader
 from werkzeug.middleware.proxy_fix import ProxyFix
 from werkzeug.security import check_password_hash, generate_password_hash
 
+from backup import backup_path, create_backup, list_backups, verify_database
+
 
 APP_NAME = "S50TTT Dnevnik skedov"
-BASE_VERSION = "1.13.0"
+BASE_VERSION = "1.14.0"
 RELEASE_CHANNEL = os.environ.get("RELEASE_CHANNEL", "stable").strip().lower()
 if RELEASE_CHANNEL not in {"stable", "alpha"}:
     RELEASE_CHANNEL = "stable"
@@ -1517,6 +1519,42 @@ def audit_log_view():
     )
 
 
+@app.route("/backups")
+@admin_required
+def backups_view():
+    return render_template("backups.html", backups=list_backups())
+
+
+@app.post("/backups/create")
+@admin_required
+def create_backup_view():
+    try:
+        path = create_backup("manual")
+    except (OSError, sqlite3.Error, RuntimeError) as error:
+        flash(f"Varnostne kopije ni bilo mogoče izdelati: {error}", "danger")
+    else:
+        audit("create", "backup", None, path.name)
+        flash("Nova varnostna kopija je izdelana in preverjena.", "success")
+    return redirect(url_for("backups_view"))
+
+
+@app.get("/backups/<path:name>/download")
+@admin_required
+def download_backup(name):
+    try:
+        path = backup_path(name)
+    except ValueError:
+        abort(404)
+    if not path.is_file() or not verify_database(path):
+        abort(404)
+    return send_file(
+        path,
+        as_attachment=True,
+        download_name=path.name,
+        mimetype="application/vnd.sqlite3",
+    )
+
+
 def report_participant_rows(filters):
     where, parameters = report_where(filters)
     return get_db().execute(
@@ -1821,7 +1859,17 @@ def audit_entity_si(value):
         "callsign": "Klicni znak",
         "user": "Uporabnik",
         "schedule_exception": "Sprememba urnika",
+        "backup": "Varnostna kopija",
     }.get(value, value)
+
+
+@app.template_filter("filesize_si")
+def filesize_si(value):
+    size = float(value or 0)
+    for unit in ("B", "KB", "MB", "GB"):
+        if size < 1024 or unit == "GB":
+            return f"{size:.0f} {unit}" if unit == "B" else f"{size:.1f} {unit}"
+        size /= 1024
 
 
 TEMPLATES = {
@@ -1902,12 +1950,14 @@ TEMPLATES.update({
 "print_report.html": r'''{% extends "base.html" %}{% block title %}Poročilo skedov · {{ app_name }}{% endblock %}{% block content %}<div class="card print-report"><div class="actions no-print"><button class="btn btn-primary" onclick="window.print()">Shrani kot PDF / natisni</button><button class="btn btn-secondary" onclick="window.close()">Zapri</button></div><h1>Poročilo skedov Radiokluba Sevnica S50TTT</h1><p class="muted">Izdelano: {{ generated_at|datetime_si }}{% if filters['from_date'] %} · od {{ filters['from_date']|date_si }}{% endif %}{% if filters['to_date'] %} · do {{ filters['to_date']|date_si }}{% endif %}</p>{% if rows %}<div class="table-wrap"><table><thead><tr><th>Datum</th><th>Sked</th><th>Status</th><th>Operater</th><th>Prijavljeni</th></tr></thead><tbody>{% for row in rows %}<tr><td class="nowrap">{{ row['net_date']|date_si }}</td><td><b>{{ row['title'] }}</b><br>{{ row['started_at']|time_si }}{% if row['ended_at'] %}–{{ row['ended_at']|time_si }}{% endif %}</td><td>{{ 'Zaključen' if row['status']=='closed' else 'Odprt' }}</td><td>{{ row['leader_name'] }} ({{ row['leader_callsign'] }})</td><td>{{ row['participant_count'] }}</td></tr>{% endfor %}</tbody><tfoot><tr><th colspan="4">Skupaj</th><th>{{ rows|sum(attribute='participant_count') }}</th></tr></tfoot></table></div>{% else %}<p class="empty">Za izbrane filtre ni podatkov.</p>{% endif %}</div>{% endblock %}'''
 })
 
+TEMPLATES["backups.html"] = r'''{% extends "base.html" %}{% block title %}Varnostne kopije · {{ app_name }}{% endblock %}{% block content %}<div class="card"><div class="actions"><div><h1>Varnostne kopije</h1><p class="muted">Portal vsak dan izdela preverjeno kopijo SQLite baze in ohrani zadnjih 30 kopij.</p></div><form class="right" method="post" action="{{ url_for('create_backup_view') }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="btn btn-primary">Izdelaj kopijo zdaj</button></form></div></div><div class="card"><h2>Shranjene kopije: {{ backups|length }}</h2>{% if backups %}<div class="table-wrap"><table><thead><tr><th>Datoteka</th><th>Čas izdelave</th><th>Velikost</th><th></th></tr></thead><tbody>{% for backup in backups %}<tr><td><b>{{ backup['name'] }}</b>{% if backup['name'].startswith('auto-') %}<br><span class="muted">Samodejna</span>{% elif backup['name'].startswith('pre-restore-') %}<br><span class="muted">Pred obnovo</span>{% else %}<br><span class="muted">Ročna</span>{% endif %}</td><td class="nowrap">{{ backup['modified_at']|datetime_si }}</td><td>{{ backup['size']|filesize_si }}</td><td><a class="btn btn-secondary btn-small" href="{{ url_for('download_backup',name=backup['name']) }}">Prenesi</a></td></tr>{% endfor %}</tbody></table></div>{% else %}<p class="empty">Varnostna kopija še ni bila izdelana.</p>{% endif %}</div><div class="card"><h2>Obnovitev baze</h2><div class="flash warning">Obnovitev namenoma ni mogoča med delovanjem portala. Najprej prenesi izbrano kopijo tudi na drugo napravo, nato portal in storitev za kopije ustavi ter uporabi dokumentirani ukaz na strežniku.</div><p class="muted">Pred obnovitvijo orodje preveri kopijo in samodejno izdela še varnostno kopijo trenutne baze.</p></div>{% endblock %}'''
+
 TEMPLATES["base.html"] = TEMPLATES["base.html"].replace(
     '<a href="{{ url_for(\'callsigns\') }}">Imenik</a>',
     '<a href="{{ url_for(\'callsigns\') }}">Imenik</a><a href="{{ url_for(\'statistics\') }}">Statistika</a>',
 ).replace(
     '<a href="{{ url_for(\'users\') }}">Uporabniki</a>',
-    '<a href="{{ url_for(\'users\') }}">Uporabniki</a><a href="{{ url_for(\'audit_log_view\') }}">Revizija</a>',
+    '<a href="{{ url_for(\'users\') }}">Uporabniki</a><a href="{{ url_for(\'audit_log_view\') }}">Revizija</a><a href="{{ url_for(\'backups_view\') }}">Kopije</a>',
 ).replace(
     '</style>',
     r'''.report-filters{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;align-items:end}.report-filters .field{margin:0}.stats-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:14px}.stat{text-align:center}.stat span{display:block;color:#65717c}.stat strong{display:block;font-size:2rem;margin-top:5px}.bar-chart{display:grid;gap:12px}.bar-row{display:grid;grid-template-columns:minmax(95px,1.2fr) minmax(110px,3fr) 42px minmax(62px,auto);gap:9px;align-items:center}.bar-track{height:13px;background:#e7edf2;border-radius:999px;overflow:hidden}.bar-track i{display:block;height:100%;min-width:2px;background:var(--blue);border-radius:999px}.bar-row small{color:#65717c}.audit-details{display:block;white-space:pre-wrap;overflow-wrap:anywhere;max-width:420px;margin-top:7px}.print-report{max-width:none}@media(max-width:700px){.stats-grid{grid-template-columns:1fr 1fr}.bar-row{grid-template-columns:minmax(85px,1.3fr) minmax(80px,2fr) 34px}.bar-row>small{display:none}.report-filters{grid-template-columns:1fr}}@media print{.stats-grid{grid-template-columns:repeat(4,1fr)}.print-report table{font-size:10pt}}</style>''',

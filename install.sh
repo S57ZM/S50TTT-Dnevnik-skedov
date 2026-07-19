@@ -13,7 +13,7 @@ command -v docker >/dev/null 2>&1 || fail "Docker ni nameščen."
 docker compose version >/dev/null 2>&1 || fail "Docker Compose ni na voljo."
 
 cd "$APP_DIR"
-mkdir -p data
+mkdir -p data backups
 
 if [[ ! -f .env ]]; then
   SECRET_KEY="$(openssl rand -hex 32)"

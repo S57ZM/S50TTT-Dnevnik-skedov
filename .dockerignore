@@ -6,5 +6,7 @@
 .docker-config
 data
 data-alpha
+backups
+backups-alpha
 __pycache__
 *.pyc

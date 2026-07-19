@@ -5,8 +5,12 @@ services:
     restart: unless-stopped
     user: "${PUID}:${PGID}"
     env_file: .env
+    environment:
+      BACKUP_DIR: /app/backups
+      BACKUP_RETENTION: 30
     volumes:
       - ./data:/app/data
+      - ./backups:/app/backups
     ports:
       - "${BIND_IP:-0.0.0.0}:${PORT:-8023}:8000"
     healthcheck:
@@ -15,3 +19,21 @@ services:
       timeout: 5s
       retries: 3
       start_period: 15s
+
+  backup:
+    build: .
+    container_name: s50ttt-skedi-backup
+    restart: unless-stopped
+    user: "${PUID}:${PGID}"
+    env_file: .env
+    environment:
+      BACKUP_DIR: /app/backups
+      BACKUP_RETENTION: 30
+      BACKUP_INTERVAL_SECONDS: 86400
+    volumes:
+      - ./data:/app/data
+      - ./backups:/app/backups
+    command: ["python", "backup.py", "schedule"]
+    depends_on:
+      skedi:
+        condition: service_healthy

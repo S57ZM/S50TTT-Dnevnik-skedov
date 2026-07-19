@@ -2,7 +2,7 @@
 
 Ločen spletni portal Radiokluba Sevnica S50TTT za vodenje skedov.
 
-Trenutna alpha različica: **1.13.0-alpha**
+Trenutna alpha različica: **1.14.0-alpha**
 
 ## Funkcije
 
@@ -12,6 +12,7 @@ Trenutna alpha različica: **1.13.0-alpha**
 - statistika udeležbe po mesecih, operaterjih in klicnih znakih;
 - filtriran izvoz poročila v CSV ter priprava za PDF oziroma tiskanje;
 - administratorski pregled revizijske sledi s filtri;
+- dnevne preverjene varnostne kopije z 30-dnevno hrambo in ročnim prenosom;
 - zaklenjeno odpiranje rednega dnevnika do petka pred skedom, s predčasnim
   odklepom po petih hitrih pritiskih;
 - živ odštevalnik, številka sobotnega skeda in skupno število prijavljenih na
@@ -136,13 +137,28 @@ Za javni naslov `skedi.s57zm.eu` se v Nginx Proxy Managerju ustvari Proxy Host:
 
 ## Varnostna kopija
 
-Za varnostno kopijo je dovolj kopirati datoteko:
+Ločena Docker storitev enkrat dnevno izdela konsistentno SQLite kopijo, jo
+preveri in ohrani zadnjih 30 kopij v mapi:
 
 ```text
-data/skedi.db
+backups/
 ```
 
-Pred kopiranjem je priporočljivo za kratek čas ustaviti vsebnik.
+Administrator lahko na strani `Kopije` kadar koli izdela novo ročno kopijo in
+jo prenese na drugo napravo.
+
+Za obnovitev najprej izberi ime kopije, nato na strežniku ustavi obe storitvi,
+preveri datoteko in potrdi obnovo:
+
+```bash
+docker compose stop skedi backup
+docker compose run --rm --no-deps backup python backup.py verify IME_KOPIJE.sqlite3
+docker compose run --rm --no-deps backup python backup.py restore IME_KOPIJE.sqlite3 --confirm
+docker compose up -d
+```
+
+Pred zamenjavo baze se samodejno izdela dodatna kopija trenutnega stanja z
+oznako `pre-restore`.
 
 ## Posodobitev
 
