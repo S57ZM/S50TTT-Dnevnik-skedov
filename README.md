@@ -2,7 +2,7 @@
 
 Ločen spletni portal Radiokluba Sevnica S50TTT za vodenje skedov.
 
-Trenutna različica: **1.8.1**
+Trenutna različica: **1.8.2**
 
 ## Funkcije
 

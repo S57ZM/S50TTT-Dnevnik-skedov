@@ -227,8 +227,8 @@ class ScheduleTests(unittest.TestCase):
             self.assertEqual(
                 dashboard_html.count("data-early-open aria-disabled=\"true\""), 2
             )
-            self.assertIn("Na voljo od petka, 24. 07. 2026", dashboard_html)
-            self.assertIn("Na voljo od petka, 31. 07. 2026", dashboard_html)
+            self.assertNotIn("Na voljo od petka", dashboard_html)
+            self.assertNotIn("Za predčasno odprtje", dashboard_html)
             self.assertIn("Ti si pravi Heker", dashboard_html)
 
             locked_response = client.post(
