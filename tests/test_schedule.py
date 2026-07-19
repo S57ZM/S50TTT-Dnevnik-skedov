@@ -1,7 +1,7 @@
 import os
 import tempfile
 import unittest
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 
 
 TEST_DATA = tempfile.TemporaryDirectory()
@@ -124,6 +124,43 @@ class ScheduleTests(unittest.TestCase):
                         now_db(),
                     ),
                 )
+
+            past_saturdays = []
+            displayed_date = date.fromisoformat(displayed_saturday["date"])
+            for weeks_back, participant_count in ((1, 3), (2, 4)):
+                past_date = displayed_date - timedelta(days=7 * weeks_back)
+                scheduled = scheduled_net_for_date(SCHEDULE_SATURDAY, past_date)
+                past_cursor = db.execute(
+                    """INSERT INTO nets
+                       (title, net_date, started_at, ended_at, status, leader_id,
+                        schedule_type, repeater, control_callsign, created_at)
+                       VALUES (?, ?, ?, ?, 'closed', ?, ?, ?, 'S50TTT', ?)""",
+                    (
+                        f"Pretekli sobotni sked {weeks_back}",
+                        scheduled["date"],
+                        f"{scheduled['date']} {scheduled['time']}:00",
+                        f"{scheduled['date']} 21:30:00",
+                        admin_id,
+                        SCHEDULE_SATURDAY,
+                        scheduled["repeater"],
+                        now_db(),
+                    ),
+                )
+                for index in range(participant_count):
+                    db.execute(
+                        """INSERT INTO participants
+                           (net_id, full_name, callsign, checkin_at,
+                            created_by, created_at)
+                           VALUES (?, 'Pretekli udeleženec', ?, ?, ?, ?)""",
+                        (
+                            past_cursor.lastrowid,
+                            f"S5{weeks_back}{index}T",
+                            f"{scheduled['date']} {scheduled['time']}:00",
+                            admin_id,
+                            now_db(),
+                        ),
+                    )
+                past_saturdays.append((past_date, participant_count))
             db.commit()
 
         response = flask_app.test_client().get("/login")
@@ -133,6 +170,10 @@ class ScheduleTests(unittest.TestCase):
         self.assertIn("data-countdown=", html)
         self.assertIn("Redni sobotni sked", html)
         self.assertIn('data-participant-count="2"', html)
+        self.assertIn("Zadnja zaključena sobotna skeda", html)
+        for past_date, participant_count in past_saturdays:
+            self.assertIn(f"št. {saturday_net_number(past_date)}", html)
+            self.assertIn(f'data-history-count="{participant_count}"', html)
 
     def test_next_summer_saturday_and_monthly_net(self):
         scheduled = next_scheduled_nets(datetime(2026, 7, 19, 12, 0))
@@ -221,6 +262,11 @@ class ScheduleTests(unittest.TestCase):
 
         self.assertEqual(edit_page.status_code, 200)
         self.assertIn("Uredi zaključeni sked", edit_page.get_data(as_text=True))
+        self.assertIn("Razlog brisanja", edit_page.get_data(as_text=True))
+        self.assertIn(
+            f'action="/nets/{net_id}/delete-closed"',
+            edit_page.get_data(as_text=True),
+        )
         self.assertIn("Izbriši sked", detail_page.get_data(as_text=True))
         self.assertIn("Uredi", archive_page.get_data(as_text=True))
 
@@ -230,8 +276,8 @@ class ScheduleTests(unittest.TestCase):
                 "csrf_token": "test-csrf-token",
                 "title": "Popravljen zaključeni sked",
                 "net_date": "2030-02-09",
-                "started_time": "20:10",
-                "ended_time": "20:45",
+                "started_time": "21:00",
+                "ended_time": "00:41",
                 "leader_id": str(admin_id),
             },
         )
@@ -251,8 +297,8 @@ class ScheduleTests(unittest.TestCase):
             ).fetchone()
 
             self.assertEqual(net["title"], "Popravljen zaključeni sked")
-            self.assertEqual(net["started_at"], "2030-02-09 20:10:00")
-            self.assertEqual(net["ended_at"], "2030-02-09 20:45:00")
+            self.assertEqual(net["started_at"], "2030-02-09 21:00:00")
+            self.assertEqual(net["ended_at"], "2030-02-10 00:41:00")
             self.assertTrue(participant["checkin_at"].startswith("2030-02-09 "))
             self.assertIn('"before"', audit_row["details"])
             self.assertIn('"after"', audit_row["details"])
