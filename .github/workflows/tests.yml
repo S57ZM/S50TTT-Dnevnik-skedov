@@ -1,0 +1,42 @@
+name: Preizkusi
+
+on:
+  push:
+    branches: [main, alpha]
+  pull_request:
+    branches: [main, alpha]
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      DATABASE_PATH: /tmp/s50ttt-tests/skedi.db
+      BACKUP_DIR: /tmp/s50ttt-tests/backups
+      ADMIN_PASSWORD: test-password-123
+      SECRET_KEY: github-actions-test-secret
+      RELEASE_CHANNEL: alpha
+      SESSION_COOKIE_SECURE: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Namesti odvisnosti
+        run: pip install -r requirements.txt
+      - name: Preveri Python
+        run: python -m compileall -q app.py backup.py migrations.py tests
+      - name: Zaženi teste
+        run: python -m unittest discover -s tests -v
+
+  docker:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Preveri gradnjo Docker slike
+        run: docker build -t s50ttt-skedi:test .

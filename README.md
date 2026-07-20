@@ -2,7 +2,7 @@
 
 Ločen spletni portal Radiokluba Sevnica S50TTT za vodenje skedov.
 
-Trenutna alpha različica: **1.20.0-alpha**
+Trenutna alpha različica: **1.21.0-alpha**
 
 ## Funkcije
 
@@ -13,7 +13,8 @@ Trenutna alpha različica: **1.20.0-alpha**
 - filtriran izvoz poročila v CSV ter priprava za PDF oziroma tiskanje;
 - varen administratorski uvoz zgodovinskih skedov iz CSV s predogledom;
 - administratorski pregled revizijske sledi s filtri;
-- dnevne preverjene varnostne kopije z 30-dnevno hrambo in ročnim prenosom;
+- preverjene dnevne, ročne in varnostne kopije z ločeno hrambo ter izbirno
+  drugo lokacijo;
 - zaščita prijave z začasnim zaklepom, beleženjem poskusov in ročnim odklepom;
 - profil klicnega znaka z zgodovino udeležb, letnim pregledom in internimi
   administratorskimi opombami;
@@ -27,6 +28,9 @@ Trenutna alpha različica: **1.20.0-alpha**
 - zaporedno številčenje sobotnih skedov od 5. januarja 2019;
 - odpiranje novega skeda z datumom, uro in vodjo;
 - hiter vnos imena, klicnega znaka ter ure prijave;
+- način vodenja v živo z zadnjimi petimi prijavami in razveljavitvijo zadnjega
+  vnosa;
+- opozorilo ob novem klicnem znaku, ki je zelo podoben obstoječemu;
 - zapisnik oziroma opombe skeda za obvestila, tehnične težave in posebnosti;
 - preprečevanje podvojenega klicnega znaka v istem skedu;
 - urejanje in brisanje napačnih vnosov;
@@ -40,6 +44,10 @@ Trenutna alpha različica: **1.20.0-alpha**
   po datumu, vrsti in statusu;
 - tiskanje dnevnika oziroma shranjevanje v PDF prek brskalnika;
 - mobilnim napravam prilagojen prikaz;
+- zložljiv mobilni meni;
+- javni urnik brez osebnih podatkov in naročnina na koledar `.ics`;
+- administratorska stran `Sistem` s stanjem baze, sheme in varnostnih kopij;
+- obvezna zamenjava začasnega gesla novih uporabnikov;
 - sled sprememb v podatkovni bazi;
 - SQLite podatkovna baza v trajni mapi `data`.
 
@@ -94,6 +102,10 @@ odjemalca.
 Administrator lahko v urejevalniku zaključenega skeda naknadno doda, popravi ali
 izbriše prijavljenega člana. Naknadno dodani klicni znaki se prav tako shranijo v
 imenik, vsi posegi pa ostanejo v revizijski sledi.
+
+Odprt dnevnik in njegove prijave lahko spreminjata njegov operater in
+administrator. Drugi vodje ga lahko pregledajo, ne morejo pa dodajati ali
+brisati prijav oziroma zaključiti skeda.
 
 ## Popravki zaključenih skedov
 
@@ -178,7 +190,7 @@ chmod +x install.sh
 ```
 
 Namestitveni program ob prvem zagonu ustvari administratorski račun `S57ZM` in
-izpiše naključno začetno geslo. Po prvi prijavi ga je treba zamenjati.
+izpiše naključno začetno geslo. Portal po prvi prijavi zahteva njegovo zamenjavo.
 
 Za varno preizkušanje novih funkcij je na voljo tudi povsem ločena alpha
 namestitev. Uporablja vejo `alpha`, port `8024`, vsebnik `s50ttt-skedi-alpha` in
@@ -190,6 +202,11 @@ Lokalni naslov na rpi-services:
 http://192.168.1.57:8023
 ```
 
+Produkcijska seja uporablja varen piškotek in je namenjena dostopu prek naslova
+`https://skedi.s57zm.eu`. Za lokalno testiranje prek navadnega HTTP uporabi alpha
+različico na portu `8024`; produkcijskega `SESSION_COOKIE_SECURE=1` ne izklapljaj
+na javno dostopnem portalu.
+
 Za javni naslov `skedi.s57zm.eu` se v Nginx Proxy Managerju ustvari Proxy Host:
 
 - Forward Hostname/IP: `192.168.1.57`
@@ -198,10 +215,22 @@ Za javni naslov `skedi.s57zm.eu` se v Nginx Proxy Managerju ustvari Proxy Host:
 - Websockets Support: vključeno
 - SSL: nov Let's Encrypt certifikat, Force SSL in HTTP/2
 
+Produkcijski portal zaupa glavam enega povratnega posrednika. Ko preveriš Docker
+omrežje Nginx Proxy Managerja, ga lahko v `.env` dodatno omejiš, na primer:
+
+```text
+TRUSTED_PROXY_NETWORKS=172.16.0.0/12,127.0.0.1/32
+```
+
+Uporabi dejansko omrežje svojega posrednika; stran `Sistem` do takrat prikaže
+opozorilo. Port `8023` naj bo s požarnim zidom dostopen samo posredniku oziroma
+lokalnemu omrežju.
+
 ## Varnostna kopija
 
-Ločena Docker storitev enkrat dnevno izdela konsistentno SQLite kopijo, jo
-preveri in ohrani zadnjih 30 kopij v mapi:
+Ločena Docker storitev enkrat dnevno izdela konsistentno SQLite kopijo in jo
+preveri. Portal ločeno ohrani zadnjih 30 dnevnih, 10 ročnih in 10 varnostnih
+kopij pred uvozom ali obnovitvijo. Lokalne kopije so v mapi:
 
 ```text
 backups/
@@ -209,6 +238,18 @@ backups/
 
 Administrator lahko na strani `Kopije` kadar koli izdela novo ročno kopijo in
 jo prenese na drugo napravo.
+
+Za samodejno dodatno kopijo na NAS ali drug priklopljen disk v `.env` nastavi:
+
+```text
+OFFSITE_BACKUP_ENABLED=1
+OFFSITE_HOST_PATH=/mnt/nas/s50ttt-skedi
+```
+
+Portal na drugi lokaciji ohrani zadnjih 90 preverjenih kopij. Če pot ostane
+`./backups-offsite`, je kopija še vedno na istem strežniku in zato ne varuje pred
+okvaro njegovega diska.
+Priklopljena mapa mora biti zapisljiva uporabniku `PUID:PGID` iz `.env`.
 
 Za obnovitev najprej izberi ime kopije, nato na strežniku ustavi obe storitvi,
 preveri datoteko in potrdi obnovo:
@@ -237,3 +278,6 @@ Po gradnji slike je mogoče preveriti pravila rednih terminov z:
 ```bash
 docker compose run --rm skedi python -m unittest discover -s tests -v
 ```
+
+Repozitorij vsebuje tudi GitHub Actions, ki ob spremembi vej `alpha` ali `main`
+samodejno zažene vseh 42 testov in preveri gradnjo Docker slike.

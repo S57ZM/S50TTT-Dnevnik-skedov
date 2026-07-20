@@ -1,4 +1,5 @@
 import csv
+import difflib
 import hmac
 import ipaddress
 import io
@@ -7,23 +8,32 @@ import os
 import secrets
 import sqlite3
 import unicodedata
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from functools import wraps
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from flask import (
     Flask, Response, abort, flash, g, redirect, render_template, request, send_file,
     session, url_for,
 )
-from jinja2 import DictLoader
+from jinja2 import ChoiceLoader, DictLoader, FileSystemLoader
 from werkzeug.middleware.proxy_fix import ProxyFix
 from werkzeug.security import check_password_hash, generate_password_hash
 
-from backup import backup_path, create_backup, list_backups, verify_database
+from backup import (
+    backup_path,
+    backup_status,
+    create_backup,
+    list_backups,
+    mirror_backup,
+    verify_database,
+)
+from migrations import LATEST_SCHEMA_VERSION, run_migrations, schema_version
 
 
 APP_NAME = "S50TTT Dnevnik skedov"
-BASE_VERSION = "1.20.0"
+BASE_VERSION = "1.21.0"
 RELEASE_CHANNEL = os.environ.get("RELEASE_CHANNEL", "stable").strip().lower()
 if RELEASE_CHANNEL not in {"stable", "alpha"}:
     RELEASE_CHANNEL = "stable"
@@ -33,6 +43,11 @@ APP_VERSION = (
 DB_PATH = os.environ.get("DATABASE_PATH", "/app/data/skedi.db")
 TIMEZONE = ZoneInfo(os.environ.get("TZ", "Europe/Ljubljana"))
 TRUST_PROXY = os.environ.get("TRUST_PROXY", "0").strip() == "1"
+TRUSTED_PROXY_NETWORKS = []
+for proxy_network in os.environ.get("TRUSTED_PROXY_NETWORKS", "").split(","):
+    proxy_network = proxy_network.strip()
+    if proxy_network:
+        TRUSTED_PROXY_NETWORKS.append(ipaddress.ip_network(proxy_network, strict=False))
 SCHEDULE_MONTHLY = "monthly"
 SCHEDULE_SATURDAY = "saturday"
 SCHEDULE_TYPES = {SCHEDULE_MONTHLY, SCHEDULE_SATURDAY}
@@ -43,15 +58,50 @@ LOGIN_IP_MAX_FAILURES = 20
 LOGIN_ATTEMPT_RETENTION = 5000
 DUMMY_PASSWORD_HASH = generate_password_hash(secrets.token_urlsafe(32))
 
+APP_ROOT = Path(__file__).resolve().parent
 app = Flask(__name__)
-app.secret_key = os.environ.get("SECRET_KEY") or secrets.token_hex(32)
+secret_key = os.environ.get("SECRET_KEY", "").strip()
+if not secret_key:
+    raise RuntimeError("SECRET_KEY mora biti nastavljen.")
+app.secret_key = secret_key
 app.config.update(
     SESSION_COOKIE_HTTPONLY=True,
     SESSION_COOKIE_SAMESITE="Lax",
+    SESSION_COOKIE_SECURE=os.environ.get(
+        "SESSION_COOKIE_SECURE", "1" if RELEASE_CHANNEL == "stable" else "0"
+    ).strip()
+    == "1",
+    PERMANENT_SESSION_LIFETIME=timedelta(
+        hours=max(1, int(os.environ.get("SESSION_HOURS", "12")))
+    ),
+    SESSION_REFRESH_EACH_REQUEST=True,
     MAX_CONTENT_LENGTH=1024 * 1024,
 )
+
+
+class TrustedProxyFix:
+    """Uporabi posredovane glave samo, kadar zahteva pride iz dovoljene mreže."""
+
+    def __init__(self, wrapped_app, trusted_networks):
+        self.direct_app = wrapped_app
+        self.proxy_app = ProxyFix(wrapped_app, x_for=1, x_proto=1, x_host=1)
+        self.trusted_networks = trusted_networks
+
+    def __call__(self, environ, start_response):
+        try:
+            remote = ipaddress.ip_address(environ.get("REMOTE_ADDR", ""))
+        except ValueError:
+            return self.direct_app(environ, start_response)
+        if any(remote in network for network in self.trusted_networks):
+            return self.proxy_app(environ, start_response)
+        return self.direct_app(environ, start_response)
+
+
 if TRUST_PROXY:
-    app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
+    if TRUSTED_PROXY_NETWORKS:
+        app.wsgi_app = TrustedProxyFix(app.wsgi_app, TRUSTED_PROXY_NETWORKS)
+    else:
+        app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
 
 
 def now_local():
@@ -307,6 +357,72 @@ def recent_closed_saturday_summaries(limit=2):
     return summaries
 
 
+def public_schedule_rows(reference=None, limit=10):
+    reference = reference or now_local()
+    db = get_db()
+    items = {
+        (item["schedule_type"], item["original_date"]): dict(item)
+        for item in upcoming_effective_scheduled_nets(reference, horizon_days=120)
+    }
+    canceled = db.execute(
+        """SELECT * FROM schedule_exceptions
+           WHERE action='canceled' AND scheduled_date>=? AND scheduled_date<=?
+           ORDER BY scheduled_date""",
+        (
+            reference.date().isoformat(),
+            (reference.date() + timedelta(days=120)).isoformat(),
+        ),
+    ).fetchall()
+    for exception in canceled:
+        try:
+            original_date = date.fromisoformat(exception["scheduled_date"])
+        except ValueError:
+            continue
+        scheduled = scheduled_net_for_date(exception["schedule_type"], original_date)
+        if scheduled:
+            effective = apply_schedule_exception(scheduled, db)
+            items[(exception["schedule_type"], exception["scheduled_date"])] = effective
+
+    rows = []
+    for item in sorted(items.values(), key=schedule_start_datetime)[:limit]:
+        row = dict(item)
+        existing = db.execute(
+            """SELECT n.id, n.status, COUNT(p.id) AS participant_count
+               FROM nets n LEFT JOIN participants p ON p.net_id=n.id
+               WHERE n.schedule_type=?
+                 AND COALESCE(n.scheduled_date,n.net_date)=?
+               GROUP BY n.id""",
+            (row["schedule_type"], row["original_date"]),
+        ).fetchone()
+        row["existing_id"] = existing["id"] if existing else None
+        row["existing_status"] = existing["status"] if existing else None
+        row["participant_count"] = existing["participant_count"] if existing else 0
+        rows.append(row)
+    return rows
+
+
+def ics_escape(value):
+    return (
+        str(value or "")
+        .replace("\\", "\\\\")
+        .replace(";", "\\;")
+        .replace(",", "\\,")
+        .replace("\r\n", "\\n")
+        .replace("\n", "\\n")
+    )
+
+
+def ics_fold(line, width=73):
+    if len(line) <= width:
+        return [line]
+    parts = [line[:width]]
+    remaining = line[width:]
+    while remaining:
+        parts.append(" " + remaining[: width - 1])
+        remaining = remaining[width - 1 :]
+    return parts
+
+
 def get_db():
     if "db" not in g:
         os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
@@ -524,6 +640,8 @@ def init_db():
             except sqlite3.OperationalError as error:
                 if "duplicate column name" not in str(error).lower():
                     raise
+    db.commit()
+    run_migrations(db, now_db())
     db.execute("DROP INDEX IF EXISTS idx_nets_schedule_date")
     db.execute(
         """CREATE UNIQUE INDEX IF NOT EXISTS idx_nets_schedule_date
@@ -532,24 +650,34 @@ def init_db():
     )
     db.commit()
 
-    if db.execute("SELECT COUNT(*) AS n FROM users").fetchone()["n"] == 0:
-        username = os.environ.get("ADMIN_USERNAME", "S57ZM").strip()
-        password = os.environ.get("ADMIN_PASSWORD", "").strip()
-        if not password:
-            raise RuntimeError("ADMIN_PASSWORD mora biti nastavljen ob prvem zagonu.")
-        db.execute(
-            """INSERT INTO users
-               (username, full_name, callsign, password_hash, role, active, created_at)
-               VALUES (?, ?, ?, ?, 'admin', 1, ?)""",
-            (
-                username,
-                os.environ.get("ADMIN_NAME", "Marko Zidar").strip() or "Administrator",
-                os.environ.get("ADMIN_CALLSIGN", "S57ZM").strip().upper() or "S57ZM",
-                generate_password_hash(password),
-                now_db(),
-            ),
-        )
+    db.execute("BEGIN IMMEDIATE")
+    try:
+        if db.execute("SELECT COUNT(*) AS n FROM users").fetchone()["n"] == 0:
+            username = os.environ.get("ADMIN_USERNAME", "S57ZM").strip()
+            password = os.environ.get("ADMIN_PASSWORD", "").strip()
+            if not password:
+                raise RuntimeError(
+                    "ADMIN_PASSWORD mora biti nastavljen ob prvem zagonu."
+                )
+            db.execute(
+                """INSERT INTO users
+                   (username, full_name, callsign, password_hash, role, active,
+                    must_change_password, created_at)
+                   VALUES (?, ?, ?, ?, 'admin', 1, 1, ?)""",
+                (
+                    username,
+                    os.environ.get("ADMIN_NAME", "Marko Zidar").strip()
+                    or "Administrator",
+                    os.environ.get("ADMIN_CALLSIGN", "S57ZM").strip().upper()
+                    or "S57ZM",
+                    generate_password_hash(password),
+                    now_db(),
+                ),
+            )
         db.commit()
+    except Exception:
+        db.rollback()
+        raise
 
     db.execute(
         """INSERT OR IGNORE INTO callsign_directory
@@ -613,6 +741,21 @@ def refresh_callsign_usage(db, callsign):
     )
 
 
+def similar_callsigns(callsign, limit=3):
+    callsign = callsign.strip().upper()
+    if not callsign:
+        return []
+    known = [
+        row["callsign"]
+        for row in get_db().execute(
+            "SELECT callsign FROM callsign_directory WHERE active=1"
+        ).fetchall()
+    ]
+    if callsign in {value.upper() for value in known}:
+        return []
+    return difflib.get_close_matches(callsign, known, n=limit, cutoff=0.72)
+
+
 @app.before_request
 def load_user_and_csrf():
     g.user = None
@@ -631,6 +774,38 @@ def load_user_and_csrf():
         expected = session.get("csrf_token", "")
         if not submitted or not expected or not hmac.compare_digest(submitted, expected):
             abort(400, "Neveljaven varnostni žeton. Osveži stran in poskusi ponovno.")
+
+
+@app.before_request
+def require_initial_password_change():
+    if not g.user or not g.user["must_change_password"]:
+        return None
+    if request.endpoint in {"change_password", "logout", "static"}:
+        return None
+    flash("Pred nadaljevanjem zamenjaj začasno geslo.", "warning")
+    return redirect(url_for("change_password"))
+
+
+@app.after_request
+def add_security_headers(response):
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("X-Frame-Options", "SAMEORIGIN")
+    response.headers.setdefault("Referrer-Policy", "same-origin")
+    response.headers.setdefault(
+        "Permissions-Policy", "camera=(), geolocation=(), microphone=()"
+    )
+    response.headers.setdefault(
+        "Content-Security-Policy",
+        "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; "
+        "script-src 'self' 'unsafe-inline'; base-uri 'self'; frame-ancestors 'self'",
+    )
+    if request.is_secure and RELEASE_CHANNEL == "stable":
+        response.headers.setdefault(
+            "Strict-Transport-Security", "max-age=31536000; includeSubDomains"
+        )
+    if g.get("user") is not None:
+        response.headers.setdefault("Cache-Control", "no-store")
+    return response
 
 
 @app.context_processor
@@ -700,11 +875,78 @@ def record_login_attempt(user, username, ip_address_value, success, reason, crea
 
 @app.route("/health")
 def health():
+    try:
+        db = get_db()
+        db.execute("SELECT 1").fetchone()
+        current_schema = schema_version(db)
+    except sqlite3.Error:
+        return {
+            "status": "error",
+            "database": "unavailable",
+            "version": APP_VERSION,
+            "channel": RELEASE_CHANNEL,
+        }, 503
     return {
         "status": "ok",
+        "database": "ok",
+        "schema_version": current_schema,
+        "schema_latest": LATEST_SCHEMA_VERSION,
         "version": APP_VERSION,
         "channel": RELEASE_CHANNEL,
     }
+
+
+@app.get("/urnik")
+def public_schedule():
+    return render_template(
+        "public_schedule.html", scheduled_nets=public_schedule_rows()
+    )
+
+
+@app.get("/urnik.ics")
+def public_schedule_ics():
+    host = request.host.split(":", 1)[0] or "skedi.s57zm.eu"
+    generated = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    lines = [
+        "BEGIN:VCALENDAR",
+        "VERSION:2.0",
+        "PRODID:-//S50TTT//Dnevnik skedov//SL",
+        "CALSCALE:GREGORIAN",
+        "METHOD:PUBLISH",
+        "X-WR-CALNAME:S50TTT skedi",
+        "X-WR-TIMEZONE:Europe/Ljubljana",
+    ]
+    for item in public_schedule_rows(limit=20):
+        start_local = schedule_start_datetime(item).replace(tzinfo=TIMEZONE)
+        start_utc = start_local.astimezone(ZoneInfo("UTC"))
+        end_utc = start_utc + timedelta(hours=1)
+        description_parts = [item["rule"], "Upravna postaja: S50TTT"]
+        if item["repeater"]:
+            description_parts.append(f"Repetitor: {item['repeater']}")
+        if item["exception_reason"]:
+            description_parts.append(f"Razlog: {item['exception_reason']}")
+        event = [
+            "BEGIN:VEVENT",
+            f"UID:{item['schedule_type']}-{item['original_date']}@{host}",
+            f"DTSTAMP:{generated}",
+            f"DTSTART:{start_utc.strftime('%Y%m%dT%H%M%SZ')}",
+            f"DTEND:{end_utc.strftime('%Y%m%dT%H%M%SZ')}",
+            f"SUMMARY:{ics_escape(item['label'])}",
+            f"DESCRIPTION:{ics_escape(' | '.join(description_parts))}",
+        ]
+        if item["exception_action"] == "canceled":
+            event.extend(["STATUS:CANCELLED", "SEQUENCE:1"])
+        elif item["exception_action"] == "postponed":
+            event.append("SEQUENCE:1")
+        event.append("END:VEVENT")
+        lines.extend(event)
+    lines.append("END:VCALENDAR")
+    folded = [part for line in lines for part in ics_fold(line)]
+    return Response(
+        "\r\n".join(folded) + "\r\n",
+        mimetype="text/calendar; charset=utf-8",
+        headers={"Content-Disposition": "attachment; filename=s50ttt-skedi.ics"},
+    )
 
 
 @app.route("/login", methods=["GET", "POST"])
@@ -787,6 +1029,7 @@ def login():
                 session.clear()
                 session["user_id"] = user["id"]
                 session["csrf_token"] = secrets.token_urlsafe(32)
+                session.permanent = True
                 if previous_login:
                     flash(
                         "Prejšnja uspešna prijava: "
@@ -795,6 +1038,11 @@ def login():
                         ),
                         "success",
                     )
+                if user["must_change_password"]:
+                    return redirect(url_for("change_password"))
+                next_target = request.args.get("next", "")
+                if next_target.startswith("/") and not next_target.startswith("//"):
+                    return redirect(next_target)
                 return redirect(url_for("dashboard"))
 
             reason = "account_locked" if account_locked else "invalid_credentials"
@@ -1169,6 +1417,12 @@ def fetch_net(net_id):
     return row
 
 
+def can_manage_participants(net):
+    if g.user["role"] == "admin":
+        return True
+    return net["status"] == "open" and net["leader_id"] == g.user["id"]
+
+
 @app.route("/nets/<int:net_id>")
 @login_required
 def net_detail(net_id):
@@ -1199,7 +1453,9 @@ def net_detail(net_id):
         now=now_local(),
         can_delete_net=can_delete_net,
         can_edit_notes=can_edit_notes,
+        can_manage_participants=can_manage_participants(net),
         directory_entries=directory_entries,
+        recent_participants=list(reversed(participants[-5:])),
     )
 
 
@@ -1359,7 +1615,7 @@ def participant_return_url(net_id):
 @login_required
 def add_participant(net_id):
     net = fetch_net(net_id)
-    if net["status"] != "open" and g.user["role"] != "admin":
+    if not can_manage_participants(net):
         abort(403)
     full_name = request.form.get("full_name", "").strip()
     callsign = request.form.get("callsign", "").strip().upper().replace(" ", "")
@@ -1373,6 +1629,7 @@ def add_participant(net_id):
         flash("Ura prijave ni veljavna.", "danger")
         return redirect(participant_return_url(net_id))
     db = get_db()
+    possible_typos = similar_callsigns(callsign)
     checkin_at = f"{net['net_date']} {checkin_time}:00"
     try:
         cur = db.execute(
@@ -1399,6 +1656,11 @@ def add_participant(net_id):
     if directory_created:
         audit("learn", "callsign", directory_id, f"{callsign} – {full_name}")
     flash(f"Dodan: {callsign} – {full_name}", "success")
+    if possible_typos:
+        flash(
+            "Preveri klicni znak: podoben je " + ", ".join(possible_typos) + ".",
+            "warning",
+        )
     return redirect(participant_return_url(net_id))
 
 
@@ -1415,7 +1677,7 @@ def edit_participant(participant_id):
     participant = fetch_participant(participant_id)
     net = fetch_net(participant["net_id"])
     return_to = request.form.get("return_to") or request.args.get("return_to", "")
-    if net["status"] != "open" and g.user["role"] != "admin":
+    if not can_manage_participants(net):
         abort(403)
     if request.method == "POST":
         full_name = request.form.get("full_name", "").strip()
@@ -1465,7 +1727,7 @@ def edit_participant(participant_id):
 def delete_participant(participant_id):
     participant = fetch_participant(participant_id)
     net = fetch_net(participant["net_id"])
-    if net["status"] != "open" and g.user["role"] != "admin":
+    if not can_manage_participants(net):
         abort(403)
     db = get_db()
     db.execute("DELETE FROM participants WHERE id=?", (participant_id,))
@@ -1474,6 +1736,38 @@ def delete_participant(participant_id):
     audit("delete", "participant", participant_id, f"{participant['callsign']} – {participant['full_name']}")
     flash("Vnos je izbrisan.", "success")
     return redirect(participant_return_url(net["id"]))
+
+
+@app.post("/nets/<int:net_id>/participants/undo-last")
+@login_required
+def undo_last_participant(net_id):
+    net = fetch_net(net_id)
+    if not can_manage_participants(net) or net["status"] != "open":
+        abort(403)
+    db = get_db()
+    participant = db.execute(
+        """SELECT * FROM participants WHERE net_id=?
+           ORDER BY id DESC LIMIT 1""",
+        (net_id,),
+    ).fetchone()
+    if participant is None:
+        flash("V dnevniku še ni vnosa za razveljavitev.", "warning")
+        return redirect(url_for("net_detail", net_id=net_id))
+    db.execute("DELETE FROM participants WHERE id=?", (participant["id"],))
+    refresh_callsign_usage(db, participant["callsign"])
+    db.commit()
+    audit(
+        "undo",
+        "participant",
+        participant["id"],
+        f"{participant['callsign']} – {participant['full_name']}",
+    )
+    flash(
+        f"Razveljavljen zadnji vnos: {participant['callsign']} – "
+        f"{participant['full_name']}",
+        "success",
+    )
+    return redirect(url_for("net_detail", net_id=net_id))
 
 
 @app.post("/nets/<int:net_id>/delete")
@@ -1599,6 +1893,8 @@ def delete_closed_net(net_id):
 @login_required
 def close_net(net_id):
     net = fetch_net(net_id)
+    if not can_manage_participants(net):
+        abort(403)
     if net["status"] == "open":
         get_db().execute(
             "UPDATE nets SET status='closed', ended_at=? WHERE id=?", (now_db(), net_id)
@@ -1815,7 +2111,9 @@ def audit_log_view():
 @app.route("/backups")
 @admin_required
 def backups_view():
-    return render_template("backups.html", backups=list_backups())
+    return render_template(
+        "backups.html", backups=list_backups(), backup_state=backup_status()
+    )
 
 
 @app.post("/backups/create")
@@ -1827,8 +2125,56 @@ def create_backup_view():
         flash(f"Varnostne kopije ni bilo mogoče izdelati: {error}", "danger")
     else:
         audit("create", "backup", None, path.name)
-        flash("Nova varnostna kopija je izdelana in preverjena.", "success")
+        try:
+            mirrored = mirror_backup(path)
+        except (OSError, sqlite3.Error, RuntimeError) as error:
+            flash(
+                "Lokalna kopija je izdelana, druga kopija pa ni uspela: "
+                f"{error}",
+                "warning",
+            )
+        else:
+            message = "Nova varnostna kopija je izdelana in preverjena."
+            if mirrored:
+                message += " Preverjena je tudi druga kopija."
+            flash(message, "success")
     return redirect(url_for("backups_view"))
+
+
+@app.get("/system")
+@admin_required
+def system_status_view():
+    db = get_db()
+    try:
+        integrity = db.execute("PRAGMA quick_check").fetchone()[0]
+    except sqlite3.Error:
+        integrity = "error"
+    try:
+        database_size = Path(DB_PATH).stat().st_size
+    except OSError:
+        database_size = 0
+    counts = {
+        "nets": db.execute("SELECT COUNT(*) AS n FROM nets").fetchone()["n"],
+        "participants": db.execute(
+            "SELECT COUNT(*) AS n FROM participants"
+        ).fetchone()["n"],
+        "users": db.execute("SELECT COUNT(*) AS n FROM users").fetchone()["n"],
+        "pending_imports": db.execute(
+            "SELECT COUNT(*) AS n FROM csv_imports WHERE status='pending'"
+        ).fetchone()["n"],
+    }
+    return render_template(
+        "system_status.html",
+        backup_state=backup_status(),
+        database_integrity=integrity,
+        database_size=database_size,
+        schema_current=schema_version(db),
+        schema_latest=LATEST_SCHEMA_VERSION,
+        secure_cookie=app.config["SESSION_COOKIE_SECURE"],
+        trust_proxy=TRUST_PROXY,
+        trusted_proxy_networks=[str(network) for network in TRUSTED_PROXY_NETWORKS],
+        counts=counts,
+    )
 
 
 @app.get("/backups/<path:name>/download")
@@ -2157,6 +2503,15 @@ def fetch_csv_import(import_id, pending_only=False):
 @admin_required
 def csv_import_view():
     errors = []
+    db = get_db()
+    pending_cutoff = (now_local() - timedelta(hours=24)).strftime(
+        "%Y-%m-%d %H:%M:%S"
+    )
+    db.execute(
+        "DELETE FROM csv_imports WHERE status='pending' AND created_at<?",
+        (pending_cutoff,),
+    )
+    db.commit()
     if request.method == "POST":
         upload = request.files.get("csv_file")
         if upload is None or not upload.filename:
@@ -2166,7 +2521,6 @@ def csv_import_view():
         else:
             parsed, errors = parse_csv_import(upload)
             if not errors:
-                db = get_db()
                 db.execute(
                     "DELETE FROM csv_imports WHERE status='pending' AND created_by=?",
                     (g.user["id"],),
@@ -2266,6 +2620,10 @@ def confirm_csv_import(import_id):
         flash(f"Uvoz je ustavljen, ker varnostna kopija ni uspela: {error}", "danger")
         return redirect(url_for("csv_import_preview", import_id=import_id))
     audit("create", "backup", None, backup.name)
+    try:
+        mirror_backup(backup)
+    except (OSError, sqlite3.Error, RuntimeError):
+        pass
 
     db = get_db()
     created_net_ids = []
@@ -3026,8 +3384,10 @@ def new_user():
         else:
             try:
                 cur = get_db().execute(
-                    """INSERT INTO users(username, full_name, callsign, password_hash, role, active, created_at)
-                       VALUES (?, ?, ?, ?, ?, 1, ?)""",
+                    """INSERT INTO users
+                       (username, full_name, callsign, password_hash, role, active,
+                        must_change_password, created_at)
+                       VALUES (?, ?, ?, ?, ?, 1, 1, ?)""",
                     (username, full_name[:120], callsign[:24], generate_password_hash(password), role, now_db()),
                 )
                 get_db().commit()
@@ -3051,8 +3411,20 @@ def edit_user(user_id):
         role = request.form.get("role", "leader")
         active = 1 if request.form.get("active") == "1" else 0
         password = request.form.get("password", "")
+        removes_active_admin = (
+            edit_user_row["role"] == "admin"
+            and edit_user_row["active"]
+            and (role != "admin" or not active)
+        )
+        active_admin_count = get_db().execute(
+            "SELECT COUNT(*) AS n FROM users WHERE role='admin' AND active=1"
+        ).fetchone()["n"]
         if user_id == g.user["id"] and not active:
             flash("Svojega računa ne moreš onemogočiti.", "danger")
+        elif removes_active_admin and active_admin_count <= 1:
+            flash(
+                "V portalu mora ostati vsaj en aktiven administrator.", "danger"
+            )
         elif not full_name or not callsign or role not in {"admin", "leader"}:
             flash("Izpolni vsa zahtevana polja.", "danger")
         elif password and not valid_password(password):
@@ -3060,7 +3432,8 @@ def edit_user(user_id):
         else:
             if password:
                 get_db().execute(
-                    """UPDATE users SET full_name=?, callsign=?, role=?, active=?, password_hash=?
+                    """UPDATE users SET full_name=?, callsign=?, role=?, active=?,
+                       password_hash=?, must_change_password=1
                        WHERE id=?""",
                     (full_name[:120], callsign[:24], role, active, generate_password_hash(password), user_id),
                 )
@@ -3091,10 +3464,12 @@ def change_password():
             flash("Novi gesli se ne ujemata.", "danger")
         else:
             get_db().execute(
-                "UPDATE users SET password_hash=? WHERE id=?",
+                """UPDATE users SET password_hash=?, must_change_password=0
+                   WHERE id=?""",
                 (generate_password_hash(new), g.user["id"]),
             )
             get_db().commit()
+            session.permanent = True
             audit("password_change", "user", g.user["id"], g.user["username"])
             flash("Geslo je spremenjeno.", "success")
             return redirect(url_for("dashboard"))
@@ -3136,6 +3511,7 @@ def audit_action_si(value):
         "merge": "Združitev",
         "restore": "Obnovljeno",
         "import": "Uvoženo",
+        "undo": "Razveljavljeno",
     }.get(value, value)
 
 
@@ -3249,7 +3625,7 @@ TEMPLATES.update({
 "print_report.html": r'''{% extends "base.html" %}{% block title %}Poročilo skedov · {{ app_name }}{% endblock %}{% block content %}<div class="card print-report"><div class="actions no-print"><button class="btn btn-primary" onclick="window.print()">Shrani kot PDF / natisni</button><button class="btn btn-secondary" onclick="window.close()">Zapri</button></div><h1>Poročilo skedov Radiokluba Sevnica S50TTT</h1><p class="muted">Izdelano: {{ generated_at|datetime_si }}{% if filters['from_date'] %} · od {{ filters['from_date']|date_si }}{% endif %}{% if filters['to_date'] %} · do {{ filters['to_date']|date_si }}{% endif %}</p>{% if rows %}<div class="table-wrap"><table><thead><tr><th>Datum</th><th>Sked</th><th>Status</th><th>Operater</th><th>Prijavljeni</th></tr></thead><tbody>{% for row in rows %}<tr><td class="nowrap">{{ row['net_date']|date_si }}</td><td><b>{{ row['title'] }}</b><br>{{ row['started_at']|time_si }}{% if row['ended_at'] %}–{{ row['ended_at']|time_si }}{% endif %}</td><td>{{ 'Zaključen' if row['status']=='closed' else 'Odprt' }}</td><td>{{ row['leader_name'] }} ({{ row['leader_callsign'] }})</td><td>{{ row['participant_count'] }}</td></tr>{% endfor %}</tbody><tfoot><tr><th colspan="4">Skupaj</th><th>{{ rows|sum(attribute='participant_count') }}</th></tr></tfoot></table></div>{% else %}<p class="empty">Za izbrane filtre ni podatkov.</p>{% endif %}</div>{% endblock %}'''
 })
 
-TEMPLATES["backups.html"] = r'''{% extends "base.html" %}{% block title %}Varnostne kopije · {{ app_name }}{% endblock %}{% block content %}<div class="card"><div class="actions"><div><h1>Varnostne kopije</h1><p class="muted">Portal vsak dan izdela preverjeno kopijo SQLite baze in ohrani zadnjih 30 kopij.</p></div><form class="right" method="post" action="{{ url_for('create_backup_view') }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="btn btn-primary">Izdelaj kopijo zdaj</button></form></div></div><div class="card"><h2>Shranjene kopije: {{ backups|length }}</h2>{% if backups %}<div class="table-wrap"><table><thead><tr><th>Datoteka</th><th>Čas izdelave</th><th>Velikost</th><th></th></tr></thead><tbody>{% for backup in backups %}<tr><td><b>{{ backup['name'] }}</b>{% if backup['name'].startswith('auto-') %}<br><span class="muted">Samodejna</span>{% elif backup['name'].startswith('pre-restore-') %}<br><span class="muted">Pred obnovo</span>{% elif backup['name'].startswith('pre-import-') %}<br><span class="muted">Pred CSV-uvozom</span>{% else %}<br><span class="muted">Ročna</span>{% endif %}</td><td class="nowrap">{{ backup['modified_at']|datetime_si }}</td><td>{{ backup['size']|filesize_si }}</td><td><a class="btn btn-secondary btn-small" href="{{ url_for('download_backup',name=backup['name']) }}">Prenesi</a></td></tr>{% endfor %}</tbody></table></div>{% else %}<p class="empty">Varnostna kopija še ni bila izdelana.</p>{% endif %}</div><div class="card"><h2>Obnovitev baze</h2><div class="flash warning">Obnovitev namenoma ni mogoča med delovanjem portala. Najprej prenesi izbrano kopijo tudi na drugo napravo, nato portal in storitev za kopije ustavi ter uporabi dokumentirani ukaz na strežniku.</div><p class="muted">Pred obnovitvijo orodje preveri kopijo in samodejno izdela še varnostno kopijo trenutne baze.</p></div>{% endblock %}'''
+TEMPLATES["backups.html"] = r'''{% extends "base.html" %}{% block title %}Varnostne kopije · {{ app_name }}{% endblock %}{% block content %}<div class="card"><div class="actions"><div><h1>Varnostne kopije</h1><p class="muted">Portal ločeno ohranja preverjene dnevne, ročne in varnostne kopije.</p></div><form class="right" method="post" action="{{ url_for('create_backup_view') }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="btn btn-primary">Izdelaj kopijo zdaj</button></form></div></div><div class="card"><h2>Shranjene kopije: {{ backups|length }}</h2>{% if backups %}<div class="table-wrap"><table><thead><tr><th>Datoteka</th><th>Čas izdelave</th><th>Velikost</th><th></th></tr></thead><tbody>{% for backup in backups %}<tr><td><b>{{ backup['name'] }}</b>{% if backup['name'].startswith('auto-') %}<br><span class="muted">Samodejna</span>{% elif backup['name'].startswith('pre-restore-') %}<br><span class="muted">Pred obnovo</span>{% elif backup['name'].startswith('pre-import-') %}<br><span class="muted">Pred CSV-uvozom</span>{% else %}<br><span class="muted">Ročna</span>{% endif %}</td><td class="nowrap">{{ backup['modified_at']|datetime_si }}</td><td>{{ backup['size']|filesize_si }}</td><td><a class="btn btn-secondary btn-small" href="{{ url_for('download_backup',name=backup['name']) }}">Prenesi</a></td></tr>{% endfor %}</tbody></table></div>{% else %}<p class="empty">Varnostna kopija še ni bila izdelana.</p>{% endif %}</div><div class="card"><h2>Obnovitev baze</h2><div class="flash warning">Obnovitev namenoma ni mogoča med delovanjem portala. Najprej prenesi izbrano kopijo tudi na drugo napravo, nato portal in storitev za kopije ustavi ter uporabi dokumentirani ukaz na strežniku.</div><p class="muted">Pred obnovitvijo orodje preveri kopijo in samodejno izdela še varnostno kopijo trenutne baze.</p></div>{% endblock %}'''
 
 TEMPLATES["csv_import.html"] = r'''{% extends "base.html" %}{% block title %}CSV-uvoz skedov · {{ app_name }}{% endblock %}{% block content %}<div class="card"><div class="actions"><div><h1>Uvoz starejših skedov iz CSV</h1><p class="muted">Najprej se prikaže predogled. Do potrditve se podatkovna baza ne spremeni.</p></div><a class="btn btn-secondary right" href="{{ url_for('csv_import_template') }}">Prenesi CSV-predlogo</a></div>{% if errors %}<div class="flash danger"><b>Uvoz vsebuje napake in ni bil shranjen.</b></div><div class="table-wrap"><table><thead><tr><th>Vrstica</th><th>Napaka</th></tr></thead><tbody>{% for error in errors %}<tr><td>{{ error['line'] or '–' }}</td><td>{{ error['message'] }}</td></tr>{% endfor %}</tbody></table></div>{% endif %}<form method="post" enctype="multipart/form-data"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><div class="field"><label>CSV-datoteka</label><input type="file" name="csv_file" accept=".csv,text/csv" required><small class="muted">Največ 1 MB in 3000 vrstic; kodiranje UTF-8.</small></div><button class="btn btn-primary">Preveri in prikaži predogled</button></form></div><div class="card"><h2>Oblika datoteke</h2><p>Obvezni stolpci so <code>datum</code>, <code>zacetek</code>, <code>operater</code>, <code>klicni_znak</code> in <code>ime</code>. Dodatni stolpci so <code>konec</code>, <code>naslov</code>, <code>vrsta</code>, <code>prijava</code> in <code>opombe</code>.</p><ul><li>Vsak prijavljeni je v svoji vrstici.</li><li>Vrstice istega skeda morajo imeti enak datum, čas, naslov, operaterja in opombo.</li><li>Za sked brez prijavljenih pusti klicni znak in ime prazna.</li><li>Operater mora že obstajati med uporabniki portala; uporabi njegovo uporabniško ime ali klicni znak.</li><li>Vrsta je <code>sobotni</code>, <code>mesecni</code> ali <code>izredni</code>.</li></ul></div>{% endblock %}'''
 
@@ -3304,7 +3680,12 @@ TEMPLATES["base.html"] = TEMPLATES["base.html"].replace(
     r'''.report-filters{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;align-items:end}.report-filters .field{margin:0}.stats-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:14px}.stat{text-align:center}.stat span{display:block;color:#65717c}.stat strong{display:block;font-size:2rem;margin-top:5px}.stat .profile-date{font-size:1.25rem}.bar-chart{display:grid;gap:12px}.bar-row{display:grid;grid-template-columns:minmax(95px,1.2fr) minmax(110px,3fr) 42px minmax(62px,auto);gap:9px;align-items:center}.bar-track{height:13px;background:#e7edf2;border-radius:999px;overflow:hidden}.bar-track i{display:block;height:100%;min-width:2px;background:var(--blue);border-radius:999px}.bar-row small{color:#65717c}.audit-details{display:block;white-space:pre-wrap;overflow-wrap:anywhere;max-width:420px;margin-top:7px}.net-notes{white-space:pre-wrap;overflow-wrap:anywhere;line-height:1.55}.notes-preview{display:none}.print-report{max-width:none}@media(max-width:700px){.stats-grid{grid-template-columns:1fr 1fr}.bar-row{grid-template-columns:minmax(85px,1.3fr) minmax(80px,2fr) 34px}.bar-row>small{display:none}.report-filters{grid-template-columns:1fr}}@media print{.stats-grid{grid-template-columns:repeat(4,1fr)}.print-report table{font-size:10pt}.notes-preview{display:block}}</style>''',
 )
 
-app.jinja_loader = DictLoader(TEMPLATES)
+app.jinja_loader = ChoiceLoader(
+    [
+        FileSystemLoader(str(APP_ROOT / "templates")),
+        DictLoader(TEMPLATES),
+    ]
+)
 
 
 @app.context_processor

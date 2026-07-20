@@ -13,7 +13,7 @@ command -v docker >/dev/null 2>&1 || fail "Docker ni nameščen."
 docker compose version >/dev/null 2>&1 || fail "Docker Compose ni na voljo."
 
 cd "$APP_DIR"
-mkdir -p data backups
+mkdir -p data backups backups-offsite
 
 if [[ ! -f .env ]]; then
   SECRET_KEY="$(openssl rand -hex 32)"
@@ -26,6 +26,12 @@ BIND_IP=$BIND_IP
 TZ=Europe/Ljubljana
 DATABASE_PATH=/app/data/skedi.db
 SECRET_KEY=$SECRET_KEY
+SESSION_COOKIE_SECURE=1
+SESSION_HOURS=12
+TRUST_PROXY=1
+TRUSTED_PROXY_NETWORKS=
+OFFSITE_BACKUP_ENABLED=0
+OFFSITE_HOST_PATH=./backups-offsite
 ADMIN_USERNAME=S57ZM
 ADMIN_PASSWORD=$ADMIN_PASSWORD
 ADMIN_NAME=Marko Zidar
@@ -51,7 +57,7 @@ for _ in $(seq 1 30); do
     printf 'Uporabniško ime: S57ZM\n'
     if [[ -n "$ADMIN_PASSWORD" ]]; then
       printf 'Začetno geslo: %s\n' "$ADMIN_PASSWORD"
-      printf '\nPo prvi prijavi geslo spremeni v meniju Geslo.\n'
+      printf '\nPortal bo pred nadaljevanjem zahteval spremembo začetnega gesla.\n'
     else
       printf 'Geslo: uporabi svoje že nastavljeno geslo.\n'
     fi

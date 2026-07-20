@@ -7,11 +7,20 @@ services:
     env_file: .env
     environment:
       BACKUP_DIR: /app/backups
-      BACKUP_RETENTION: 30
-      TRUST_PROXY: 1
+      BACKUP_AUTO_RETENTION: 30
+      BACKUP_MANUAL_RETENTION: 10
+      BACKUP_SAFETY_RETENTION: 10
+      OFFSITE_BACKUP_ENABLED: "${OFFSITE_BACKUP_ENABLED:-0}"
+      OFFSITE_BACKUP_DIR: /app/offsite-backups
+      OFFSITE_BACKUP_RETENTION: 90
+      SESSION_COOKIE_SECURE: "${SESSION_COOKIE_SECURE:-1}"
+      SESSION_HOURS: "${SESSION_HOURS:-12}"
+      TRUST_PROXY: "${TRUST_PROXY:-1}"
+      TRUSTED_PROXY_NETWORKS: "${TRUSTED_PROXY_NETWORKS:-}"
     volumes:
       - ./data:/app/data
       - ./backups:/app/backups
+      - "${OFFSITE_HOST_PATH:-./backups-offsite}:/app/offsite-backups"
     ports:
       - "${BIND_IP:-0.0.0.0}:${PORT:-8023}:8000"
     healthcheck:
@@ -29,11 +38,17 @@ services:
     env_file: .env
     environment:
       BACKUP_DIR: /app/backups
-      BACKUP_RETENTION: 30
+      BACKUP_AUTO_RETENTION: 30
+      BACKUP_MANUAL_RETENTION: 10
+      BACKUP_SAFETY_RETENTION: 10
       BACKUP_INTERVAL_SECONDS: 86400
+      OFFSITE_BACKUP_ENABLED: "${OFFSITE_BACKUP_ENABLED:-0}"
+      OFFSITE_BACKUP_DIR: /app/offsite-backups
+      OFFSITE_BACKUP_RETENTION: 90
     volumes:
       - ./data:/app/data
       - ./backups:/app/backups
+      - "${OFFSITE_HOST_PATH:-./backups-offsite}:/app/offsite-backups"
     command: ["python", "backup.py", "schedule"]
     depends_on:
       skedi:

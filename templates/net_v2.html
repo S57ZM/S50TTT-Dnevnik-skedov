@@ -1,0 +1,112 @@
+{% extends "base.html" %}
+{% block title %}{{ net['title'] }} · {{ app_name }}{% endblock %}
+{% block content %}
+  <div class="card">
+    <div class="actions">
+      <div>
+        <span class="badge {{ net['status'] }}">{{ 'Odprt' if net['status'] == 'open' else 'Zaključen' }}</span>
+        {% if net['schedule_type'] %}<span class="badge leader">Redni sked</span>{% endif %}
+        <h1>{{ net['title'] }}</h1>
+        <p>
+          {{ net['net_date']|date_si }} · začetek {{ net['started_at']|time_si }}
+          {% if net['ended_at'] %} · konec {{ net['ended_at']|time_si }}{% endif %}
+          {% if net['control_callsign'] %}<br>Upravna postaja: <b>{{ net['control_callsign'] }}</b>{% endif %}
+          {% if net['repeater'] %}<br>Repetitor: <b>{{ net['repeater'] }}</b>{% endif %}
+          <br>Operater: <b>{{ net['leader_name'] }} ({{ net['leader_callsign'] }})</b>
+        </p>
+      </div>
+      <div class="actions right no-print">
+        <button class="btn btn-secondary" type="button" onclick="window.print()">🖨 Natisni / PDF</button>
+        {% if net['status'] == 'open' and can_manage_participants %}
+          {% if can_delete_net %}
+            <form method="post" action="{{ url_for('delete_net', net_id=net['id']) }}" onsubmit="return confirm('Izbrišem ta prazen odprt sked?')">
+              <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+              <button class="btn btn-danger">Izbriši prazen sked</button>
+            </form>
+          {% endif %}
+          <form method="post" action="{{ url_for('close_net', net_id=net['id']) }}" onsubmit="return confirm('Zaključim ta sked?')">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+            <button class="btn btn-success">✓ Zaključi sked</button>
+          </form>
+        {% elif net['status'] == 'closed' and g.user['role'] == 'admin' %}
+          <a class="btn btn-primary" href="{{ url_for('edit_net', net_id=net['id']) }}">Uredi podatke</a>
+          <form method="post" action="{{ url_for('reopen_net', net_id=net['id']) }}">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+            <button class="btn btn-secondary">Ponovno odpri</button>
+          </form>
+          <a class="btn btn-danger" href="{{ url_for('delete_closed_net', net_id=net['id']) }}">Izbriši sked</a>
+        {% endif %}
+      </div>
+    </div>
+  </div>
+
+  {% if net['notes'] or can_edit_notes %}
+    <div class="card">
+      <h2>Zapisnik / opombe skeda</h2>
+      {% if can_edit_notes %}
+        <form class="notes-editor no-print" method="post" action="{{ url_for('update_net_notes', net_id=net['id']) }}">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <textarea name="notes" maxlength="5000" placeholder="Obvestila kluba, tehnične težave, posebnosti skeda …">{{ net['notes'] or '' }}</textarea>
+          <div class="actions" style="margin-top:10px"><button class="btn btn-primary">Shrani zapisnik</button><span class="muted">Največ 5000 znakov</span></div>
+        </form>
+        {% if net['notes'] %}<div class="net-notes notes-preview">{{ net['notes'] }}</div>{% endif %}
+      {% else %}
+        <div class="net-notes">{{ net['notes'] }}</div>
+      {% endif %}
+    </div>
+  {% endif %}
+
+  {% if net['status'] == 'open' and can_manage_participants %}
+    <div class="card live-panel no-print">
+      <div class="actions">
+        <div><h2>Vodenje v živo</h2><p class="muted">Hiter vnos; kazalec se po osvežitvi samodejno vrne na klicni znak.</p></div>
+        {% if participants %}
+          <form class="right" method="post" action="{{ url_for('undo_last_participant', net_id=net['id']) }}" onsubmit="return confirm('Razveljavim zadnji dodani vnos?')">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+            <button class="btn btn-danger">↶ Razveljavi zadnji vnos</button>
+          </form>
+        {% endif %}
+      </div>
+      <form method="post" action="{{ url_for('add_participant', net_id=net['id']) }}">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <div class="grid">
+          <div class="field">
+            <label for="participant-callsign">Klicni znak</label>
+            <input id="participant-callsign" name="callsign" list="callsign-options" required autofocus autocomplete="off" style="text-transform:uppercase">
+            <datalist id="callsign-options">
+              {% for entry in directory_entries %}<option value="{{ entry['callsign'] }}" data-full-name="{{ entry['full_name'] }}">{{ entry['full_name'] }}</option>{% endfor %}
+            </datalist>
+            <small class="muted">Znani klicni znak samodejno izpolni ime.</small>
+          </div>
+          <div class="field"><label for="participant-full-name">Ime in priimek</label><input id="participant-full-name" name="full_name" required autocomplete="off"></div>
+          <div class="field"><label>Ura prijave</label><input type="time" name="checkin_time" value="{{ now.strftime('%H:%M') }}" required></div>
+        </div>
+        <button class="btn btn-primary">＋ Dodaj v dnevnik</button>
+      </form>
+      {% if recent_participants %}
+        <h3>Zadnjih {{ recent_participants|length }} vnosov</h3>
+        <div class="live-recent">
+          {% for p in recent_participants %}
+            <div class="live-entry"><span><b>{{ p['callsign'] }}</b> · {{ p['full_name'] }}</span><span>{{ p['checkin_at']|time_si }}</span></div>
+          {% endfor %}
+        </div>
+      {% endif %}
+    </div>
+  {% endif %}
+
+  <div class="card">
+    <h2>Prijavljeni: {{ participants|length }}</h2>
+    {% if participants %}
+      <div class="table-wrap"><table><thead><tr><th>Št.</th><th>Ura</th><th>Klicni znak</th><th>Ime in priimek</th><th class="no-print">Vnesel</th>{% if can_manage_participants %}<th class="no-print"></th>{% endif %}</tr></thead><tbody>
+        {% for p in participants %}
+          <tr>
+            <td>{{ loop.index }}</td><td class="nowrap">{{ p['checkin_at']|time_si }}</td><td><b>{{ p['callsign'] }}</b></td><td>{{ p['full_name'] }}</td><td class="no-print">{{ p['entered_by_name'] }}</td>
+            {% if can_manage_participants %}
+              <td class="no-print"><div class="actions"><a class="btn btn-secondary btn-small" href="{{ url_for('edit_participant', participant_id=p['id']) }}">Uredi</a><form method="post" action="{{ url_for('delete_participant', participant_id=p['id']) }}" onsubmit="return confirm('Izbrišem {{ p['callsign'] }}?')"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="btn btn-danger btn-small">Izbriši</button></form></div></td>
+            {% endif %}
+          </tr>
+        {% endfor %}
+      </tbody></table></div>
+    {% else %}<p class="empty">V tem skedu še ni prijavljenih.</p>{% endif %}
+  </div>
+{% endblock %}

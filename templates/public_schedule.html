@@ -1,0 +1,25 @@
+{% extends "base.html" %}
+{% block title %}Javni urnik · {{ app_name }}{% endblock %}
+{% block content %}
+  <div class="card public-hero">
+    <h1>📻 S50TTT · Javni urnik skedov</h1>
+    <p>Redni skedi Radiokluba Sevnica prek repetitorja S55USX na Sv. Roku.</p>
+    <div class="actions" style="justify-content:center">
+      <a class="btn btn-primary" href="{{ url_for('public_schedule_ics') }}">Dodaj v koledar (.ics)</a>
+      {% if not g.user %}<a class="btn btn-secondary" href="{{ url_for('login') }}">Prijava vodij</a>{% endif %}
+    </div>
+  </div>
+  <div class="grid">
+    {% for s in scheduled_nets %}
+      <div class="card schedule-box">
+        <span class="badge leader">{{ 'Mesečni' if s['schedule_type'] == 'monthly' else 'Sobotni' }}</span>
+        {% if s['exception_action'] == 'canceled' %}<span class="badge canceled">Odpovedan</span>{% elif s['exception_action'] == 'postponed' %}<span class="badge postponed">Prestavljen</span>{% endif %}
+        {% if s['existing_status'] %}<span class="badge {{ s['existing_status'] }}">{{ 'Odprt' if s['existing_status'] == 'open' else 'Zaključen' }}</span>{% endif %}
+        <h2>{{ s['label'] }}</h2>
+        <p><b>{{ s['date']|date_si }} ob {{ s['time'] }}</b><br>Upravna postaja: S50TTT{% if s['repeater'] %}<br>Repetitor: {{ s['repeater'] }}{% endif %}</p>
+        {% if s['exception_action'] == 'postponed' %}<p class="exception-note">Prvotni termin: {{ s['original_date']|date_si }} ob {{ s['original_time'] }}<br>Razlog: {{ s['exception_reason'] }}</p>{% elif s['exception_action'] == 'canceled' %}<p class="exception-note">Razlog odpovedi: {{ s['exception_reason'] }}</p>{% else %}<p class="muted">{{ s['rule'] }}</p>{% endif %}
+        {% if s['existing_id'] %}<p><b>{{ s['participant_count'] }}</b> prijavljenih v dnevniku</p>{% endif %}
+      </div>
+    {% endfor %}
+  </div>
+{% endblock %}

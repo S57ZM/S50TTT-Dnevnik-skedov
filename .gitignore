@@ -4,6 +4,10 @@
 .initial-alpha-admin-password
 data/
 data-alpha/
+backups/
+backups-alpha/
+backups-offsite/
+backups-alpha-offsite/
 __pycache__/
 *.pyc
 .docker-config/

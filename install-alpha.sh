@@ -13,7 +13,7 @@ command -v docker >/dev/null 2>&1 || fail "Docker ni nameščen."
 docker compose version >/dev/null 2>&1 || fail "Docker Compose ni na voljo."
 
 cd "$APP_DIR"
-mkdir -p data-alpha backups-alpha
+mkdir -p data-alpha backups-alpha backups-alpha-offsite
 
 if [[ ! -f .env.alpha ]]; then
   SECRET_KEY="$(openssl rand -hex 32)"
@@ -27,6 +27,12 @@ TZ=Europe/Ljubljana
 DATABASE_PATH=/app/data/skedi-alpha.db
 SECRET_KEY=$SECRET_KEY
 RELEASE_CHANNEL=alpha
+SESSION_COOKIE_SECURE=0
+SESSION_HOURS=12
+TRUST_PROXY=0
+TRUSTED_PROXY_NETWORKS=
+OFFSITE_BACKUP_ENABLED=0
+OFFSITE_HOST_PATH=./backups-alpha-offsite
 ADMIN_USERNAME=S57ZM
 ADMIN_PASSWORD=$ADMIN_PASSWORD
 ADMIN_NAME=Marko Zidar
@@ -54,6 +60,7 @@ for _ in $(seq 1 30); do
     printf 'Uporabniško ime: S57ZM\n'
     if [[ -n "$ADMIN_PASSWORD" ]]; then
       printf 'Začetno alpha geslo: %s\n' "$ADMIN_PASSWORD"
+      printf 'Portal bo pred nadaljevanjem zahteval izbiro novega gesla.\n'
     else
       printf 'Geslo: uporabi že nastavljeno alpha geslo.\n'
     fi

@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="sl">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="theme-color" content="#145da0">
+  <title>{% block title %}{{ app_name }}{% endblock %}</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='app.css') }}">
+  <script defer src="{{ url_for('static', filename='app.js') }}"></script>
+</head>
+<body>
+  {% if release_channel == 'alpha' %}
+    <div class="alpha-banner">⚠ ALPHA TESTNA RAZLIČICA · podatki niso produkcijski</div>
+  {% endif %}
+
+  {% if g.user %}
+    <header>
+      <nav class="nav" aria-label="Glavna navigacija">
+        <a class="brand" href="{{ url_for('dashboard') }}">📻 S50TTT Skedi</a>
+        <button class="nav-toggle" type="button" data-nav-toggle
+                aria-expanded="false" aria-controls="main-nav-links">
+          ☰ Meni
+        </button>
+        <div class="nav-links" id="main-nav-links" data-nav-links>
+          <a href="{{ url_for('dashboard') }}">Domov</a>
+          <a href="{{ url_for('archive') }}">Arhiv</a>
+          <a href="{{ url_for('callsigns') }}">Imenik</a>
+          <a href="{{ url_for('statistics') }}">Statistika</a>
+          <a href="{{ url_for('public_schedule') }}">Javni urnik</a>
+          {% if g.user['role'] == 'admin' %}
+            <a href="{{ url_for('users') }}">Uporabniki</a>
+            <a href="{{ url_for('audit_log_view') }}">Revizija</a>
+            <a href="{{ url_for('security_view') }}">Varnost</a>
+            <a href="{{ url_for('backups_view') }}">Kopije</a>
+            <a href="{{ url_for('csv_import_view') }}">Uvoz</a>
+            <a href="{{ url_for('system_status_view') }}">Sistem</a>
+          {% endif %}
+          <span class="user">{{ g.user['full_name'] }} · {{ g.user['callsign'] }}</span>
+          <a href="{{ url_for('change_password') }}">Geslo</a>
+          <form class="inline" method="post" action="{{ url_for('logout') }}">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+            <button class="link-button">Odjava</button>
+          </form>
+        </div>
+      </nav>
+    </header>
+  {% endif %}
+
+  <main>
+    {% with msgs = get_flashed_messages(with_categories=true) %}
+      {% for category, msg in msgs %}
+        <div class="flash {{ category }}" role="status">{{ msg }}</div>
+      {% endfor %}
+    {% endwith %}
+    {% block content %}{% endblock %}
+  </main>
+
+  <footer class="footer">
+    {{ app_name }} · različica {{ app_version }}
+    · <a href="{{ url_for('public_schedule') }}">javni urnik</a>
+  </footer>
+</body>
+</html>

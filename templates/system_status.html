@@ -1,0 +1,32 @@
+{% extends "base.html" %}
+{% block title %}Stanje sistema · {{ app_name }}{% endblock %}
+{% block content %}
+  <div class="card">
+    <h1>Stanje sistema</h1>
+    <p class="muted">Hiter pregled pripravljenosti portala, baze in varnostnih kopij.</p>
+  </div>
+  <div class="stats-grid">
+    <div class="card stat"><span>Različica</span><strong class="profile-date">{{ app_version }}</strong></div>
+    <div class="card stat"><span>Shema baze</span><strong>{{ schema_current }}/{{ schema_latest }}</strong></div>
+    <div class="card stat"><span>Skedi</span><strong>{{ counts['nets'] }}</strong></div>
+    <div class="card stat"><span>Prijave</span><strong>{{ counts['participants'] }}</strong></div>
+  </div>
+  <div class="grid">
+    <div class="card">
+      <h2>Podatkovna baza</h2>
+      <p>Hitro preverjanje: <b class="{{ 'status-ok' if database_integrity == 'ok' else 'status-warning' }}">{{ 'OK' if database_integrity == 'ok' else 'NAPAKA' }}</b></p>
+      <p>Velikost: <b>{{ database_size|filesize_si }}</b><br>Uporabniki: <b>{{ counts['users'] }}</b><br>Čakajoči CSV-uvozi: <b>{{ counts['pending_imports'] }}</b></p>
+    </div>
+    <div class="card">
+      <h2>Varnostne kopije</h2>
+      <p>Zadnja dnevna: <b>{{ backup_state['latest_auto']['modified_at']|datetime_si if backup_state['latest_auto'] else 'manjka' }}</b><br>Stanje: <b class="{{ 'status-warning' if backup_state['automatic_stale'] else 'status-ok' }}">{{ 'PREVERI' if backup_state['automatic_stale'] else 'OK' }}</b><br>Druga lokacija: <b>{{ 'vključena' if backup_state['offsite_enabled'] else 'ni vključena' }}</b></p>
+      <a class="btn btn-secondary" href="{{ url_for('backups_view') }}">Odpri kopije</a>
+    </div>
+    <div class="card">
+      <h2>Varnost povezave</h2>
+      <p>Secure cookie: <b class="{{ 'status-ok' if secure_cookie else 'status-warning' }}">{{ 'vključen' if secure_cookie else 'izključen' }}</b><br>Povratni posrednik: <b>{{ 'zaupan en posrednik' if trust_proxy else 'neposredna povezava' }}</b>{% if trusted_proxy_networks %}<br>Dovoljene mreže: <b>{{ trusted_proxy_networks|join(', ') }}</b>{% endif %}</p>
+      {% if release_channel == 'stable' and not secure_cookie %}<div class="flash warning">V produkciji vključi <code>SESSION_COOKIE_SECURE=1</code>.</div>{% endif %}
+      {% if trust_proxy and not trusted_proxy_networks %}<div class="flash warning">Posrednik še ni omejen na dovoljeno mrežo. Nastavi <code>TRUSTED_PROXY_NETWORKS</code>, ko preveriš naslov omrežja Nginx Proxy Managerja.</div>{% endif %}
+    </div>
+  </div>
+{% endblock %}

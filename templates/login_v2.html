@@ -1,0 +1,71 @@
+{% extends "base.html" %}
+{% block title %}Prijava · {{ app_name }}{% endblock %}
+{% block content %}
+  <div class="card login">
+    <h1>📻 S50TTT</h1>
+    <h2>Dnevnik skedov</h2>
+    <p class="muted">Prijava za vodje skeda</p>
+    <form method="post">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <div class="field">
+        <label for="username">Uporabniško ime</label>
+        <input id="username" name="username" autocomplete="username" required autofocus>
+      </div>
+      <div class="field">
+        <label for="password">Geslo</label>
+        <input id="password" type="password" name="password" autocomplete="current-password" required>
+      </div>
+      <button class="btn btn-primary" type="submit">Prijava</button>
+    </form>
+  </div>
+
+  <div class="actions login-public-links">
+    <a class="btn btn-secondary" href="{{ url_for('public_schedule') }}">Javni urnik skedov</a>
+    <a class="btn btn-secondary" href="{{ url_for('public_schedule_ics') }}">Dodaj v koledar</a>
+  </div>
+
+  <div class="card countdown-card login-schedule"
+       data-countdown="{{ countdown_net['starts_at_iso'] }}">
+    <p class="muted">Do naslednjega rednega skeda</p>
+    <div class="countdown-value" data-countdown-value>Izračunavam …</div>
+    <p>
+      <b>{{ countdown_net['label'] }}</b><br>
+      {{ countdown_net['date']|date_si }} ob {{ countdown_net['time'] }}
+      {% if countdown_net['repeater'] %} · {{ countdown_net['repeater'] }}{% endif %}
+    </p>
+    {% if countdown_net['exception_action'] == 'postponed' %}
+      <p class="exception-login">
+        Prestavljen s {{ countdown_net['original_date']|date_si }}.
+        Razlog: {{ countdown_net['exception_reason'] }}
+      </p>
+    {% endif %}
+    <div class="login-stats">
+      <div class="login-stat">
+        <span>Redni sobotni sked</span>
+        <strong>št. {{ next_saturday['sequence_number'] }}</strong>
+        <small>
+          {{ next_saturday['date']|date_si }} ob {{ next_saturday['time'] }}<br>
+          {{ next_saturday['repeater'] }}
+        </small>
+      </div>
+      <div class="login-stat" data-participant-count="{{ saturday_participant_count }}">
+        <span>Prijavljenih</span>
+        <strong>{{ saturday_participant_count }}</strong>
+        <small>v dnevniku tega skeda</small>
+      </div>
+    </div>
+    {% if recent_saturdays %}
+      <p class="login-history-title">Zadnja zaključena sobotna skeda</p>
+      <div class="login-stats">
+        {% for saturday in recent_saturdays %}
+          <div class="login-stat" data-history-count="{{ saturday['participant_count'] }}">
+            <span>Sobotni sked</span>
+            <strong>št. {{ saturday['sequence_number'] }}</strong>
+            <span class="login-history-count">{{ saturday['participant_count'] }} prijavljenih</span>
+            <small>{{ saturday['net_date']|date_si }}</small>
+          </div>
+        {% endfor %}
+      </div>
+    {% endif %}
+  </div>
+{% endblock %}

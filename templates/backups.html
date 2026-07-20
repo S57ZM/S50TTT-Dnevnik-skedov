@@ -1,0 +1,53 @@
+{% extends "base.html" %}
+{% block title %}Varnostne kopije · {{ app_name }}{% endblock %}
+{% block content %}
+  <div class="card">
+    <div class="actions">
+      <div>
+        <h1>Varnostne kopije</h1>
+        <p class="muted">Dnevne, ročne in varnostne kopije imajo ločene omejitve hrambe.</p>
+      </div>
+      <form class="right" method="post" action="{{ url_for('create_backup_view') }}">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <button class="btn btn-primary">Izdelaj kopijo zdaj</button>
+      </form>
+    </div>
+  </div>
+
+  <div class="stats-grid">
+    <div class="card stat"><span>Lokalne kopije</span><strong>{{ backup_state['local_count'] }}</strong></div>
+    <div class="card stat"><span>Zadnja dnevna</span><strong class="profile-date">{{ backup_state['latest_auto']['modified_at']|datetime_si if backup_state['latest_auto'] else 'Manjka' }}</strong></div>
+    <div class="card stat"><span>Druga lokacija</span><strong class="profile-date">{{ 'Vključena' if backup_state['offsite_enabled'] else 'Ni vključena' }}</strong></div>
+    <div class="card stat"><span>Kopije drugje</span><strong>{{ backup_state['offsite_count'] }}</strong></div>
+  </div>
+
+  {% if backup_state['automatic_stale'] %}
+    <div class="flash warning">Samodejna dnevna kopija manjka ali je starejša od 26 ur. Preveri storitev za kopije.</div>
+  {% endif %}
+  {% if not backup_state['offsite_enabled'] %}
+    <div class="flash warning">Druga lokacija ni vključena. Za zaščito ob okvari diska nastavi <code>OFFSITE_BACKUP_ENABLED=1</code> in priklopi NAS ali drug disk.</div>
+  {% endif %}
+
+  <div class="card">
+    <h2>Shranjene kopije: {{ backups|length }}</h2>
+    {% if backups %}
+      <div class="table-wrap"><table><thead><tr><th>Datoteka</th><th>Vrsta</th><th>Čas izdelave</th><th>Velikost</th><th></th></tr></thead><tbody>
+        {% for backup in backups %}
+          <tr>
+            <td><b>{{ backup['name'] }}</b></td>
+            <td>{% if backup['name'].startswith('auto-') %}Dnevna{% elif backup['name'].startswith('pre-restore-') %}Pred obnovo{% elif backup['name'].startswith('pre-import-') %}Pred CSV-uvozom{% else %}Ročna{% endif %}</td>
+            <td class="nowrap">{{ backup['modified_at']|datetime_si }}</td>
+            <td>{{ backup['size']|filesize_si }}</td>
+            <td><a class="btn btn-secondary btn-small" href="{{ url_for('download_backup', name=backup['name']) }}">Prenesi</a></td>
+          </tr>
+        {% endfor %}
+      </tbody></table></div>
+    {% else %}<p class="empty">Varnostna kopija še ni bila izdelana.</p>{% endif %}
+  </div>
+
+  <div class="card">
+    <h2>Obnovitev baze</h2>
+    <div class="flash warning">Obnovitev ni mogoča med delovanjem portala. Najprej prenesi kopijo na drugo napravo, nato ustavi portal in uporabi dokumentirani ukaz na strežniku.</div>
+    <p class="muted">Pred obnovitvijo se kopija preveri in izdela še varnostna kopija trenutne baze.</p>
+  </div>
+{% endblock %}

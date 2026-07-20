@@ -8,6 +8,9 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY app.py .
 COPY backup.py .
+COPY migrations.py .
+COPY templates ./templates
+COPY static ./static
 COPY tests ./tests
 
 EXPOSE 8000

@@ -7,6 +7,8 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
 
+from werkzeug.security import generate_password_hash as werkzeug_generate_password_hash
+
 
 TEST_DATA = tempfile.TemporaryDirectory()
 os.environ["DATABASE_PATH"] = os.path.join(TEST_DATA.name, "test-skedi.db")
@@ -21,6 +23,7 @@ from app import (  # noqa: E402
     SCHEDULE_SATURDAY,
     app as flask_app,
     get_db,
+    init_db,
     next_effective_countdown_net,
     next_effective_saturday_net,
     next_countdown_net,
@@ -32,10 +35,50 @@ from app import (  # noqa: E402
     saturday_start_time,
     scheduled_net_for_date,
 )
+import app as app_module  # noqa: E402
 import backup as backup_tools  # noqa: E402
 
 
+BASELINE_DATABASE = Path(os.environ["DATABASE_PATH"])
+FAST_TEST_PASSWORD_HASH = werkzeug_generate_password_hash(
+    "test-password-123", method="pbkdf2:sha256:1000"
+)
+
+
 class ScheduleTests(unittest.TestCase):
+    def setUp(self):
+        self.test_data = tempfile.TemporaryDirectory()
+        database_path = Path(self.test_data.name) / "test-skedi.db"
+        backup_directory = Path(self.test_data.name) / "backups"
+        with sqlite3.connect(BASELINE_DATABASE) as source, sqlite3.connect(
+            database_path
+        ) as target:
+            source.backup(target)
+        app_module.DB_PATH = str(database_path)
+        backup_tools.DATABASE_PATH = database_path
+        backup_tools.BACKUP_DIR = backup_directory
+        backup_tools.OFFSITE_BACKUP_DIR = None
+        self.password_patcher = patch(
+            "app.generate_password_hash",
+            lambda password: werkzeug_generate_password_hash(
+                password, method="pbkdf2:sha256:1000"
+            ),
+        )
+        self.password_patcher.start()
+        os.environ["DATABASE_PATH"] = str(database_path)
+        os.environ["BACKUP_DIR"] = str(backup_directory)
+        flask_app.config.update(TESTING=True, SESSION_COOKIE_SECURE=False)
+        with flask_app.app_context():
+            get_db().execute(
+                """UPDATE users SET must_change_password=0, password_hash=?""",
+                (FAST_TEST_PASSWORD_HASH,),
+            )
+            get_db().commit()
+
+    def tearDown(self):
+        self.password_patcher.stop()
+        self.test_data.cleanup()
+
     def create_open_net(self, title):
         with flask_app.app_context():
             db = get_db()
@@ -334,7 +377,7 @@ class ScheduleTests(unittest.TestCase):
 
     def test_alpha_channel_has_visible_warning(self):
         with patch("app.RELEASE_CHANNEL", "alpha"), patch(
-            "app.APP_VERSION", "1.20.0-alpha"
+            "app.APP_VERSION", "1.21.0-alpha"
         ):
             response = flask_app.test_client().get("/login")
             health_response = flask_app.test_client().get("/health")
@@ -342,7 +385,7 @@ class ScheduleTests(unittest.TestCase):
         html = response.get_data(as_text=True)
         self.assertIn("ALPHA TESTNA RAZLIČICA", html)
         self.assertIn("podatki niso produkcijski", html)
-        self.assertIn("različica 1.20.0-alpha", html)
+        self.assertIn("različica 1.21.0-alpha", html)
         self.assertEqual(health_response.get_json()["channel"], "alpha")
 
     def test_login_shows_countdown_and_next_saturday_number(self):
@@ -579,7 +622,13 @@ class ScheduleTests(unittest.TestCase):
             )
             self.assertNotIn("Na voljo od petka", dashboard_html)
             self.assertNotIn("Za predčasno odprtje", dashboard_html)
-            self.assertIn("Ti si pravi Heker", dashboard_html)
+            script_response = client.get("/static/app.js")
+            try:
+                self.assertIn(
+                    "Ti si pravi Heker", script_response.get_data(as_text=True)
+                )
+            finally:
+                script_response.close()
 
             locked_response = client.post(
                 "/nets/new",
@@ -1606,6 +1655,253 @@ class ScheduleTests(unittest.TestCase):
         leader_client = self.authenticated_client(leader_id)
         self.assertEqual(leader_client.get("/audit").status_code, 403)
         self.assertEqual(leader_client.get("/reports/export.csv").status_code, 403)
+
+    def test_only_net_owner_or_admin_can_manage_an_open_net(self):
+        with flask_app.app_context():
+            db = get_db()
+            for username, callsign in (("owner", "S50OWN"), ("other", "S50OTH")):
+                db.execute(
+                    """INSERT INTO users
+                       (username, full_name, callsign, password_hash, role,
+                        active, created_at)
+                       VALUES (?, ?, ?, 'not-used', 'leader', 1, ?)""",
+                    (username, username.title(), callsign, now_db()),
+                )
+            owner_id = db.execute(
+                "SELECT id FROM users WHERE username='owner'"
+            ).fetchone()["id"]
+            other_id = db.execute(
+                "SELECT id FROM users WHERE username='other'"
+            ).fetchone()["id"]
+            net_id = db.execute(
+                """INSERT INTO nets
+                   (title, net_date, started_at, status, leader_id, created_at)
+                   VALUES ('Lastniški sked', '2042-01-04',
+                           '2042-01-04 20:00:00', 'open', ?, ?)""",
+                (owner_id, now_db()),
+            ).lastrowid
+            db.commit()
+
+        other = self.authenticated_client(other_id)
+        denied_add = other.post(
+            f"/nets/{net_id}/participants",
+            data={
+                "csrf_token": "test-csrf-token",
+                "callsign": "S51DEN",
+                "full_name": "Nedovoljeni vnos",
+                "checkin_time": "20:05",
+            },
+        )
+        denied_close = other.post(
+            f"/nets/{net_id}/close", data={"csrf_token": "test-csrf-token"}
+        )
+        self.assertEqual(denied_add.status_code, 403)
+        self.assertEqual(denied_close.status_code, 403)
+
+        owner = self.authenticated_client(owner_id)
+        allowed = owner.post(
+            f"/nets/{net_id}/participants",
+            data={
+                "csrf_token": "test-csrf-token",
+                "callsign": "S51YES",
+                "full_name": "Dovoljeni vnos",
+                "checkin_time": "20:05",
+            },
+        )
+        self.assertEqual(allowed.status_code, 302)
+
+    def test_last_active_admin_cannot_be_demoted(self):
+        with flask_app.app_context():
+            admin = get_db().execute(
+                "SELECT * FROM users WHERE role='admin' AND active=1 LIMIT 1"
+            ).fetchone()
+            admin_id = admin["id"]
+        client = self.authenticated_client(admin_id)
+        response = client.post(
+            f"/users/{admin_id}/edit",
+            data={
+                "csrf_token": "test-csrf-token",
+                "full_name": admin["full_name"],
+                "callsign": admin["callsign"],
+                "role": "leader",
+                "active": "1",
+                "password": "",
+            },
+            follow_redirects=True,
+        )
+        self.assertIn("vsaj en aktiven administrator", response.get_data(as_text=True))
+        with flask_app.app_context():
+            role = get_db().execute(
+                "SELECT role FROM users WHERE id=?", (admin_id,)
+            ).fetchone()["role"]
+            self.assertEqual(role, "admin")
+
+    def test_new_user_must_change_temporary_password(self):
+        with flask_app.app_context():
+            admin_id = get_db().execute(
+                "SELECT id FROM users WHERE role='admin' LIMIT 1"
+            ).fetchone()["id"]
+        admin = self.authenticated_client(admin_id)
+        created = admin.post(
+            "/users/new",
+            data={
+                "csrf_token": "test-csrf-token",
+                "username": "temporary-user",
+                "full_name": "Začasni Uporabnik",
+                "callsign": "S50TMP",
+                "role": "leader",
+                "password": "temporary-pass-123",
+            },
+        )
+        self.assertEqual(created.status_code, 302)
+        with flask_app.app_context():
+            user = get_db().execute(
+                "SELECT * FROM users WHERE username='temporary-user'"
+            ).fetchone()
+            self.assertEqual(user["must_change_password"], 1)
+        response = self.authenticated_client(user["id"]).get("/")
+        self.assertEqual(response.status_code, 302)
+        self.assertTrue(response.headers["Location"].endswith("/change-password"))
+
+    def test_public_schedule_and_calendar_are_available_without_login(self):
+        client = flask_app.test_client()
+        schedule = client.get("/urnik")
+        calendar = client.get("/urnik.ics")
+        self.assertEqual(schedule.status_code, 200)
+        self.assertIn("Javni urnik skedov", schedule.get_data(as_text=True))
+        self.assertEqual(calendar.status_code, 200)
+        self.assertIn("text/calendar", calendar.content_type)
+        self.assertIn("BEGIN:VCALENDAR", calendar.get_data(as_text=True))
+        self.assertIn("S50TTT", calendar.get_data(as_text=True))
+
+    def test_owner_can_undo_last_participant(self):
+        net_id, admin_id = self.create_open_net("Razveljavitev prijave")
+        client = self.authenticated_client(admin_id)
+        client.post(
+            f"/nets/{net_id}/participants",
+            data={
+                "csrf_token": "test-csrf-token",
+                "callsign": "S50UNDO",
+                "full_name": "Zadnji Vnos",
+                "checkin_time": "20:10",
+            },
+        )
+        response = client.post(
+            f"/nets/{net_id}/participants/undo-last",
+            data={"csrf_token": "test-csrf-token"},
+        )
+        self.assertEqual(response.status_code, 302)
+        with flask_app.app_context():
+            db = get_db()
+            count = db.execute(
+                "SELECT COUNT(*) AS n FROM participants WHERE net_id=?", (net_id,)
+            ).fetchone()["n"]
+            audit_row = db.execute(
+                """SELECT id FROM audit_log WHERE action='undo'
+                   AND entity_type='participant' ORDER BY id DESC LIMIT 1"""
+            ).fetchone()
+            self.assertEqual(count, 0)
+            self.assertIsNotNone(audit_row)
+
+    def test_similar_callsign_produces_non_blocking_warning(self):
+        net_id, admin_id = self.create_open_net("Opozorilo klicnega znaka")
+        with flask_app.app_context():
+            db = get_db()
+            db.execute(
+                """INSERT INTO callsign_directory
+                   (callsign, full_name, active, use_count, created_by, created_at)
+                   VALUES ('S57ZM', 'Znani Operater', 1, 0, ?, ?)""",
+                (admin_id, now_db()),
+            )
+            db.commit()
+        response = self.authenticated_client(admin_id).post(
+            f"/nets/{net_id}/participants",
+            data={
+                "csrf_token": "test-csrf-token",
+                "callsign": "S57ZN",
+                "full_name": "Možen tipkarski vnos",
+                "checkin_time": "20:10",
+            },
+            follow_redirects=True,
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("podoben je S57ZM", response.get_data(as_text=True))
+
+    def test_health_and_security_headers_report_real_state(self):
+        response = flask_app.test_client().get("/health")
+        payload = response.get_json()
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(payload["database"], "ok")
+        self.assertEqual(payload["schema_version"], payload["schema_latest"])
+        self.assertEqual(response.headers["X-Content-Type-Options"], "nosniff")
+        self.assertIn("default-src", response.headers["Content-Security-Policy"])
+
+    def test_backup_retention_is_separate_by_kind(self):
+        backup_tools.BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+        names = [
+            "auto-skedi-20260101-000000-000001.sqlite3",
+            "auto-skedi-20260102-000000-000001.sqlite3",
+            "auto-skedi-20260103-000000-000001.sqlite3",
+            "manual-skedi-20260101-000000-000001.sqlite3",
+            "manual-skedi-20260102-000000-000001.sqlite3",
+            "pre-import-skedi-20260101-000000-000001.sqlite3",
+            "pre-restore-skedi-20260102-000000-000001.sqlite3",
+        ]
+        for index, name in enumerate(names):
+            path = backup_tools.BACKUP_DIR / name
+            path.write_bytes(b"test")
+            os.utime(path, (index + 1, index + 1))
+        with patch("backup.BACKUP_AUTO_RETENTION", 2), patch(
+            "backup.BACKUP_MANUAL_RETENTION", 1
+        ), patch("backup.BACKUP_SAFETY_RETENTION", 1):
+            backup_tools.prune_backups()
+        remaining = [item["name"] for item in backup_tools.list_backups()]
+        self.assertEqual(sum(name.startswith("auto-") for name in remaining), 2)
+        self.assertEqual(sum(name.startswith("manual-") for name in remaining), 1)
+        self.assertEqual(
+            sum(name.startswith(("pre-import-", "pre-restore-")) for name in remaining),
+            1,
+        )
+
+    def test_versioned_migration_preserves_an_existing_installation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            old_database = Path(directory) / "old-skedi.db"
+            with sqlite3.connect(old_database) as db:
+                db.executescript(
+                    """CREATE TABLE users (
+                           id INTEGER PRIMARY KEY AUTOINCREMENT,
+                           username TEXT NOT NULL UNIQUE COLLATE NOCASE,
+                           full_name TEXT NOT NULL,
+                           callsign TEXT NOT NULL COLLATE NOCASE,
+                           password_hash TEXT NOT NULL,
+                           role TEXT NOT NULL,
+                           active INTEGER NOT NULL DEFAULT 1,
+                           created_at TEXT NOT NULL
+                       );
+                       INSERT INTO users
+                           (username, full_name, callsign, password_hash,
+                            role, active, created_at)
+                       VALUES ('existing-admin', 'Obstoječi Administrator',
+                               'S50OLD', 'old-hash', 'admin', 1,
+                               '2025-01-01 12:00:00');"""
+                )
+            with patch("app.DB_PATH", str(old_database)):
+                with flask_app.app_context():
+                    init_db()
+                    db = get_db()
+                    columns = {
+                        row["name"] for row in db.execute("PRAGMA table_info(users)")
+                    }
+                    existing = db.execute(
+                        "SELECT * FROM users WHERE username='existing-admin'"
+                    ).fetchone()
+                    version = db.execute(
+                        "SELECT MAX(version) AS n FROM schema_migrations"
+                    ).fetchone()["n"]
+            self.assertIn("must_change_password", columns)
+            self.assertEqual(existing["callsign"], "S50OLD")
+            self.assertEqual(existing["must_change_password"], 0)
+            self.assertEqual(version, 1)
 
 
 if __name__ == "__main__":
