@@ -5,9 +5,36 @@
     const toggle = document.querySelector("[data-nav-toggle]");
     const links = document.querySelector("[data-nav-links]");
     if (!toggle || !links) return;
-    toggle.addEventListener("click", function () {
-      const open = links.classList.toggle("open");
+
+    const icon = toggle.querySelector("[data-nav-icon]");
+    const label = toggle.querySelector("[data-nav-label]");
+
+    function setOpen(open) {
+      links.classList.toggle("open", open);
       toggle.setAttribute("aria-expanded", String(open));
+      toggle.setAttribute("aria-label", open ? "Zapri glavni meni" : "Odpri glavni meni");
+      if (icon) icon.textContent = open ? "×" : "☰";
+      if (label) label.textContent = open ? "Zapri" : "Meni";
+    }
+
+    toggle.addEventListener("click", function () {
+      setOpen(!links.classList.contains("open"));
+    });
+
+    links.addEventListener("click", function (event) {
+      if (event.target.closest("a, button")) setOpen(false);
+    });
+
+    document.addEventListener("click", function (event) {
+      if (!links.classList.contains("open")) return;
+      if (!links.contains(event.target) && !toggle.contains(event.target)) setOpen(false);
+    });
+
+    document.addEventListener("keydown", function (event) {
+      if (event.key === "Escape" && links.classList.contains("open")) {
+        setOpen(false);
+        toggle.focus();
+      }
     });
   }
 

@@ -10,37 +10,55 @@
 </head>
 <body>
   {% if release_channel == 'alpha' %}
-    <div class="alpha-banner">⚠ ALPHA TESTNA RAZLIČICA · podatki niso produkcijski</div>
+    <div class="alpha-banner" role="status">
+      <span aria-hidden="true">⚠</span>
+      <strong>ALPHA · testno okolje</strong>
+      <span class="alpha-banner-note">Podatki niso produkcijski</span>
+    </div>
   {% endif %}
 
   {% if g.user %}
-    <header>
+    <header class="site-header">
       <nav class="nav" aria-label="Glavna navigacija">
-        <a class="brand" href="{{ url_for('dashboard') }}">📻 S50TTT Skedi</a>
+        <a class="brand" href="{{ url_for('dashboard') }}">
+          <span class="brand-mark" aria-hidden="true">📻</span>
+          <span><strong>S50TTT</strong><small>Dnevnik skedov</small></span>
+        </a>
         <button class="nav-toggle" type="button" data-nav-toggle
-                aria-expanded="false" aria-controls="main-nav-links">
-          ☰ Meni
+                aria-expanded="false" aria-controls="main-nav-links"
+                aria-label="Odpri glavni meni">
+          <span data-nav-icon aria-hidden="true">☰</span>
+          <span data-nav-label>Meni</span>
         </button>
         <div class="nav-links" id="main-nav-links" data-nav-links>
-          <a href="{{ url_for('dashboard') }}">Domov</a>
-          <a href="{{ url_for('archive') }}">Arhiv</a>
-          <a href="{{ url_for('callsigns') }}">Imenik</a>
-          <a href="{{ url_for('statistics') }}">Statistika</a>
-          <a href="{{ url_for('public_schedule') }}">Javni urnik</a>
+          <div class="nav-group">
+            <span class="nav-group-title">Portal</span>
+            <a href="{{ url_for('dashboard') }}" {% if request.endpoint == 'dashboard' %}class="active" aria-current="page"{% endif %}>Domov</a>
+            <a href="{{ url_for('archive') }}" {% if request.endpoint == 'archive' %}class="active" aria-current="page"{% endif %}>Arhiv</a>
+            <a href="{{ url_for('callsigns') }}" {% if request.endpoint == 'callsigns' %}class="active" aria-current="page"{% endif %}>Imenik</a>
+            <a href="{{ url_for('statistics') }}" {% if request.endpoint == 'statistics' %}class="active" aria-current="page"{% endif %}>Statistika</a>
+            <a href="{{ url_for('public_schedule') }}" {% if request.endpoint == 'public_schedule' %}class="active" aria-current="page"{% endif %}>Javni urnik</a>
+          </div>
           {% if g.user['role'] == 'admin' %}
-            <a href="{{ url_for('users') }}">Uporabniki</a>
-            <a href="{{ url_for('audit_log_view') }}">Revizija</a>
-            <a href="{{ url_for('security_view') }}">Varnost</a>
-            <a href="{{ url_for('backups_view') }}">Kopije</a>
-            <a href="{{ url_for('csv_import_view') }}">Uvoz</a>
-            <a href="{{ url_for('system_status_view') }}">Sistem</a>
+            <div class="nav-group nav-admin-group">
+              <span class="nav-group-title">Upravljanje</span>
+              <a href="{{ url_for('users') }}" {% if request.endpoint == 'users' %}class="active" aria-current="page"{% endif %}>Uporabniki</a>
+              <a href="{{ url_for('audit_log_view') }}" {% if request.endpoint == 'audit_log_view' %}class="active" aria-current="page"{% endif %}>Revizija</a>
+              <a href="{{ url_for('security_view') }}" {% if request.endpoint == 'security_view' %}class="active" aria-current="page"{% endif %}>Varnost</a>
+              <a href="{{ url_for('backups_view') }}" {% if request.endpoint == 'backups_view' %}class="active" aria-current="page"{% endif %}>Kopije</a>
+              <a href="{{ url_for('csv_import_view') }}" {% if request.endpoint == 'csv_import_view' %}class="active" aria-current="page"{% endif %}>Uvoz</a>
+              <a href="{{ url_for('system_status_view') }}" {% if request.endpoint == 'system_status_view' %}class="active" aria-current="page"{% endif %}>Sistem</a>
+            </div>
           {% endif %}
-          <span class="user">{{ g.user['full_name'] }} · {{ g.user['callsign'] }}</span>
-          <a href="{{ url_for('change_password') }}">Geslo</a>
-          <form class="inline" method="post" action="{{ url_for('logout') }}">
-            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-            <button class="link-button">Odjava</button>
-          </form>
+          <div class="nav-group nav-account-group">
+            <span class="nav-group-title">Račun</span>
+            <span class="user"><b>{{ g.user['full_name'] }}</b><small>{{ g.user['callsign'] }}</small></span>
+            <a href="{{ url_for('change_password') }}" {% if request.endpoint == 'change_password' %}class="active" aria-current="page"{% endif %}>Spremeni geslo</a>
+            <form class="inline" method="post" action="{{ url_for('logout') }}">
+              <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+              <button class="link-button">Odjava</button>
+            </form>
+          </div>
         </div>
       </nav>
     </header>

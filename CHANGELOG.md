@@ -1,5 +1,14 @@
 # Zgodovina različic
 
+## 1.22.0-alpha
+
+- prenovljen in bolje kontrasten mobilni meni;
+- navigacija je razdeljena na portal, upravljanje in uporabniški račun;
+- trenutna stran je v meniju jasno označena;
+- meni se zapre ob izbiri, pritisku Escape ali pritisku izven menija;
+- osvežene kartice, gumbi, obrazci, tabele in mobilni razmiki;
+- kompaktnejša oznaka testnega okolja.
+
 ## 1.21.0-alpha
 
 - operater in administrator sta edina, ki lahko spreminjata ali zaključita odprt sked;

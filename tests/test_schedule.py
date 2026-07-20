@@ -377,16 +377,31 @@ class ScheduleTests(unittest.TestCase):
 
     def test_alpha_channel_has_visible_warning(self):
         with patch("app.RELEASE_CHANNEL", "alpha"), patch(
-            "app.APP_VERSION", "1.21.0-alpha"
+            "app.APP_VERSION", "1.22.0-alpha"
         ):
             response = flask_app.test_client().get("/login")
             health_response = flask_app.test_client().get("/health")
 
         html = response.get_data(as_text=True)
-        self.assertIn("ALPHA TESTNA RAZLIČICA", html)
-        self.assertIn("podatki niso produkcijski", html)
-        self.assertIn("različica 1.21.0-alpha", html)
+        self.assertIn("ALPHA · testno okolje", html)
+        self.assertIn("Podatki niso produkcijski", html)
+        self.assertIn("različica 1.22.0-alpha", html)
         self.assertEqual(health_response.get_json()["channel"], "alpha")
+
+    def test_authenticated_navigation_is_grouped_and_marks_current_page(self):
+        with flask_app.app_context():
+            admin_id = get_db().execute(
+                "SELECT id FROM users WHERE role='admin' ORDER BY id LIMIT 1"
+            ).fetchone()["id"]
+
+        response = self.authenticated_client(admin_id).get("/")
+        html = response.get_data(as_text=True)
+
+        self.assertIn('<span class="nav-group-title">Portal</span>', html)
+        self.assertIn('<span class="nav-group-title">Upravljanje</span>', html)
+        self.assertIn('<span class="nav-group-title">Račun</span>', html)
+        self.assertIn('class="active" aria-current="page">Domov</a>', html)
+        self.assertIn('aria-label="Odpri glavni meni"', html)
 
     def test_login_shows_countdown_and_next_saturday_number(self):
         displayed_saturday = next(
