@@ -155,6 +155,10 @@ p { margin-top: .65em; margin-bottom: 1em; }
 .alpha-banner-note::before { content: "· "; }
 label { display: block; font-weight: 700; margin: 0 0 6px; }
 .field { margin-bottom: 14px; }
+.form-wide { max-width: 900px; }
+.form-medium { max-width: 680px; }
+.callsign-input { text-transform: uppercase; }
+.checkbox-input { width: auto; }
 input, select, textarea {
   width: 100%;
   min-height: 44px;
@@ -248,6 +252,23 @@ tr:last-child td { border-bottom: 0; }
 .live-entry { display: flex; justify-content: space-between; gap: 12px; padding: 10px 12px; border-radius: 9px; background: var(--light); }
 .status-ok { color: #075f34; }
 .status-warning { color: #8a5700; }
+.status-danger { color: #9f1c14; }
+.status-unavailable { color: #687782; }
+.system-updated { color: var(--muted); font-size: .88rem; }
+.system-metrics { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 14px; }
+.metric-card { display: flex; flex-direction: column; min-height: 168px; }
+.metric-heading { display: flex; align-items: center; justify-content: space-between; gap: 10px; color: var(--muted); font-weight: 750; }
+.metric-card strong { display: block; margin: 12px 0 8px; font-size: clamp(1.35rem, 3vw, 1.85rem); }
+.metric-card small { margin-top: auto; }
+.metric-dot { width: 11px; height: 11px; flex: 0 0 11px; border-radius: 50%; background: #8a98a3; box-shadow: 0 0 0 4px #8a98a31c; }
+.metric-dot.status-ok { background: #1a9b58; box-shadow: 0 0 0 4px #1a9b581c; }
+.metric-dot.status-warning { background: #d68910; box-shadow: 0 0 0 4px #d689101f; }
+.metric-dot.status-danger { background: #d13b2f; box-shadow: 0 0 0 4px #d13b2f1f; }
+.metric-dot.status-unavailable { background: #8a98a3; }
+.metric-card progress { width: 100%; height: 10px; margin: 0 0 9px; overflow: hidden; border: 0; border-radius: 999px; background: #e5ebef; accent-color: var(--blue); }
+.metric-card progress::-webkit-progress-bar { background: #e5ebef; border-radius: 999px; }
+.metric-card progress::-webkit-progress-value { background: var(--blue); border-radius: 999px; }
+.metric-card progress::-moz-progress-bar { background: var(--blue); border-radius: 999px; }
 .public-hero { text-align: center; max-width: 760px; margin-left: auto; margin-right: auto; }
 
 @media (min-width: 701px) {

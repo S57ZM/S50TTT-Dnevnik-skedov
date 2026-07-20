@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
+umask 077
 
 APP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PORT="${PORT:-8023}"
@@ -14,6 +15,7 @@ docker compose version >/dev/null 2>&1 || fail "Docker Compose ni na voljo."
 
 cd "$APP_DIR"
 mkdir -p data backups backups-offsite
+chmod 700 data backups backups-offsite
 
 if [[ ! -f .env ]]; then
   SECRET_KEY="$(openssl rand -hex 32)"
@@ -27,9 +29,12 @@ TZ=Europe/Ljubljana
 DATABASE_PATH=/app/data/skedi.db
 SECRET_KEY=$SECRET_KEY
 SESSION_COOKIE_SECURE=1
+SESSION_COOKIE_NAME=s50ttt_session
 SESSION_HOURS=12
+SESSION_ABSOLUTE_HOURS=24
 TRUST_PROXY=1
 TRUSTED_PROXY_NETWORKS=
+TRUSTED_HOSTS=skedi.s57zm.eu,localhost,127.0.0.1
 OFFSITE_BACKUP_ENABLED=0
 OFFSITE_HOST_PATH=./backups-offsite
 ADMIN_USERNAME=S57ZM

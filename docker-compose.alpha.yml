@@ -6,6 +6,13 @@ services:
     container_name: s50ttt-skedi-alpha
     restart: unless-stopped
     user: "${PUID}:${PGID}"
+    read_only: true
+    init: true
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    pids_limit: 128
+    tmpfs:
+      - /tmp:size=32m,mode=1777
     env_file: .env.alpha
     environment:
       RELEASE_CHANNEL: alpha
@@ -17,8 +24,11 @@ services:
       OFFSITE_BACKUP_DIR: /app/offsite-backups
       OFFSITE_BACKUP_RETENTION: 90
       SESSION_COOKIE_SECURE: "${SESSION_COOKIE_SECURE:-0}"
+      SESSION_COOKIE_NAME: "${SESSION_COOKIE_NAME:-s50ttt_alpha_session}"
       SESSION_HOURS: "${SESSION_HOURS:-12}"
+      SESSION_ABSOLUTE_HOURS: "${SESSION_ABSOLUTE_HOURS:-24}"
       TRUST_PROXY: 0
+      TRUSTED_HOSTS: "${TRUSTED_HOSTS:-}"
     volumes:
       - ./data-alpha:/app/data
       - ./backups-alpha:/app/backups
@@ -37,6 +47,13 @@ services:
     container_name: s50ttt-skedi-alpha-backup
     restart: unless-stopped
     user: "${PUID}:${PGID}"
+    read_only: true
+    init: true
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    pids_limit: 64
+    tmpfs:
+      - /tmp:size=16m,mode=1777
     env_file: .env.alpha
     environment:
       RELEASE_CHANNEL: alpha

@@ -6,7 +6,7 @@ Stare namestitve so pred uvedbo te datoteke stolpce dodajale neposredno v
 """
 
 
-LATEST_SCHEMA_VERSION = 1
+LATEST_SCHEMA_VERSION = 2
 
 
 def _column_names(db, table):
@@ -25,8 +25,16 @@ def _migration_1(db):
     )
 
 
+def _migration_2(db):
+    if "auth_version" not in _column_names(db, "users"):
+        db.execute(
+            "ALTER TABLE users ADD COLUMN auth_version INTEGER NOT NULL DEFAULT 0"
+        )
+
+
 MIGRATIONS = {
     1: _migration_1,
+    2: _migration_2,
 }
 
 

@@ -9,11 +9,11 @@
       <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
       <div class="field">
         <label for="username">Uporabniško ime</label>
-        <input id="username" name="username" autocomplete="username" required autofocus>
+        <input id="username" name="username" autocomplete="username" maxlength="120" required autofocus>
       </div>
       <div class="field">
         <label for="password">Geslo</label>
-        <input id="password" type="password" name="password" autocomplete="current-password" required>
+        <input id="password" type="password" name="password" autocomplete="current-password" maxlength="128" required>
       </div>
       <button class="btn btn-primary" type="submit">Prijava</button>
     </form>

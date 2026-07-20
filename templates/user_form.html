@@ -5,18 +5,18 @@
     <form method="post">
       <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
       {% if not edit_user %}
-        <div class="field"><label>Uporabniško ime</label><input name="username" required autocomplete="off"></div>
+        <div class="field"><label>Uporabniško ime</label><input name="username" required maxlength="120" autocomplete="off"></div>
       {% else %}
         <p>Uporabniško ime: <b>{{ edit_user['username'] }}</b></p>
       {% endif %}
       <div class="grid">
-        <div class="field"><label>Ime in priimek</label><input name="full_name" value="{{ edit_user['full_name'] if edit_user else '' }}" required></div>
-        <div class="field"><label>Klicni znak</label><input name="callsign" value="{{ edit_user['callsign'] if edit_user else '' }}" required style="text-transform:uppercase"></div>
+        <div class="field"><label>Ime in priimek</label><input name="full_name" value="{{ edit_user['full_name'] if edit_user else '' }}" required maxlength="120"></div>
+        <div class="field"><label>Klicni znak</label><input name="callsign" value="{{ edit_user['callsign'] if edit_user else '' }}" required minlength="2" maxlength="24" pattern="[A-Za-z0-9][A-Za-z0-9/-]{0,22}[A-Za-z0-9]" class="callsign-input"></div>
         <div class="field"><label>Vloga</label><select name="role"><option value="leader" {% if edit_user and edit_user['role'] == 'leader' %}selected{% endif %}>Vodja skeda</option><option value="admin" {% if edit_user and edit_user['role'] == 'admin' %}selected{% endif %}>Administrator</option></select></div>
       </div>
       <div class="field">
-        <label>{{ 'Novo začasno geslo (pusti prazno, če ga ne spreminjaš)' if edit_user else 'Začasno geslo (najmanj 10 znakov)' }}</label>
-        <input type="password" name="password" {% if not edit_user %}required{% endif %} autocomplete="new-password">
+        <label>{{ 'Novo začasno geslo (pusti prazno, če ga ne spreminjaš)' if edit_user else 'Začasno geslo (15–128 znakov)' }}</label>
+        <input type="password" name="password" minlength="15" maxlength="128" {% if not edit_user %}required{% endif %} autocomplete="new-password">
         <small class="muted">Po prijavi bo uporabnik moral izbrati svoje novo geslo.</small>
       </div>
       {% if edit_user %}<div class="field"><label><input style="width:auto" type="checkbox" name="active" value="1" {% if edit_user['active'] %}checked{% endif %}> Aktiven uporabnik</label></div>{% endif %}

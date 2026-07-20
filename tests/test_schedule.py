@@ -2,6 +2,7 @@ import io
 import os
 import sqlite3
 import tempfile
+import time
 import unittest
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -15,6 +16,7 @@ os.environ["DATABASE_PATH"] = os.path.join(TEST_DATA.name, "test-skedi.db")
 os.environ["BACKUP_DIR"] = os.path.join(TEST_DATA.name, "backups")
 os.environ["ADMIN_PASSWORD"] = "test-password-123"
 os.environ["SECRET_KEY"] = "test-secret-key"
+os.environ["RELEASE_CHANNEL"] = "alpha"
 
 from app import (  # noqa: E402
     APP_VERSION,
@@ -120,8 +122,14 @@ class ScheduleTests(unittest.TestCase):
 
     def authenticated_client(self, user_id):
         client = flask_app.test_client()
+        with flask_app.app_context():
+            auth_version = get_db().execute(
+                "SELECT auth_version FROM users WHERE id=?", (user_id,)
+            ).fetchone()["auth_version"]
         with client.session_transaction() as session:
             session["user_id"] = user_id
+            session["auth_version"] = auth_version
+            session["authenticated_at"] = int(time.time())
             session["csrf_token"] = "test-csrf-token"
         return client
 
@@ -377,7 +385,7 @@ class ScheduleTests(unittest.TestCase):
 
     def test_alpha_channel_has_visible_warning(self):
         with patch("app.RELEASE_CHANNEL", "alpha"), patch(
-            "app.APP_VERSION", "1.22.0-alpha"
+            "app.APP_VERSION", "1.23.0-alpha"
         ):
             response = flask_app.test_client().get("/login")
             health_response = flask_app.test_client().get("/health")
@@ -385,7 +393,7 @@ class ScheduleTests(unittest.TestCase):
         html = response.get_data(as_text=True)
         self.assertIn("ALPHA · testno okolje", html)
         self.assertIn("Podatki niso produkcijski", html)
-        self.assertIn("različica 1.22.0-alpha", html)
+        self.assertIn("različica 1.23.0-alpha", html)
         self.assertEqual(health_response.get_json()["channel"], "alpha")
 
     def test_authenticated_navigation_is_grouped_and_marks_current_page(self):
@@ -1849,7 +1857,120 @@ class ScheduleTests(unittest.TestCase):
         self.assertEqual(payload["database"], "ok")
         self.assertEqual(payload["schema_version"], payload["schema_latest"])
         self.assertEqual(response.headers["X-Content-Type-Options"], "nosniff")
-        self.assertIn("default-src", response.headers["Content-Security-Policy"])
+        csp = response.headers["Content-Security-Policy"]
+        self.assertIn("default-src", csp)
+        self.assertIn("script-src 'self'", csp)
+        self.assertNotIn("script-src 'self' 'unsafe-inline'", csp)
+        self.assertEqual(response.headers["X-Frame-Options"], "DENY")
+
+    def test_untrusted_host_is_rejected(self):
+        previous_hosts = flask_app.config.get("TRUSTED_HOSTS")
+        flask_app.config["TRUSTED_HOSTS"] = ["localhost", "127.0.0.1"]
+        try:
+            response = flask_app.test_client().get(
+                "/health", headers={"Host": "napadalec.example"}
+            )
+        finally:
+            flask_app.config["TRUSTED_HOSTS"] = previous_hosts
+        self.assertEqual(response.status_code, 400)
+
+    def test_absolute_session_lifetime_is_enforced(self):
+        with flask_app.app_context():
+            admin_id = get_db().execute(
+                "SELECT id FROM users WHERE role='admin' ORDER BY id LIMIT 1"
+            ).fetchone()["id"]
+        client = self.authenticated_client(admin_id)
+        with client.session_transaction() as session:
+            session["authenticated_at"] = int(
+                time.time() - app_module.SESSION_ABSOLUTE_SECONDS - 1
+            )
+        response = client.get("/")
+        self.assertEqual(response.status_code, 302)
+        self.assertIn("/login", response.headers["Location"])
+
+    def test_invalid_callsign_is_rejected_and_not_rendered_as_inline_script(self):
+        net_id, admin_id = self.create_open_net("Varnostni test klicnega znaka")
+        client = self.authenticated_client(admin_id)
+        response = client.post(
+            f"/nets/{net_id}/participants",
+            data={
+                "csrf_token": "test-csrf-token",
+                "callsign": "S57X');alert(1)//",
+                "full_name": "Neveljaven vnos",
+                "checkin_time": "20:05",
+            },
+            follow_redirects=True,
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("lahko vsebuje samo", response.get_data(as_text=True))
+        self.assertNotIn("onsubmit=", response.get_data(as_text=True))
+        with flask_app.app_context():
+            count = get_db().execute(
+                "SELECT COUNT(*) AS n FROM participants WHERE net_id=?", (net_id,)
+            ).fetchone()["n"]
+        self.assertEqual(count, 0)
+
+    def test_login_rejects_ambiguous_external_next_target(self):
+        with flask_app.app_context():
+            username = get_db().execute(
+                "SELECT username FROM users WHERE role='admin' ORDER BY id LIMIT 1"
+            ).fetchone()["username"]
+        client = flask_app.test_client()
+        client.get("/login")
+        with client.session_transaction() as session:
+            csrf_token = session["csrf_token"]
+        response = client.post(
+            "/login?next=/\\evil.example",
+            data={
+                "csrf_token": csrf_token,
+                "username": username,
+                "password": "test-password-123",
+            },
+        )
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(response.headers["Location"], "/")
+
+    def test_password_change_revokes_other_sessions(self):
+        with flask_app.app_context():
+            admin_id = get_db().execute(
+                "SELECT id FROM users WHERE role='admin' ORDER BY id LIMIT 1"
+            ).fetchone()["id"]
+        current_client = self.authenticated_client(admin_id)
+        other_client = self.authenticated_client(admin_id)
+        response = current_client.post(
+            "/change-password",
+            data={
+                "csrf_token": "test-csrf-token",
+                "current_password": "test-password-123",
+                "new_password": "novo-varno-geslo-123",
+                "confirm_password": "novo-varno-geslo-123",
+            },
+        )
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(current_client.get("/").status_code, 200)
+        revoked = other_client.get("/")
+        self.assertEqual(revoked.status_code, 302)
+        self.assertIn("/login", revoked.headers["Location"])
+
+    def test_system_metrics_are_admin_only_and_do_not_expose_paths(self):
+        self.assertEqual(flask_app.test_client().get("/system/metrics").status_code, 302)
+        with flask_app.app_context():
+            admin_id = get_db().execute(
+                "SELECT id FROM users WHERE role='admin' ORDER BY id LIMIT 1"
+            ).fetchone()["id"]
+        client = self.authenticated_client(admin_id)
+        response = client.get("/system/metrics")
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        for field in (
+            "temperature_c", "disk_free_bytes", "memory_used_percent",
+            "load_1m", "uptime_seconds", "checked_at",
+        ):
+            self.assertIn(field, payload)
+        self.assertNotIn("temperature_path", payload)
+        page = client.get("/system")
+        self.assertEqual(page.status_code, 200)
+        self.assertIn("data-system-metrics", page.get_data(as_text=True))
 
     def test_backup_retention_is_separate_by_kind(self):
         backup_tools.BACKUP_DIR.mkdir(parents=True, exist_ok=True)
@@ -1914,9 +2035,11 @@ class ScheduleTests(unittest.TestCase):
                         "SELECT MAX(version) AS n FROM schema_migrations"
                     ).fetchone()["n"]
             self.assertIn("must_change_password", columns)
+            self.assertIn("auth_version", columns)
             self.assertEqual(existing["callsign"], "S50OLD")
             self.assertEqual(existing["must_change_password"], 0)
-            self.assertEqual(version, 1)
+            self.assertEqual(existing["auth_version"], 0)
+            self.assertEqual(version, 2)
 
 
 if __name__ == "__main__":

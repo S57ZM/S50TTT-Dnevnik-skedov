@@ -5,12 +5,16 @@ import ipaddress
 import io
 import json
 import os
+import re
 import secrets
+import shutil
 import sqlite3
+import time
 import unicodedata
 from datetime import date, datetime, timedelta, timezone
 from functools import wraps
 from pathlib import Path
+from urllib.parse import unquote, urlsplit
 from zoneinfo import ZoneInfo
 
 from flask import (
@@ -33,7 +37,7 @@ from migrations import LATEST_SCHEMA_VERSION, run_migrations, schema_version
 
 
 APP_NAME = "S50TTT Dnevnik skedov"
-BASE_VERSION = "1.22.0"
+BASE_VERSION = "1.23.0"
 RELEASE_CHANNEL = os.environ.get("RELEASE_CHANNEL", "stable").strip().lower()
 if RELEASE_CHANNEL not in {"stable", "alpha"}:
     RELEASE_CHANNEL = "stable"
@@ -48,6 +52,14 @@ for proxy_network in os.environ.get("TRUSTED_PROXY_NETWORKS", "").split(","):
     proxy_network = proxy_network.strip()
     if proxy_network:
         TRUSTED_PROXY_NETWORKS.append(ipaddress.ip_network(proxy_network, strict=False))
+TRUSTED_HOSTS = [
+    host.strip()
+    for host in os.environ.get(
+        "TRUSTED_HOSTS",
+        "skedi.s57zm.eu,localhost,127.0.0.1" if RELEASE_CHANNEL == "stable" else "",
+    ).split(",")
+    if host.strip()
+]
 SCHEDULE_MONTHLY = "monthly"
 SCHEDULE_SATURDAY = "saturday"
 SCHEDULE_TYPES = {SCHEDULE_MONTHLY, SCHEDULE_SATURDAY}
@@ -56,6 +68,9 @@ LOGIN_MAX_FAILURES = 5
 LOGIN_LOCK_MINUTES = 15
 LOGIN_IP_MAX_FAILURES = 20
 LOGIN_ATTEMPT_RETENTION = 5000
+PASSWORD_MIN_LENGTH = 15
+PASSWORD_MAX_LENGTH = 128
+CALLSIGN_PATTERN = re.compile(r"^[A-Z0-9](?:[A-Z0-9/-]{0,22}[A-Z0-9])?$")
 DUMMY_PASSWORD_HASH = generate_password_hash(secrets.token_urlsafe(32))
 
 APP_ROOT = Path(__file__).resolve().parent
@@ -63,8 +78,17 @@ app = Flask(__name__)
 secret_key = os.environ.get("SECRET_KEY", "").strip()
 if not secret_key:
     raise RuntimeError("SECRET_KEY mora biti nastavljen.")
+if RELEASE_CHANNEL == "stable" and (
+    len(secret_key) < 32 or secret_key == "replace-with-a-long-random-value"
+):
+    raise RuntimeError("SECRET_KEY mora biti naključen in dolg najmanj 32 znakov.")
 app.secret_key = secret_key
 app.config.update(
+    SESSION_COOKIE_NAME=os.environ.get(
+        "SESSION_COOKIE_NAME",
+        "s50ttt_session" if RELEASE_CHANNEL == "stable" else "s50ttt_alpha_session",
+    ).strip(),
+    SESSION_COOKIE_PATH="/",
     SESSION_COOKIE_HTTPONLY=True,
     SESSION_COOKIE_SAMESITE="Lax",
     SESSION_COOKIE_SECURE=os.environ.get(
@@ -76,6 +100,10 @@ app.config.update(
     ),
     SESSION_REFRESH_EACH_REQUEST=True,
     MAX_CONTENT_LENGTH=1024 * 1024,
+    TRUSTED_HOSTS=TRUSTED_HOSTS or None,
+)
+SESSION_ABSOLUTE_SECONDS = max(
+    3600, int(os.environ.get("SESSION_ABSOLUTE_HOURS", "24")) * 3600
 )
 
 
@@ -84,7 +112,7 @@ class TrustedProxyFix:
 
     def __init__(self, wrapped_app, trusted_networks):
         self.direct_app = wrapped_app
-        self.proxy_app = ProxyFix(wrapped_app, x_for=1, x_proto=1, x_host=1)
+        self.proxy_app = ProxyFix(wrapped_app, x_for=1, x_proto=1)
         self.trusted_networks = trusted_networks
 
     def __call__(self, environ, start_response):
@@ -101,7 +129,10 @@ if TRUST_PROXY:
     if TRUSTED_PROXY_NETWORKS:
         app.wsgi_app = TrustedProxyFix(app.wsgi_app, TRUSTED_PROXY_NETWORKS)
     else:
-        app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
+        app.logger.warning(
+            "TRUST_PROXY je vključen brez TRUSTED_PROXY_NETWORKS; "
+            "posredovane glave bodo zaradi varnosti prezrte."
+        )
 
 
 def now_local():
@@ -110,6 +141,139 @@ def now_local():
 
 def now_db():
     return now_local().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def normalize_callsign(value):
+    return re.sub(r"\s+", "", str(value or "")).upper()
+
+
+def valid_callsign(value):
+    return bool(
+        2 <= len(value) <= 24
+        and CALLSIGN_PATTERN.fullmatch(value)
+        and "//" not in value
+        and "--" not in value
+        and "/-" not in value
+        and "-/" not in value
+    )
+
+
+def safe_local_redirect(target):
+    """Dovoli samo nedvoumne absolutne poti znotraj portala."""
+    if not target or any(ord(character) < 32 for character in target):
+        return False
+    decoded = target
+    for _ in range(2):
+        decoded = unquote(decoded)
+    parsed = urlsplit(decoded)
+    if (
+        not decoded.startswith("/")
+        or decoded.startswith("//")
+        or "\\" in decoded
+        or parsed.scheme
+        or parsed.netloc
+    ):
+        return False
+    return True
+
+
+def metric_status(value, warning_at, danger_at):
+    if value is None:
+        return "unavailable"
+    if value >= danger_at:
+        return "danger"
+    if value >= warning_at:
+        return "warning"
+    return "ok"
+
+
+def collect_system_metrics():
+    """Preberi omejen nabor gostiteljskih meritev brez izvajanja ukazov."""
+    metrics = {
+        "checked_at": now_db(),
+        "temperature_c": None,
+        "temperature_status": "unavailable",
+        "disk_total_bytes": None,
+        "disk_used_bytes": None,
+        "disk_free_bytes": None,
+        "disk_used_percent": None,
+        "disk_status": "unavailable",
+        "memory_total_bytes": None,
+        "memory_used_bytes": None,
+        "memory_available_bytes": None,
+        "memory_used_percent": None,
+        "memory_status": "unavailable",
+        "load_1m": None,
+        "cpu_count": os.cpu_count() or 1,
+        "load_percent": None,
+        "load_status": "unavailable",
+        "uptime_seconds": None,
+    }
+
+    temperature_path = Path(
+        os.environ.get(
+            "CPU_TEMPERATURE_PATH", "/sys/class/thermal/thermal_zone0/temp"
+        )
+    )
+    try:
+        temperature = float(temperature_path.read_text(encoding="ascii").strip())
+        if temperature > 1000:
+            temperature /= 1000
+        metrics["temperature_c"] = round(temperature, 1)
+        metrics["temperature_status"] = metric_status(temperature, 70, 80)
+    except (OSError, ValueError):
+        pass
+
+    try:
+        usage = shutil.disk_usage(Path(DB_PATH).parent)
+        disk_percent = usage.used * 100 / usage.total if usage.total else 0
+        metrics.update(
+            disk_total_bytes=usage.total,
+            disk_used_bytes=usage.used,
+            disk_free_bytes=usage.free,
+            disk_used_percent=round(disk_percent, 1),
+            disk_status=metric_status(disk_percent, 80, 90),
+        )
+    except OSError:
+        pass
+
+    try:
+        memory_values = {}
+        for line in Path("/proc/meminfo").read_text(encoding="ascii").splitlines():
+            key, separator, raw_value = line.partition(":")
+            if separator:
+                memory_values[key] = int(raw_value.strip().split()[0]) * 1024
+        memory_total = memory_values["MemTotal"]
+        memory_available = memory_values["MemAvailable"]
+        memory_used = max(0, memory_total - memory_available)
+        memory_percent = memory_used * 100 / memory_total if memory_total else 0
+        metrics.update(
+            memory_total_bytes=memory_total,
+            memory_used_bytes=memory_used,
+            memory_available_bytes=memory_available,
+            memory_used_percent=round(memory_percent, 1),
+            memory_status=metric_status(memory_percent, 80, 90),
+        )
+    except (OSError, ValueError, KeyError):
+        pass
+
+    try:
+        load_1m = os.getloadavg()[0]
+        load_percent = load_1m * 100 / metrics["cpu_count"]
+        metrics.update(
+            load_1m=round(load_1m, 2),
+            load_percent=round(load_percent, 1),
+            load_status=metric_status(load_percent, 75, 100),
+        )
+    except (AttributeError, OSError):
+        pass
+
+    try:
+        uptime_value = Path("/proc/uptime").read_text(encoding="ascii").split()[0]
+        metrics["uptime_seconds"] = int(float(uptime_value))
+    except (OSError, ValueError, IndexError):
+        pass
+    return metrics
 
 
 def first_weekday_of_month(year, month, weekday):
@@ -453,6 +617,7 @@ def init_db():
             password_hash TEXT NOT NULL,
             role TEXT NOT NULL CHECK(role IN ('admin', 'leader')),
             active INTEGER NOT NULL DEFAULT 1,
+            auth_version INTEGER NOT NULL DEFAULT 0,
             created_at TEXT NOT NULL
         );
 
@@ -659,6 +824,15 @@ def init_db():
                 raise RuntimeError(
                     "ADMIN_PASSWORD mora biti nastavljen ob prvem zagonu."
                 )
+            if not valid_password(password):
+                raise RuntimeError(
+                    "ADMIN_PASSWORD mora imeti od 15 do 128 znakov."
+                )
+            admin_callsign = normalize_callsign(
+                os.environ.get("ADMIN_CALLSIGN", "S57ZM")
+            )
+            if not valid_callsign(admin_callsign):
+                raise RuntimeError("ADMIN_CALLSIGN ni veljaven klicni znak.")
             db.execute(
                 """INSERT INTO users
                    (username, full_name, callsign, password_hash, role, active,
@@ -668,8 +842,7 @@ def init_db():
                     username,
                     os.environ.get("ADMIN_NAME", "Marko Zidar").strip()
                     or "Administrator",
-                    os.environ.get("ADMIN_CALLSIGN", "S57ZM").strip().upper()
-                    or "S57ZM",
+                    admin_callsign,
                     generate_password_hash(password),
                     now_db(),
                 ),
@@ -760,11 +933,27 @@ def similar_callsigns(callsign, limit=3):
 def load_user_and_csrf():
     g.user = None
     if session.get("user_id"):
-        g.user = get_db().execute(
+        user = get_db().execute(
             "SELECT * FROM users WHERE id = ? AND active = 1", (session["user_id"],)
         ).fetchone()
-        if g.user is None:
+        try:
+            authenticated_at = int(session.get("authenticated_at", 0))
+            session_auth_version = int(session.get("auth_version", -1))
+        except (TypeError, ValueError):
+            authenticated_at = 0
+            session_auth_version = -1
+        session_expired = (
+            not authenticated_at
+            or time.time() - authenticated_at > SESSION_ABSOLUTE_SECONDS
+        )
+        if (
+            user is None
+            or session_expired
+            or session_auth_version != user["auth_version"]
+        ):
             session.clear()
+        else:
+            g.user = user
 
     if "csrf_token" not in session:
         session["csrf_token"] = secrets.token_urlsafe(32)
@@ -789,7 +978,7 @@ def require_initial_password_change():
 @app.after_request
 def add_security_headers(response):
     response.headers.setdefault("X-Content-Type-Options", "nosniff")
-    response.headers.setdefault("X-Frame-Options", "SAMEORIGIN")
+    response.headers.setdefault("X-Frame-Options", "DENY")
     response.headers.setdefault("Referrer-Policy", "same-origin")
     response.headers.setdefault(
         "Permissions-Policy", "camera=(), geolocation=(), microphone=()"
@@ -797,14 +986,16 @@ def add_security_headers(response):
     response.headers.setdefault(
         "Content-Security-Policy",
         "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; "
-        "script-src 'self' 'unsafe-inline'; base-uri 'self'; frame-ancestors 'self'",
+        "script-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'; "
+        "frame-ancestors 'none'",
     )
     if request.is_secure and RELEASE_CHANNEL == "stable":
         response.headers.setdefault(
             "Strict-Transport-Security", "max-age=31536000; includeSubDomains"
         )
-    if g.get("user") is not None:
+    if g.get("user") is not None or request.endpoint in {"login", "change_password"}:
         response.headers.setdefault("Cache-Control", "no-store")
+        response.headers.setdefault("Pragma", "no-cache")
     return response
 
 
@@ -839,7 +1030,7 @@ def admin_required(view):
 
 
 def valid_password(password):
-    return len(password) >= 10
+    return PASSWORD_MIN_LENGTH <= len(password) <= PASSWORD_MAX_LENGTH
 
 
 def client_ip_address():
@@ -1028,6 +1219,8 @@ def login():
                 )
                 session.clear()
                 session["user_id"] = user["id"]
+                session["auth_version"] = user["auth_version"]
+                session["authenticated_at"] = int(time.time())
                 session["csrf_token"] = secrets.token_urlsafe(32)
                 session.permanent = True
                 if previous_login:
@@ -1041,7 +1234,7 @@ def login():
                 if user["must_change_password"]:
                     return redirect(url_for("change_password"))
                 next_target = request.args.get("next", "")
-                if next_target.startswith("/") and not next_target.startswith("//"):
+                if safe_local_redirect(next_target):
                     return redirect(next_target)
                 return redirect(url_for("dashboard"))
 
@@ -1618,10 +1811,16 @@ def add_participant(net_id):
     if not can_manage_participants(net):
         abort(403)
     full_name = request.form.get("full_name", "").strip()
-    callsign = request.form.get("callsign", "").strip().upper().replace(" ", "")
+    callsign = normalize_callsign(request.form.get("callsign", ""))
     checkin_time = request.form.get("checkin_time", now_local().strftime("%H:%M"))
     if not full_name or not callsign:
         flash("Vpiši ime in klicni znak.", "danger")
+        return redirect(participant_return_url(net_id))
+    if not valid_callsign(callsign):
+        flash(
+            "Klicni znak lahko vsebuje samo črke, številke, / in - (2–24 znakov).",
+            "danger",
+        )
         return redirect(participant_return_url(net_id))
     try:
         datetime.strptime(checkin_time, "%H:%M")
@@ -1681,10 +1880,16 @@ def edit_participant(participant_id):
         abort(403)
     if request.method == "POST":
         full_name = request.form.get("full_name", "").strip()
-        callsign = request.form.get("callsign", "").strip().upper().replace(" ", "")
+        callsign = normalize_callsign(request.form.get("callsign", ""))
         checkin_time = request.form.get("checkin_time", "")
         if not full_name or not callsign:
             flash("Vpiši ime in klicni znak.", "danger")
+            return redirect(request.url)
+        if not valid_callsign(callsign):
+            flash(
+                "Klicni znak lahko vsebuje samo črke, številke, / in - (2–24 znakov).",
+                "danger",
+            )
             return redirect(request.url)
         try:
             datetime.strptime(checkin_time, "%H:%M")
@@ -2173,8 +2378,17 @@ def system_status_view():
         secure_cookie=app.config["SESSION_COOKIE_SECURE"],
         trust_proxy=TRUST_PROXY,
         trusted_proxy_networks=[str(network) for network in TRUSTED_PROXY_NETWORKS],
+        trusted_hosts=TRUSTED_HOSTS,
+        session_cookie_name=app.config["SESSION_COOKIE_NAME"],
+        system_metrics=collect_system_metrics(),
         counts=counts,
     )
+
+
+@app.get("/system/metrics")
+@admin_required
+def system_metrics_view():
+    return collect_system_metrics()
 
 
 @app.get("/backups/<path:name>/download")
@@ -2423,12 +2637,18 @@ def parse_csv_import(upload):
                 )
                 continue
 
-        callsign = row.get("klicni_znak", "").strip().upper().replace(" ", "")[:24]
+        callsign = normalize_callsign(row.get("klicni_znak", ""))
         full_name = row.get("ime", "").strip()[:120]
         if bool(callsign) != bool(full_name):
             add_error(line_number, "Klicni znak in ime morata biti oba izpolnjena ali oba prazna.")
             continue
         if callsign:
+            if not valid_callsign(callsign):
+                add_error(
+                    line_number,
+                    "Klicni znak lahko vsebuje samo črke, številke, / in - (2–24 znakov).",
+                )
+                continue
             if callsign.casefold() in {value.casefold() for value in group["callsigns"]}:
                 add_error(line_number, f"Klicni znak {callsign} je v istem skedu podvojen.")
                 continue
@@ -3228,10 +3448,15 @@ def merge_callsign(entry_id):
 @admin_required
 def new_callsign():
     if request.method == "POST":
-        callsign = request.form.get("callsign", "").strip().upper().replace(" ", "")
+        callsign = normalize_callsign(request.form.get("callsign", ""))
         full_name = request.form.get("full_name", "").strip()
         if not callsign or not full_name:
             flash("Vpiši klicni znak in ime.", "danger")
+        elif not valid_callsign(callsign):
+            flash(
+                "Klicni znak lahko vsebuje samo črke, številke, / in - (2–24 znakov).",
+                "danger",
+            )
         else:
             try:
                 cursor = get_db().execute(
@@ -3255,11 +3480,16 @@ def new_callsign():
 def edit_callsign(entry_id):
     entry = fetch_callsign_entry(entry_id)
     if request.method == "POST":
-        callsign = request.form.get("callsign", "").strip().upper().replace(" ", "")[:24]
+        callsign = normalize_callsign(request.form.get("callsign", ""))
         full_name = request.form.get("full_name", "").strip()
         active = 1 if request.form.get("active") == "1" else 0
         if not callsign or not full_name:
             flash("Vpiši klicni znak in ime.", "danger")
+        elif not valid_callsign(callsign):
+            flash(
+                "Klicni znak lahko vsebuje samo črke, številke, / in - (2–24 znakov).",
+                "danger",
+            )
         else:
             try:
                 db = get_db()
@@ -3374,13 +3604,18 @@ def new_user():
     if request.method == "POST":
         username = request.form.get("username", "").strip()
         full_name = request.form.get("full_name", "").strip()
-        callsign = request.form.get("callsign", "").strip().upper().replace(" ", "")
+        callsign = normalize_callsign(request.form.get("callsign", ""))
         password = request.form.get("password", "")
         role = request.form.get("role", "leader")
         if not username or not full_name or not callsign or role not in {"admin", "leader"}:
             flash("Izpolni vsa zahtevana polja.", "danger")
+        elif not valid_callsign(callsign):
+            flash(
+                "Klicni znak lahko vsebuje samo črke, številke, / in - (2–24 znakov).",
+                "danger",
+            )
         elif not valid_password(password):
-            flash("Geslo mora imeti najmanj 10 znakov.", "danger")
+            flash("Geslo mora imeti od 15 do 128 znakov.", "danger")
         else:
             try:
                 cur = get_db().execute(
@@ -3407,7 +3642,7 @@ def edit_user(user_id):
         abort(404)
     if request.method == "POST":
         full_name = request.form.get("full_name", "").strip()
-        callsign = request.form.get("callsign", "").strip().upper().replace(" ", "")
+        callsign = normalize_callsign(request.form.get("callsign", ""))
         role = request.form.get("role", "leader")
         active = 1 if request.form.get("active") == "1" else 0
         password = request.form.get("password", "")
@@ -3427,13 +3662,19 @@ def edit_user(user_id):
             )
         elif not full_name or not callsign or role not in {"admin", "leader"}:
             flash("Izpolni vsa zahtevana polja.", "danger")
+        elif not valid_callsign(callsign):
+            flash(
+                "Klicni znak lahko vsebuje samo črke, številke, / in - (2–24 znakov).",
+                "danger",
+            )
         elif password and not valid_password(password):
-            flash("Novo geslo mora imeti najmanj 10 znakov.", "danger")
+            flash("Novo geslo mora imeti od 15 do 128 znakov.", "danger")
         else:
             if password:
                 get_db().execute(
                     """UPDATE users SET full_name=?, callsign=?, role=?, active=?,
-                       password_hash=?, must_change_password=1
+                       password_hash=?, must_change_password=1,
+                       auth_version=auth_version+1
                        WHERE id=?""",
                     (full_name[:120], callsign[:24], role, active, generate_password_hash(password), user_id),
                 )
@@ -3443,6 +3684,12 @@ def edit_user(user_id):
                     (full_name[:120], callsign[:24], role, active, user_id),
                 )
             get_db().commit()
+            if password and user_id == g.user["id"]:
+                refreshed = get_db().execute(
+                    "SELECT auth_version FROM users WHERE id=?", (user_id,)
+                ).fetchone()
+                session["auth_version"] = refreshed["auth_version"]
+                session["authenticated_at"] = int(time.time())
             audit("update", "user", user_id, edit_user_row["username"])
             flash("Uporabnik je posodobljen.", "success")
             return redirect(url_for("users"))
@@ -3459,16 +3706,22 @@ def change_password():
         if not check_password_hash(g.user["password_hash"], current):
             flash("Trenutno geslo ni pravilno.", "danger")
         elif not valid_password(new):
-            flash("Novo geslo mora imeti najmanj 10 znakov.", "danger")
+            flash("Novo geslo mora imeti od 15 do 128 znakov.", "danger")
         elif new != confirm:
             flash("Novi gesli se ne ujemata.", "danger")
         else:
             get_db().execute(
-                """UPDATE users SET password_hash=?, must_change_password=0
+                """UPDATE users SET password_hash=?, must_change_password=0,
+                   auth_version=auth_version+1
                    WHERE id=?""",
                 (generate_password_hash(new), g.user["id"]),
             )
             get_db().commit()
+            refreshed = get_db().execute(
+                "SELECT auth_version FROM users WHERE id=?", (g.user["id"],)
+            ).fetchone()
+            session["auth_version"] = refreshed["auth_version"]
+            session["authenticated_at"] = int(time.time())
             session.permanent = True
             audit("password_change", "user", g.user["id"], g.user["username"])
             flash("Geslo je spremenjeno.", "success")
@@ -3535,6 +3788,21 @@ def filesize_si(value):
         if size < 1024 or unit == "GB":
             return f"{size:.0f} {unit}" if unit == "B" else f"{size:.1f} {unit}"
         size /= 1024
+
+
+@app.template_filter("duration_si")
+def duration_si(value):
+    seconds = max(0, int(value or 0))
+    days, remainder = divmod(seconds, 86400)
+    hours, remainder = divmod(remainder, 3600)
+    minutes = remainder // 60
+    parts = []
+    if days:
+        parts.append(f"{days} d")
+    if hours or days:
+        parts.append(f"{hours} h")
+    parts.append(f"{minutes} min")
+    return " ".join(parts)
 
 
 @app.template_filter("login_reason_si")

@@ -2,7 +2,7 @@
 
 Ločen spletni portal Radiokluba Sevnica S50TTT za vodenje skedov.
 
-Trenutna alpha različica: **1.22.0-alpha**
+Trenutna alpha različica: **1.23.0-alpha**
 
 ## Funkcije
 
@@ -46,7 +46,9 @@ Trenutna alpha različica: **1.22.0-alpha**
 - mobilnim napravam prilagojen prikaz;
 - zložljiv mobilni meni;
 - javni urnik brez osebnih podatkov in naročnina na koledar `.ics`;
-- administratorska stran `Sistem` s stanjem baze, sheme in varnostnih kopij;
+- administratorska stran `Sistem` s temperaturo Raspberry Pija, prostorom na
+  disku, porabo pomnilnika, obremenitvijo procesorja, časom delovanja ter
+  stanjem baze, sheme in varnostnih kopij;
 - obvezna zamenjava začasnega gesla novih uporabnikov;
 - sled sprememb v podatkovni bazi;
 - SQLite podatkovna baza v trajni mapi `data`.
@@ -95,9 +97,16 @@ Administrator ima na strani `Varnost` pregled zadnjih 200 poskusov, njihovega
 časa, naslova IP in rezultata. Zaklenjen račun lahko ročno odklene. Stran
 `Uporabniki` prikazuje zadnjo uspešno prijavo in trenutno stanje zaščite.
 Evidenca je omejena na zadnjih 5000 dogodkov, da se baza ne povečuje brez meje.
-Produkcijski Docker zaupa enemu nastavljenemu povratnemu posredniku, lokalna
-alpha različica pa posredovanih naslovov ne zaupa in uporabi neposredni naslov
-odjemalca.
+Produkcijski Docker upošteva posredovane glave samo, če neposredni naslov
+zahteve pripada mreži iz `TRUSTED_PROXY_NETWORKS`. Če seznam ni nastavljen, jih
+varno prezre. Lokalna alpha različica jih ne upošteva in uporabi neposredni
+naslov odjemalca.
+
+Geslo mora biti dolgo od 15 do 128 znakov. Seja poleg 12-urne drseče veljavnosti
+preneha najpozneje po 24 urah. Sprememba ali administratorska ponastavitev gesla
+prekliče že odprte seje uporabnika. Produkcija in alpha uporabljata različni
+imeni piškotkov. Portal preverja tudi dovoljene gostitelje, klicne znake,
+preusmeritve po prijavi ter uporablja strogo politiko izvajanja JavaScripta.
 
 Administrator lahko v urejevalniku zaključenega skeda naknadno doda, popravi ali
 izbriše prijavljenega člana. Naknadno dodani klicni znaki se prav tako shranijo v
@@ -180,6 +189,20 @@ pravi Heker«, dogodek pa se zabeleži v revizijsko sled.
 Sobotni skedi se številčijo neprekinjeno od prve sobote leta 2019: sked 5.
 januarja 2019 je št. 1. Po tem pravilu je sobotni sked 25. julija 2026 št. 395.
 
+## Stanje Raspberry Pija
+
+Administratorju stran `Sistem` v živo prikazuje temperaturo procesorja, prosti
+prostor na disku, uporabo RAM-a, 1-minutno povprečno obremenitev in čas od
+zadnjega zagona. Podatki se osvežijo vsakih 15 sekund in ne razkrivajo poti ali
+drugih občutljivih sistemskih podatkov. Rumeno opozorilo se prikaže pri 70 °C,
+80 % zasedenosti diska ali RAM-a ter večji obremenitvi; kritične meje so 80 °C
+oziroma 90 %.
+
+Meritve se berejo neposredno iz `/proc`, `/sys` in datotečnega sistema podatkovne
+baze, zato aplikacija ne potrebuje privilegiranega vsebnika ali dostopa do
+Docker vtičnice. Če posamezen podatek na napravi ni dosegljiv, portal prikaže
+`Ni na voljo`, ostale meritve pa še naprej delujejo.
+
 ## Namestitev
 
 Portal je pripravljen za Docker Compose. Privzeto posluša na portu `8023`.
@@ -215,8 +238,8 @@ Za javni naslov `skedi.s57zm.eu` se v Nginx Proxy Managerju ustvari Proxy Host:
 - Websockets Support: vključeno
 - SSL: nov Let's Encrypt certifikat, Force SSL in HTTP/2
 
-Produkcijski portal zaupa glavam enega povratnega posrednika. Ko preveriš Docker
-omrežje Nginx Proxy Managerja, ga lahko v `.env` dodatno omejiš, na primer:
+Produkcijski portal privzeto prezre posredovane glave, dokler ne vpišeš Docker
+omrežja Nginx Proxy Managerja v `.env`, na primer:
 
 ```text
 TRUSTED_PROXY_NETWORKS=172.16.0.0/12,127.0.0.1/32
@@ -280,4 +303,5 @@ docker compose run --rm skedi python -m unittest discover -s tests -v
 ```
 
 Repozitorij vsebuje tudi GitHub Actions, ki ob spremembi vej `alpha` ali `main`
-samodejno zažene vseh 42 testov in preveri gradnjo Docker slike.
+samodejno zažene vseh 49 testov, pregleda odvisnosti za znane ranljivosti in
+preveri gradnjo Docker slike.

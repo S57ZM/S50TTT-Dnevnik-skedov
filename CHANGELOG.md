@@ -1,5 +1,22 @@
 # Zgodovina različic
 
+## 1.23.0-alpha
+
+- nova nadzorna plošča Raspberry Pija s temperaturo, prostorom na disku,
+  pomnilnikom, obremenitvijo in časom delovanja;
+- samodejno osveževanje meritev brez privilegiranega vsebnika ali Docker
+  vtičnice;
+- posodobljena Flask 3.1.3 in Gunicorn 26.0.0 brez znanih ranljivosti;
+- strožja politika izvajanja JavaScripta ter odstranjeni vstavljeni skripti in
+  dogodki iz aktivnih pogledov;
+- varno preverjanje klicnih znakov, gostiteljev in preusmeritev po prijavi;
+- najmanj 15 znakov za nova gesla, absolutna 24-urna omejitev seje ter preklic
+  drugih sej ob spremembi ali ponastavitvi gesla;
+- posredovane glave se upoštevajo samo iz izrecno dovoljenih mrež;
+- utrjena Docker vsebnika z datotečnim sistemom samo za branje, odstranjenimi
+  zmožnostmi, omejitvijo procesov in pravilom `no-new-privileges`;
+- shema baze 2 in 49 avtomatiziranih testov.
+
 ## 1.22.0-alpha
 
 - prenovljen in bolje kontrasten mobilni meni;

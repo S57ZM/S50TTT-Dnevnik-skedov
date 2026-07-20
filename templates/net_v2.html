@@ -16,15 +16,15 @@
         </p>
       </div>
       <div class="actions right no-print">
-        <button class="btn btn-secondary" type="button" onclick="window.print()">🖨 Natisni / PDF</button>
+        <button class="btn btn-secondary" type="button" data-window-action="print">🖨 Natisni / PDF</button>
         {% if net['status'] == 'open' and can_manage_participants %}
           {% if can_delete_net %}
-            <form method="post" action="{{ url_for('delete_net', net_id=net['id']) }}" onsubmit="return confirm('Izbrišem ta prazen odprt sked?')">
+            <form method="post" action="{{ url_for('delete_net', net_id=net['id']) }}" data-confirm="Izbrišem ta prazen odprt sked?">
               <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
               <button class="btn btn-danger">Izbriši prazen sked</button>
             </form>
           {% endif %}
-          <form method="post" action="{{ url_for('close_net', net_id=net['id']) }}" onsubmit="return confirm('Zaključim ta sked?')">
+          <form method="post" action="{{ url_for('close_net', net_id=net['id']) }}" data-confirm="Zaključim ta sked?">
             <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
             <button class="btn btn-success">✓ Zaključi sked</button>
           </form>
@@ -61,7 +61,7 @@
       <div class="actions">
         <div><h2>Vodenje v živo</h2><p class="muted">Hiter vnos; kazalec se po osvežitvi samodejno vrne na klicni znak.</p></div>
         {% if participants %}
-          <form class="right" method="post" action="{{ url_for('undo_last_participant', net_id=net['id']) }}" onsubmit="return confirm('Razveljavim zadnji dodani vnos?')">
+          <form class="right" method="post" action="{{ url_for('undo_last_participant', net_id=net['id']) }}" data-confirm="Razveljavim zadnji dodani vnos?">
             <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
             <button class="btn btn-danger">↶ Razveljavi zadnji vnos</button>
           </form>
@@ -72,7 +72,7 @@
         <div class="grid">
           <div class="field">
             <label for="participant-callsign">Klicni znak</label>
-            <input id="participant-callsign" name="callsign" list="callsign-options" required autofocus autocomplete="off" style="text-transform:uppercase">
+            <input id="participant-callsign" name="callsign" list="callsign-options" required minlength="2" maxlength="24" pattern="[A-Za-z0-9][A-Za-z0-9/-]{0,22}[A-Za-z0-9]" autofocus autocomplete="off" class="callsign-input">
             <datalist id="callsign-options">
               {% for entry in directory_entries %}<option value="{{ entry['callsign'] }}" data-full-name="{{ entry['full_name'] }}">{{ entry['full_name'] }}</option>{% endfor %}
             </datalist>
@@ -102,7 +102,7 @@
           <tr>
             <td>{{ loop.index }}</td><td class="nowrap">{{ p['checkin_at']|time_si }}</td><td><b>{{ p['callsign'] }}</b></td><td>{{ p['full_name'] }}</td><td class="no-print">{{ p['entered_by_name'] }}</td>
             {% if can_manage_participants %}
-              <td class="no-print"><div class="actions"><a class="btn btn-secondary btn-small" href="{{ url_for('edit_participant', participant_id=p['id']) }}">Uredi</a><form method="post" action="{{ url_for('delete_participant', participant_id=p['id']) }}" onsubmit="return confirm('Izbrišem {{ p['callsign'] }}?')"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="btn btn-danger btn-small">Izbriši</button></form></div></td>
+              <td class="no-print"><div class="actions"><a class="btn btn-secondary btn-small" href="{{ url_for('edit_participant', participant_id=p['id']) }}">Uredi</a><form method="post" action="{{ url_for('delete_participant', participant_id=p['id']) }}" data-confirm="Izbrišem {{ p['callsign'] }}?"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="btn btn-danger btn-small">Izbriši</button></form></div></td>
             {% endif %}
           </tr>
         {% endfor %}

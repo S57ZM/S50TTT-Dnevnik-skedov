@@ -2,15 +2,53 @@
 {% block title %}Stanje sistema · {{ app_name }}{% endblock %}
 {% block content %}
   <div class="card">
-    <h1>Stanje sistema</h1>
-    <p class="muted">Hiter pregled pripravljenosti portala, baze in varnostnih kopij.</p>
+    <div class="actions">
+      <div>
+        <h1>Stanje sistema</h1>
+        <p class="muted">Portal, Raspberry Pi, podatkovna baza in varnostne kopije.</p>
+      </div>
+      <span class="system-updated right" data-metric="checked_at">Osveženo {{ system_metrics['checked_at']|datetime_si }}</span>
+    </div>
   </div>
+
+  <section class="system-metrics" data-system-metrics data-endpoint="{{ url_for('system_metrics_view') }}" aria-label="Stanje Raspberry Pija">
+    <article class="card metric-card" data-status-card="temperature">
+      <div class="metric-heading"><span>Temperatura procesorja</span><span class="metric-dot status-{{ system_metrics['temperature_status'] }}" data-status-dot="temperature"></span></div>
+      <strong data-metric="temperature">{{ ('%.1f °C'|format(system_metrics['temperature_c'])) if system_metrics['temperature_c'] is not none else 'Ni na voljo' }}</strong>
+      <small class="muted">Opozorilo pri 70 °C, kritično pri 80 °C</small>
+    </article>
+    <article class="card metric-card" data-status-card="disk">
+      <div class="metric-heading"><span>Prostor na disku</span><span class="metric-dot status-{{ system_metrics['disk_status'] }}" data-status-dot="disk"></span></div>
+      <strong data-metric="disk-free">{{ system_metrics['disk_free_bytes']|filesize_si if system_metrics['disk_free_bytes'] is not none else 'Ni na voljo' }} prosto</strong>
+      <progress max="100" value="{{ system_metrics['disk_used_percent'] or 0 }}" data-metric-progress="disk"></progress>
+      <small class="muted" data-metric="disk-detail">{% if system_metrics['disk_used_percent'] is not none %}{{ system_metrics['disk_used_percent'] }} % zasedeno od {{ system_metrics['disk_total_bytes']|filesize_si }}{% else %}Podatek ni na voljo{% endif %}</small>
+    </article>
+    <article class="card metric-card" data-status-card="memory">
+      <div class="metric-heading"><span>Pomnilnik RAM</span><span class="metric-dot status-{{ system_metrics['memory_status'] }}" data-status-dot="memory"></span></div>
+      <strong data-metric="memory">{% if system_metrics['memory_used_bytes'] is not none %}{{ system_metrics['memory_used_bytes']|filesize_si }} / {{ system_metrics['memory_total_bytes']|filesize_si }}{% else %}Ni na voljo{% endif %}</strong>
+      <progress max="100" value="{{ system_metrics['memory_used_percent'] or 0 }}" data-metric-progress="memory"></progress>
+      <small class="muted" data-metric="memory-detail">{{ (system_metrics['memory_used_percent'] ~ ' % uporabljeno') if system_metrics['memory_used_percent'] is not none else 'Podatek ni na voljo' }}</small>
+    </article>
+    <article class="card metric-card" data-status-card="load">
+      <div class="metric-heading"><span>Obremenitev procesorja</span><span class="metric-dot status-{{ system_metrics['load_status'] }}" data-status-dot="load"></span></div>
+      <strong data-metric="load">{{ system_metrics['load_1m'] if system_metrics['load_1m'] is not none else 'Ni na voljo' }}</strong>
+      <progress max="100" value="{{ [system_metrics['load_percent'] or 0, 100]|min }}" data-metric-progress="load"></progress>
+      <small class="muted" data-metric="load-detail">1-minutno povprečje · {{ system_metrics['cpu_count'] }} jeder</small>
+    </article>
+    <article class="card metric-card" data-status-card="uptime">
+      <div class="metric-heading"><span>Čas delovanja</span><span class="metric-dot status-ok"></span></div>
+      <strong data-metric="uptime">{{ system_metrics['uptime_seconds']|duration_si if system_metrics['uptime_seconds'] is not none else 'Ni na voljo' }}</strong>
+      <small class="muted">Od zadnjega zagona Raspberry Pija</small>
+    </article>
+  </section>
+
   <div class="stats-grid">
     <div class="card stat"><span>Različica</span><strong class="profile-date">{{ app_version }}</strong></div>
     <div class="card stat"><span>Shema baze</span><strong>{{ schema_current }}/{{ schema_latest }}</strong></div>
     <div class="card stat"><span>Skedi</span><strong>{{ counts['nets'] }}</strong></div>
     <div class="card stat"><span>Prijave</span><strong>{{ counts['participants'] }}</strong></div>
   </div>
+
   <div class="grid">
     <div class="card">
       <h2>Podatkovna baza</h2>
@@ -24,9 +62,9 @@
     </div>
     <div class="card">
       <h2>Varnost povezave</h2>
-      <p>Secure cookie: <b class="{{ 'status-ok' if secure_cookie else 'status-warning' }}">{{ 'vključen' if secure_cookie else 'izključen' }}</b><br>Povratni posrednik: <b>{{ 'zaupan en posrednik' if trust_proxy else 'neposredna povezava' }}</b>{% if trusted_proxy_networks %}<br>Dovoljene mreže: <b>{{ trusted_proxy_networks|join(', ') }}</b>{% endif %}</p>
+      <p>Secure cookie: <b class="{{ 'status-ok' if secure_cookie else 'status-warning' }}">{{ 'vključen' if secure_cookie else 'izključen' }}</b><br>Piškotek: <b>{{ session_cookie_name }}</b><br>Povratni posrednik: <b>{{ 'omejen na dovoljene mreže' if trust_proxy and trusted_proxy_networks else ('nepravilno nastavljen' if trust_proxy else 'neposredna povezava') }}</b>{% if trusted_proxy_networks %}<br>Dovoljene mreže: <b>{{ trusted_proxy_networks|join(', ') }}</b>{% endif %}{% if trusted_hosts %}<br>Dovoljeni gostitelji: <b>{{ trusted_hosts|join(', ') }}</b>{% endif %}</p>
       {% if release_channel == 'stable' and not secure_cookie %}<div class="flash warning">V produkciji vključi <code>SESSION_COOKIE_SECURE=1</code>.</div>{% endif %}
-      {% if trust_proxy and not trusted_proxy_networks %}<div class="flash warning">Posrednik še ni omejen na dovoljeno mrežo. Nastavi <code>TRUSTED_PROXY_NETWORKS</code>, ko preveriš naslov omrežja Nginx Proxy Managerja.</div>{% endif %}
+      {% if trust_proxy and not trusted_proxy_networks %}<div class="flash warning">Posredovane glave se zaradi praznega <code>TRUSTED_PROXY_NETWORKS</code> varno prezrejo. Nastavi dejansko mrežo posrednika.</div>{% endif %}
     </div>
   </div>
 {% endblock %}

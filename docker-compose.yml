@@ -4,6 +4,13 @@ services:
     container_name: s50ttt-skedi
     restart: unless-stopped
     user: "${PUID}:${PGID}"
+    read_only: true
+    init: true
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    pids_limit: 128
+    tmpfs:
+      - /tmp:size=32m,mode=1777
     env_file: .env
     environment:
       BACKUP_DIR: /app/backups
@@ -14,9 +21,12 @@ services:
       OFFSITE_BACKUP_DIR: /app/offsite-backups
       OFFSITE_BACKUP_RETENTION: 90
       SESSION_COOKIE_SECURE: "${SESSION_COOKIE_SECURE:-1}"
+      SESSION_COOKIE_NAME: "${SESSION_COOKIE_NAME:-s50ttt_session}"
       SESSION_HOURS: "${SESSION_HOURS:-12}"
+      SESSION_ABSOLUTE_HOURS: "${SESSION_ABSOLUTE_HOURS:-24}"
       TRUST_PROXY: "${TRUST_PROXY:-1}"
       TRUSTED_PROXY_NETWORKS: "${TRUSTED_PROXY_NETWORKS:-}"
+      TRUSTED_HOSTS: "${TRUSTED_HOSTS:-skedi.s57zm.eu,localhost,127.0.0.1}"
     volumes:
       - ./data:/app/data
       - ./backups:/app/backups
@@ -35,6 +45,13 @@ services:
     container_name: s50ttt-skedi-backup
     restart: unless-stopped
     user: "${PUID}:${PGID}"
+    read_only: true
+    init: true
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    pids_limit: 64
+    tmpfs:
+      - /tmp:size=16m,mode=1777
     env_file: .env
     environment:
       BACKUP_DIR: /app/backups
