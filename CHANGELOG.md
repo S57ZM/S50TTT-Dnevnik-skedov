@@ -1,5 +1,19 @@
 # Zgodovina različic
 
+## 1.24.0-alpha
+
+- namestljiva PWA za Android in iPhone z lastno ikono ter samostojnim prikazom;
+- varen offline pregled zadnjega odprtega skeda, vpis in odstranitev udeležencev
+  ter urejanje zapisnika;
+- samodejna sinhronizacija ob ponovni povezavi brez podvajanja že poslanih
+  operacij;
+- zaznavanje konflikta, če je sked medtem zaključen ali je bil zapisnik
+  spremenjen na drugi napravi;
+- lokalni podatki se odstranijo ob odjavi ali ročno na offline zaslonu;
+- strežniške strani s sejami in varnostnimi žetoni se ne shranjujejo v spletni
+  predpomnilnik;
+- shema baze 3 in 55 avtomatiziranih testov.
+
 ## 1.23.0-alpha
 
 - nova nadzorna plošča Raspberry Pija s temperaturo, prostorom na disku,

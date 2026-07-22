@@ -19,12 +19,12 @@
         <button class="btn btn-secondary" type="button" data-window-action="print">🖨 Natisni / PDF</button>
         {% if net['status'] == 'open' and can_manage_participants %}
           {% if can_delete_net %}
-            <form method="post" action="{{ url_for('delete_net', net_id=net['id']) }}" data-confirm="Izbrišem ta prazen odprt sked?">
+            <form method="post" action="{{ url_for('delete_net', net_id=net['id']) }}" data-confirm="Izbrišem ta prazen odprt sked?" data-online-only>
               <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
               <button class="btn btn-danger">Izbriši prazen sked</button>
             </form>
           {% endif %}
-          <form method="post" action="{{ url_for('close_net', net_id=net['id']) }}" data-confirm="Zaključim ta sked?">
+          <form method="post" action="{{ url_for('close_net', net_id=net['id']) }}" data-confirm="Zaključim ta sked?" data-online-only>
             <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
             <button class="btn btn-success">✓ Zaključi sked</button>
           </form>
@@ -44,7 +44,7 @@
     <div class="card">
       <h2>Zapisnik / opombe skeda</h2>
       {% if can_edit_notes %}
-        <form class="notes-editor no-print" method="post" action="{{ url_for('update_net_notes', net_id=net['id']) }}">
+        <form class="notes-editor no-print" method="post" action="{{ url_for('update_net_notes', net_id=net['id']) }}" data-offline-action="update-notes" data-net-id="{{ net['id'] }}">
           <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
           <textarea name="notes" maxlength="5000" placeholder="Obvestila kluba, tehnične težave, posebnosti skeda …">{{ net['notes'] or '' }}</textarea>
           <div class="actions" style="margin-top:10px"><button class="btn btn-primary">Shrani zapisnik</button><span class="muted">Največ 5000 znakov</span></div>
@@ -67,7 +67,7 @@
           </form>
         {% endif %}
       </div>
-      <form method="post" action="{{ url_for('add_participant', net_id=net['id']) }}">
+      <form method="post" action="{{ url_for('add_participant', net_id=net['id']) }}" data-offline-action="add-participant" data-net-id="{{ net['id'] }}">
         <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
         <div class="grid">
           <div class="field">
@@ -102,11 +102,14 @@
           <tr>
             <td>{{ loop.index }}</td><td class="nowrap">{{ p['checkin_at']|time_si }}</td><td><b>{{ p['callsign'] }}</b></td><td>{{ p['full_name'] }}</td><td class="no-print">{{ p['entered_by_name'] }}</td>
             {% if can_manage_participants %}
-              <td class="no-print"><div class="actions"><a class="btn btn-secondary btn-small" href="{{ url_for('edit_participant', participant_id=p['id']) }}">Uredi</a><form method="post" action="{{ url_for('delete_participant', participant_id=p['id']) }}" data-confirm="Izbrišem {{ p['callsign'] }}?"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="btn btn-danger btn-small">Izbriši</button></form></div></td>
+              <td class="no-print"><div class="actions"><a class="btn btn-secondary btn-small" href="{{ url_for('edit_participant', participant_id=p['id']) }}" data-online-only>Uredi</a><form method="post" action="{{ url_for('delete_participant', participant_id=p['id']) }}" data-confirm="Izbrišem {{ p['callsign'] }}?" data-offline-action="delete-participant" data-net-id="{{ net['id'] }}" data-participant-id="{{ p['id'] }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="btn btn-danger btn-small">Izbriši</button></form></div></td>
             {% endif %}
           </tr>
         {% endfor %}
       </tbody></table></div>
     {% else %}<p class="empty">V tem skedu še ni prijavljenih.</p>{% endif %}
   </div>
+  {% if offline_snapshot %}
+    <script id="offline-net-snapshot" type="application/json">{{ offline_snapshot|tojson }}</script>
+  {% endif %}
 {% endblock %}

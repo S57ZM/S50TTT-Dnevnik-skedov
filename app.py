@@ -18,8 +18,8 @@ from urllib.parse import unquote, urlsplit
 from zoneinfo import ZoneInfo
 
 from flask import (
-    Flask, Response, abort, flash, g, redirect, render_template, request, send_file,
-    session, url_for,
+    Flask, Response, abort, flash, g, jsonify, redirect, render_template, request,
+    send_file, session, url_for,
 )
 from jinja2 import ChoiceLoader, DictLoader, FileSystemLoader
 from werkzeug.middleware.proxy_fix import ProxyFix
@@ -37,7 +37,7 @@ from migrations import LATEST_SCHEMA_VERSION, run_migrations, schema_version
 
 
 APP_NAME = "S50TTT Dnevnik skedov"
-BASE_VERSION = "1.23.0"
+BASE_VERSION = "1.24.0"
 RELEASE_CHANNEL = os.environ.get("RELEASE_CHANNEL", "stable").strip().lower()
 if RELEASE_CHANNEL not in {"stable", "alpha"}:
     RELEASE_CHANNEL = "stable"
@@ -959,7 +959,11 @@ def load_user_and_csrf():
         session["csrf_token"] = secrets.token_urlsafe(32)
 
     if request.method == "POST":
-        submitted = request.form.get("csrf_token", "")
+        if request.endpoint == "offline_sync" and g.user is None:
+            return None
+        submitted = request.form.get("csrf_token", "") or request.headers.get(
+            "X-CSRF-Token", ""
+        )
         expected = session.get("csrf_token", "")
         if not submitted or not expected or not hmac.compare_digest(submitted, expected):
             abort(400, "Neveljaven varnostni žeton. Osveži stran in poskusi ponovno.")
@@ -1085,6 +1089,29 @@ def health():
         "version": APP_VERSION,
         "channel": RELEASE_CHANNEL,
     }
+
+
+@app.get("/app.webmanifest")
+def pwa_manifest():
+    response = send_file(
+        APP_ROOT / "static" / "app.webmanifest",
+        mimetype="application/manifest+json",
+        conditional=True,
+    )
+    response.headers["Cache-Control"] = "no-cache"
+    return response
+
+
+@app.get("/service-worker.js")
+def service_worker():
+    response = send_file(
+        APP_ROOT / "static" / "service-worker.js",
+        mimetype="application/javascript",
+        conditional=True,
+    )
+    response.headers["Cache-Control"] = "no-cache"
+    response.headers["Service-Worker-Allowed"] = "/"
+    return response
 
 
 @app.get("/urnik")
@@ -1616,6 +1643,63 @@ def can_manage_participants(net):
     return net["status"] == "open" and net["leader_id"] == g.user["id"]
 
 
+def offline_net_snapshot(net_id, db=None):
+    db = db or get_db()
+    net = db.execute(
+        """SELECT n.*, u.full_name AS leader_name, u.callsign AS leader_callsign
+           FROM nets n JOIN users u ON u.id=n.leader_id WHERE n.id=?""",
+        (net_id,),
+    ).fetchone()
+    if net is None:
+        return None
+    participants = db.execute(
+        """SELECT p.*, u.full_name AS entered_by_name
+           FROM participants p JOIN users u ON u.id=p.created_by
+           WHERE p.net_id=? ORDER BY p.checkin_at, p.id""",
+        (net_id,),
+    ).fetchall()
+    directory = db.execute(
+        """SELECT callsign, full_name FROM callsign_directory
+           WHERE active=1 ORDER BY callsign"""
+    ).fetchall()
+    can_sync = bool(
+        g.user
+        and net["status"] == "open"
+        and (g.user["role"] == "admin" or net["leader_id"] == g.user["id"])
+    )
+    return {
+        "schema_version": 1,
+        "saved_at": now_local().isoformat(timespec="seconds"),
+        "net": {
+            "id": net["id"],
+            "title": net["title"],
+            "net_date": net["net_date"],
+            "started_at": net["started_at"],
+            "status": net["status"],
+            "leader_name": net["leader_name"],
+            "leader_callsign": net["leader_callsign"],
+            "repeater": net["repeater"],
+            "control_callsign": net["control_callsign"],
+            "notes": net["notes"] or "",
+            "can_sync": can_sync,
+        },
+        "participants": [
+            {
+                "id": participant["id"],
+                "full_name": participant["full_name"],
+                "callsign": participant["callsign"],
+                "checkin_time": participant["checkin_at"][11:16],
+                "entered_by_name": participant["entered_by_name"],
+            }
+            for participant in participants
+        ],
+        "directory": [
+            {"callsign": entry["callsign"], "full_name": entry["full_name"]}
+            for entry in directory
+        ],
+    }
+
+
 @app.route("/nets/<int:net_id>")
 @login_required
 def net_detail(net_id):
@@ -1649,6 +1733,258 @@ def net_detail(net_id):
         can_manage_participants=can_manage_participants(net),
         directory_entries=directory_entries,
         recent_participants=list(reversed(participants[-5:])),
+        offline_snapshot=(
+            offline_net_snapshot(net_id)
+            if net["status"] == "open" and can_manage_participants(net)
+            else None
+        ),
+    )
+
+
+OFFLINE_OPERATION_PATTERN = re.compile(r"^[A-Za-z0-9_-]{16,80}$")
+OFFLINE_ACTIONS = {"add_participant", "delete_participant", "update_notes"}
+
+
+def offline_operation_result(operation_id, status, message, **values):
+    result = {
+        "operation_id": operation_id,
+        "status": status,
+        "message": message,
+    }
+    result.update(values)
+    return result
+
+
+def insert_offline_audit(db, action, entity_type, entity_id, details):
+    db.execute(
+        """INSERT INTO audit_log
+           (user_id, action, entity_type, entity_id, details, created_at)
+           VALUES (?, ?, ?, ?, ?, ?)""",
+        (g.user["id"], action, entity_type, entity_id, details, now_db()),
+    )
+
+
+def apply_offline_operation(db, net, operation_id, action, data):
+    if net["status"] != "open":
+        return offline_operation_result(
+            operation_id,
+            "conflict",
+            "Sked je bil med delom brez povezave že zaključen.",
+        )
+
+    if action == "add_participant":
+        full_name = str(data.get("full_name", "")).strip()
+        callsign = normalize_callsign(str(data.get("callsign", "")))
+        checkin_time = str(data.get("checkin_time", "")).strip()
+        if not full_name or not valid_callsign(callsign):
+            return offline_operation_result(
+                operation_id, "invalid", "Ime ali klicni znak ni veljaven."
+            )
+        try:
+            datetime.strptime(checkin_time, "%H:%M")
+        except ValueError:
+            return offline_operation_result(
+                operation_id, "invalid", "Ura prijave ni veljavna."
+            )
+        existing = db.execute(
+            "SELECT id FROM participants WHERE net_id=? AND callsign=?",
+            (net["id"], callsign),
+        ).fetchone()
+        if existing:
+            return offline_operation_result(
+                operation_id,
+                "conflict",
+                f"Klicni znak {callsign} je že vpisan v tem skedu.",
+            )
+        checkin_at = f"{net['net_date']} {checkin_time}:00"
+        cursor = db.execute(
+            """INSERT INTO participants
+               (net_id, full_name, callsign, checkin_at, created_by, created_at)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (
+                net["id"],
+                full_name[:120],
+                callsign[:24],
+                checkin_at,
+                g.user["id"],
+                now_db(),
+            ),
+        )
+        directory_id, directory_created = learn_callsign(
+            db, callsign, full_name, g.user["id"], checkin_at
+        )
+        insert_offline_audit(
+            db,
+            "offline_create",
+            "participant",
+            cursor.lastrowid,
+            f"{callsign} – {full_name[:120]} · operacija {operation_id}",
+        )
+        if directory_created:
+            insert_offline_audit(
+                db,
+                "learn",
+                "callsign",
+                directory_id,
+                f"{callsign} – {full_name[:120]} · offline",
+            )
+        return offline_operation_result(
+            operation_id,
+            "applied",
+            f"Dodan {callsign}.",
+            participant_id=cursor.lastrowid,
+        )
+
+    if action == "delete_participant":
+        try:
+            participant_id = int(data.get("participant_id"))
+        except (TypeError, ValueError):
+            return offline_operation_result(
+                operation_id, "invalid", "Udeleženec za izbris ni veljaven."
+            )
+        participant = db.execute(
+            "SELECT * FROM participants WHERE id=? AND net_id=?",
+            (participant_id, net["id"]),
+        ).fetchone()
+        if participant is None:
+            return offline_operation_result(
+                operation_id,
+                "applied",
+                "Vnos je bil že odstranjen.",
+            )
+        db.execute("DELETE FROM participants WHERE id=?", (participant_id,))
+        refresh_callsign_usage(db, participant["callsign"])
+        insert_offline_audit(
+            db,
+            "offline_delete",
+            "participant",
+            participant_id,
+            f"{participant['callsign']} – {participant['full_name']} · operacija {operation_id}",
+        )
+        return offline_operation_result(
+            operation_id,
+            "applied",
+            f"Odstranjen {participant['callsign']}.",
+        )
+
+    notes = str(data.get("notes", "")).strip()[:5000]
+    base_notes = str(data.get("base_notes", ""))[:5000]
+    current_notes_row = db.execute(
+        "SELECT notes FROM nets WHERE id=?", (net["id"],)
+    ).fetchone()
+    current_notes = current_notes_row["notes"] or ""
+    if current_notes not in {base_notes, notes}:
+        return offline_operation_result(
+            operation_id,
+            "conflict",
+            "Zapisnik je bil na drugi napravi že spremenjen; strežniška različica je ohranjena.",
+        )
+    db.execute("UPDATE nets SET notes=? WHERE id=?", (notes or None, net["id"]))
+    insert_offline_audit(
+        db,
+        "offline_update_notes",
+        "net",
+        net["id"],
+        f"{net['title']} · operacija {operation_id}",
+    )
+    return offline_operation_result(
+        operation_id, "applied", "Zapisnik je sinhroniziran."
+    )
+
+
+@app.post("/api/offline/sync")
+def offline_sync():
+    if g.user is None:
+        return jsonify(error="authentication_required"), 401
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        return jsonify(error="invalid_payload"), 400
+    try:
+        net_id = int(payload.get("net_id"))
+    except (TypeError, ValueError):
+        return jsonify(error="invalid_net"), 400
+    operations = payload.get("operations")
+    if not isinstance(operations, list) or not 1 <= len(operations) <= 100:
+        return jsonify(error="invalid_operations"), 400
+
+    db = get_db()
+    net = db.execute("SELECT * FROM nets WHERE id=?", (net_id,)).fetchone()
+    if net is None:
+        return jsonify(error="net_not_found"), 404
+    if g.user["role"] != "admin" and net["leader_id"] != g.user["id"]:
+        return jsonify(error="forbidden"), 403
+
+    results = []
+    try:
+        db.execute("BEGIN IMMEDIATE")
+        for operation in operations:
+            if not isinstance(operation, dict):
+                results.append(
+                    offline_operation_result("", "invalid", "Neveljavna operacija.")
+                )
+                continue
+            operation_id = str(operation.get("operation_id", ""))
+            action = str(operation.get("action", ""))
+            data = operation.get("data")
+            if not OFFLINE_OPERATION_PATTERN.fullmatch(operation_id):
+                results.append(
+                    offline_operation_result(
+                        operation_id, "invalid", "ID operacije ni veljaven."
+                    )
+                )
+                continue
+            previous = db.execute(
+                """SELECT user_id, net_id, result_json FROM offline_operations
+                   WHERE operation_id=?""",
+                (operation_id,),
+            ).fetchone()
+            if previous:
+                if previous["user_id"] == g.user["id"] and previous["net_id"] == net_id:
+                    replayed = json.loads(previous["result_json"])
+                    replayed["replayed"] = True
+                    results.append(replayed)
+                else:
+                    results.append(
+                        offline_operation_result(
+                            operation_id, "invalid", "ID operacije je že uporabljen."
+                        )
+                    )
+                continue
+            if action not in OFFLINE_ACTIONS or not isinstance(data, dict):
+                result = offline_operation_result(
+                    operation_id, "invalid", "Vrsta operacije ni veljavna."
+                )
+            else:
+                result = apply_offline_operation(
+                    db, net, operation_id, action, data
+                )
+            db.execute(
+                """INSERT INTO offline_operations
+                   (operation_id, user_id, net_id, action, result_json, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (
+                    operation_id,
+                    g.user["id"],
+                    net_id,
+                    action[:40],
+                    json.dumps(result, ensure_ascii=False),
+                    now_db(),
+                ),
+            )
+            results.append(result)
+        db.execute(
+            """DELETE FROM offline_operations WHERE id NOT IN
+               (SELECT id FROM offline_operations ORDER BY id DESC LIMIT 5000)"""
+        )
+        db.commit()
+    except sqlite3.Error:
+        db.rollback()
+        return jsonify(error="database_unavailable"), 503
+
+    return jsonify(
+        results=results,
+        snapshot=offline_net_snapshot(net_id, db),
+        version=APP_VERSION,
     )
 
 

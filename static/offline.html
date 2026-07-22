@@ -1,0 +1,107 @@
+<!doctype html>
+<html lang="sl">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <meta name="theme-color" content="#145da0">
+  <meta name="application-name" content="S50TTT Skedi">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-title" content="S50TTT Skedi">
+  <title>S50TTT Skedi · brez povezave</title>
+  <link rel="manifest" href="/app.webmanifest">
+  <link rel="icon" type="image/svg+xml" href="/static/icons/app-icon.svg">
+  <link rel="apple-touch-icon" sizes="180x180" href="/static/icons/app-icon-180.png">
+  <link rel="stylesheet" href="/static/app.css">
+  <script defer src="/static/pwa.js"></script>
+</head>
+<body data-offline-page>
+  <div class="pwa-status" data-pwa-status role="status" hidden></div>
+  <div class="alpha-banner" role="status">
+    <span aria-hidden="true">⚠</span>
+    <strong>ALPHA · delo brez povezave</strong>
+  </div>
+  <header class="site-header">
+    <div class="nav offline-nav">
+      <span class="brand">
+        <span class="brand-mark" aria-hidden="true">📻</span>
+        <span><strong>S50TTT</strong><small>Offline dnevnik</small></span>
+      </span>
+      <span class="badge offline-badge">Brez povezave</span>
+    </div>
+  </header>
+
+  <main>
+    <div class="card" data-offline-empty hidden>
+      <h1>Ni shranjenega odprtega skeda</h1>
+      <p class="muted">Ko bo povezava na voljo, odpri aktivni sked. Aplikacija ga bo nato pripravila za delo brez povezave.</p>
+      <a class="btn btn-primary" href="/">Odpri portal</a>
+    </div>
+
+    <div data-offline-content hidden>
+      <div class="card">
+        <div class="actions">
+          <div>
+            <span class="badge open" data-offline-net-status>Odprt</span>
+            <h1 data-offline-net-title></h1>
+            <p data-offline-net-details></p>
+          </div>
+          <span class="offline-pending-count" data-offline-pending-count></span>
+        </div>
+        <div class="actions no-print">
+          <button class="btn btn-primary" type="button" data-sync-now>Sinhroniziraj zdaj</button>
+          <a class="btn btn-secondary" href="/" data-open-online>Odpri portal</a>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>Zapisnik / opombe skeda</h2>
+        <form data-offline-action="update-notes">
+          <textarea name="notes" maxlength="5000" placeholder="Obvestila kluba, tehnične težave, posebnosti skeda …"></textarea>
+          <button class="btn btn-primary" type="submit">Shrani lokalno</button>
+        </form>
+      </div>
+
+      <div class="card live-panel">
+        <h2>Dodaj prijavljenega</h2>
+        <form data-offline-action="add-participant">
+          <div class="grid">
+            <div class="field">
+              <label for="offline-callsign">Klicni znak</label>
+              <input id="offline-callsign" name="callsign" list="offline-callsign-options" required minlength="2" maxlength="24" pattern="[A-Za-z0-9][A-Za-z0-9/-]{0,22}[A-Za-z0-9]" autocomplete="off" class="callsign-input">
+              <datalist id="offline-callsign-options"></datalist>
+            </div>
+            <div class="field">
+              <label for="offline-full-name">Ime in priimek</label>
+              <input id="offline-full-name" name="full_name" required autocomplete="off">
+            </div>
+            <div class="field">
+              <label for="offline-checkin-time">Ura prijave</label>
+              <input id="offline-checkin-time" type="time" name="checkin_time" required>
+            </div>
+          </div>
+          <button class="btn btn-primary" type="submit">＋ Dodaj v dnevnik</button>
+        </form>
+      </div>
+
+      <div class="card">
+        <h2>Prijavljeni: <span data-offline-participant-count>0</span></h2>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Št.</th><th>Ura</th><th>Klicni znak</th><th>Ime in priimek</th><th></th></tr></thead>
+            <tbody data-offline-participants></tbody>
+          </table>
+        </div>
+        <p class="empty" data-offline-no-participants hidden>V tem skedu še ni prijavljenih.</p>
+      </div>
+
+      <div class="card offline-privacy">
+        <h2>Podatki v tej napravi</h2>
+        <p class="muted">Shranjeni so zadnji odprti sked, imenik in še neposlane spremembe. Ob odjavi se lokalni podatki odstranijo.</p>
+        <button class="btn btn-danger" type="button" data-clear-offline-now>Odstrani lokalne podatke</button>
+      </div>
+    </div>
+  </main>
+
+  <footer class="footer">S50TTT Dnevnik skedov · offline alpha</footer>
+</body>
+</html>

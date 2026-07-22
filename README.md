@@ -2,7 +2,7 @@
 
 Ločen spletni portal Radiokluba Sevnica S50TTT za vodenje skedov.
 
-Trenutna alpha različica: **1.23.0-alpha**
+Trenutna alpha različica: **1.24.0-alpha**
 
 ## Funkcije
 
@@ -44,6 +44,8 @@ Trenutna alpha različica: **1.23.0-alpha**
   po datumu, vrsti in statusu;
 - tiskanje dnevnika oziroma shranjevanje v PDF prek brskalnika;
 - mobilnim napravam prilagojen prikaz;
+- namestljiva PWA za Android in iPhone z offline pregledom odprtega skeda,
+  vpisom in odstranitvijo udeležencev ter urejanjem zapisnika;
 - zložljiv mobilni meni;
 - javni urnik brez osebnih podatkov in naročnina na koledar `.ics`;
 - administratorska stran `Sistem` s temperaturo Raspberry Pija, prostorom na
@@ -52,6 +54,35 @@ Trenutna alpha različica: **1.23.0-alpha**
 - obvezna zamenjava začasnega gesla novih uporabnikov;
 - sled sprememb v podatkovni bazi;
 - SQLite podatkovna baza v trajni mapi `data`.
+
+## Mobilna offline aplikacija (alpha)
+
+Portal je v različici `1.24.0-alpha` mogoče namestiti kot PWA. Android prikaže
+gumb `Namesti aplikacijo`; na iPhonu se v Safariju uporabi `Deli` in nato
+`Dodaj na začetni zaslon`.
+
+Za pripravo offline podatkov se je treba v nameščeni aplikaciji prijaviti in
+vsaj enkrat odpreti aktivni sked. Brez povezave so nato na voljo:
+
+- pregled zadnjega odprtega skeda in prijavljenih;
+- dodajanje in odstranjevanje udeležencev;
+- urejanje zapisnika oziroma opomb;
+- lokalni imenik klicnih znakov za samodejno izpolnjevanje imena.
+
+Spremembe dobijo enolične identifikatorje in se ob ponovni povezavi samodejno
+pošljejo na strežnik. Ponovljen poskus zato ne ustvari dvojnega vnosa. Če je bil
+sked medtem zaključen ali je nekdo na drugi napravi spremenil zapisnik, portal
+prikaže konflikt in ne prepiše strežniških podatkov. Odpiranje in zaključevanje
+skeda ostajata namenoma samo spletni funkciji.
+
+Service worker in namestitev PWA na telefonu zahtevata **HTTPS**. Lokalni naslov
+oblike `http://192.168.1.57:8024` zato zadostuje za običajni portal, ne pa za
+namestitev ali offline način. Za mobilno testiranje uporabi domeno alpha z
+veljavnim TLS-potrdilom. Nameščena aplikacija na iPhonu uporablja lastno sejo,
+zato se je treba v njej prijaviti še enkrat.
+
+Ob odjavi portal izbriše lokalni sked, imenik in neposlane spremembe iz naprave.
+Enako je mogoče narediti ročno na offline zaslonu.
 
 ## Imenik klicnih znakov (alpha)
 
@@ -303,5 +334,5 @@ docker compose run --rm skedi python -m unittest discover -s tests -v
 ```
 
 Repozitorij vsebuje tudi GitHub Actions, ki ob spremembi vej `alpha` ali `main`
-samodejno zažene vseh 49 testov, pregleda odvisnosti za znane ranljivosti in
+samodejno zažene vseh 55 testov, pregleda odvisnosti za znane ranljivosti in
 preveri gradnjo Docker slike.

@@ -147,6 +147,183 @@ class ScheduleTests(unittest.TestCase):
         self.assertEqual(response.get_json()["version"], APP_VERSION)
         self.assertEqual(response.get_json()["channel"], RELEASE_CHANNEL)
 
+    def test_pwa_manifest_service_worker_and_offline_shell_are_public(self):
+        client = flask_app.test_client()
+
+        manifest_response = client.get("/app.webmanifest")
+        self.assertEqual(manifest_response.status_code, 200)
+        self.assertEqual(manifest_response.mimetype, "application/manifest+json")
+        manifest = manifest_response.get_json()
+        self.assertEqual(manifest["display"], "standalone")
+        self.assertEqual(manifest["start_url"], "/?source=pwa")
+        self.assertTrue(any(icon["sizes"] == "512x512" for icon in manifest["icons"]))
+
+        worker_response = client.get("/service-worker.js")
+        self.assertEqual(worker_response.status_code, 200)
+        self.assertEqual(worker_response.headers["Service-Worker-Allowed"], "/")
+        self.assertIn("/static/offline.html", worker_response.get_data(as_text=True))
+
+        offline_response = client.get("/static/offline.html")
+        self.assertEqual(offline_response.status_code, 200)
+        self.assertIn("delo brez povezave", offline_response.get_data(as_text=True))
+        manifest_response.close()
+        worker_response.close()
+        offline_response.close()
+
+    def test_open_net_page_prepares_offline_snapshot_and_forms(self):
+        net_id, admin_id = self.create_open_net("Offline preizkus")
+        client = self.authenticated_client(admin_id)
+
+        response = client.get(f"/nets/{net_id}")
+        html = response.get_data(as_text=True)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn('id="offline-net-snapshot"', html)
+        self.assertIn('data-offline-action="add-participant"', html)
+        self.assertIn('data-offline-action="update-notes"', html)
+        self.assertIn('rel="manifest"', html)
+        self.assertIn("Offline preizkus", html)
+
+    def test_offline_sync_add_is_idempotent_and_audited(self):
+        net_id, admin_id = self.create_open_net("Idempotentni offline vnos")
+        client = self.authenticated_client(admin_id)
+        operation = {
+            "operation_id": "offlineaddoperation0001",
+            "net_id": net_id,
+            "action": "add_participant",
+            "data": {
+                "callsign": "s56pwa",
+                "full_name": "PWA Preizkus",
+                "checkin_time": "20:14",
+            },
+            "created_at": "2030-01-05T20:14:00Z",
+        }
+
+        first = client.post(
+            "/api/offline/sync",
+            json={"net_id": net_id, "operations": [operation]},
+            headers={"X-CSRF-Token": "test-csrf-token"},
+        )
+        second = client.post(
+            "/api/offline/sync",
+            json={"net_id": net_id, "operations": [operation]},
+            headers={"X-CSRF-Token": "test-csrf-token"},
+        )
+
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(first.get_json()["results"][0]["status"], "applied")
+        self.assertEqual(second.status_code, 200)
+        self.assertTrue(second.get_json()["results"][0]["replayed"])
+        with flask_app.app_context():
+            db = get_db()
+            self.assertEqual(
+                db.execute(
+                    "SELECT COUNT(*) AS n FROM participants WHERE net_id=? AND callsign='S56PWA'",
+                    (net_id,),
+                ).fetchone()["n"],
+                1,
+            )
+            self.assertEqual(
+                db.execute(
+                    "SELECT COUNT(*) AS n FROM offline_operations WHERE operation_id=?",
+                    (operation["operation_id"],),
+                ).fetchone()["n"],
+                1,
+            )
+            self.assertEqual(
+                db.execute(
+                    "SELECT COUNT(*) AS n FROM audit_log WHERE action='offline_create'",
+                ).fetchone()["n"],
+                1,
+            )
+
+    def test_offline_sync_updates_notes_and_deletes_participant(self):
+        net_id, admin_id = self.create_open_net("Offline spremembe")
+        with flask_app.app_context():
+            db = get_db()
+            participant = db.execute(
+                """INSERT INTO participants
+                   (net_id, full_name, callsign, checkin_at, created_by, created_at)
+                   VALUES (?, 'Za izbris', 'S57DEL', '2030-01-05 20:20:00', ?, ?)""",
+                (net_id, admin_id, now_db()),
+            )
+            participant_id = participant.lastrowid
+            db.commit()
+        client = self.authenticated_client(admin_id)
+        operations = [
+            {
+                "operation_id": "offlinenotesoperation01",
+                "action": "update_notes",
+                "data": {"base_notes": "", "notes": "Opomba brez povezave"},
+            },
+            {
+                "operation_id": "offlinedeleteoperation1",
+                "action": "delete_participant",
+                "data": {"participant_id": participant_id},
+            },
+        ]
+
+        response = client.post(
+            "/api/offline/sync",
+            json={"net_id": net_id, "operations": operations},
+            headers={"X-CSRF-Token": "test-csrf-token"},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            [result["status"] for result in response.get_json()["results"]],
+            ["applied", "applied"],
+        )
+        with flask_app.app_context():
+            db = get_db()
+            self.assertEqual(
+                db.execute("SELECT notes FROM nets WHERE id=?", (net_id,)).fetchone()["notes"],
+                "Opomba brez povezave",
+            )
+            self.assertIsNone(
+                db.execute("SELECT id FROM participants WHERE id=?", (participant_id,)).fetchone()
+            )
+
+    def test_offline_sync_preserves_server_notes_on_conflict(self):
+        net_id, admin_id = self.create_open_net("Offline konflikt")
+        with flask_app.app_context():
+            get_db().execute("UPDATE nets SET notes='Strežniška opomba' WHERE id=?", (net_id,))
+            get_db().commit()
+        client = self.authenticated_client(admin_id)
+
+        response = client.post(
+            "/api/offline/sync",
+            json={
+                "net_id": net_id,
+                "operations": [
+                    {
+                        "operation_id": "offlineconflictoperation",
+                        "action": "update_notes",
+                        "data": {"base_notes": "Stara opomba", "notes": "Offline opomba"},
+                    }
+                ],
+            },
+            headers={"X-CSRF-Token": "test-csrf-token"},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()["results"][0]["status"], "conflict")
+        with flask_app.app_context():
+            self.assertEqual(
+                get_db().execute("SELECT notes FROM nets WHERE id=?", (net_id,)).fetchone()["notes"],
+                "Strežniška opomba",
+            )
+
+    def test_offline_sync_requires_authenticated_session(self):
+        response = flask_app.test_client().post(
+            "/api/offline/sync",
+            json={"net_id": 1, "operations": [{"operation_id": "offlineunauthenticated1"}]},
+            headers={"X-CSRF-Token": "stale-token"},
+        )
+
+        self.assertEqual(response.status_code, 401)
+        self.assertEqual(response.get_json()["error"], "authentication_required")
+
     def test_new_participant_is_learned_and_suggested_from_directory(self):
         net_id, admin_id = self.create_open_net("Test imenika klicnih znakov")
         client = self.authenticated_client(admin_id)
@@ -2034,12 +2211,17 @@ class ScheduleTests(unittest.TestCase):
                     version = db.execute(
                         "SELECT MAX(version) AS n FROM schema_migrations"
                     ).fetchone()["n"]
+                    offline_table = db.execute(
+                        """SELECT name FROM sqlite_master
+                           WHERE type='table' AND name='offline_operations'"""
+                    ).fetchone()
             self.assertIn("must_change_password", columns)
             self.assertIn("auth_version", columns)
             self.assertEqual(existing["callsign"], "S50OLD")
             self.assertEqual(existing["must_change_password"], 0)
             self.assertEqual(existing["auth_version"], 0)
-            self.assertEqual(version, 2)
+            self.assertEqual(version, 3)
+            self.assertIsNotNone(offline_table)
 
 
 if __name__ == "__main__":

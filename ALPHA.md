@@ -9,7 +9,7 @@ veja alpha ──> s50ttt-skedi-alpha  ──> port 8024 ──> data-alpha/sked
 ```
 
 Alpha na vsaki strani prikaže rumeno opozorilo in različico, na primer
-`1.23.0-alpha`. Vpisani testni podatki nikoli ne končajo v produkcijski bazi.
+`1.24.0-alpha`. Vpisani testni podatki nikoli ne končajo v produkcijski bazi.
 
 Trenutne alpha funkcije vključujejo lokalni imenik klicnih znakov,
 administratorsko odpoved ali prestavitev rednega skeda, statistiko, CSV/PDF
@@ -84,7 +84,7 @@ curl -s http://127.0.0.1:8024/health
 Pričakovani odgovor vsebuje kanal `alpha`:
 
 ```json
-{"channel":"alpha","database":"ok","schema_latest":2,"schema_version":2,"status":"ok","version":"1.23.0-alpha"}
+{"channel":"alpha","database":"ok","schema_latest":3,"schema_version":3,"status":"ok","version":"1.24.0-alpha"}
 ```
 
 Alpha varnostne kopije se shranjujejo v `backups-alpha/`. Obnovitev izbrane
@@ -122,6 +122,39 @@ Pred združitvijo je priporočljivo v alpha mapi zagnati vse preizkuse:
 ```bash
 docker compose --env-file .env.alpha -f docker-compose.alpha.yml run --rm skedi-alpha python -m unittest discover -s tests -v
 ```
+
+## 6. Preizkus mobilne offline aplikacije
+
+Namestitev PWA in service worker na telefonu zahtevata varen naslov HTTPS.
+Neposredni lokalni naslov `http://192.168.1.57:8024` omogoča običajni dostop,
+ne omogoča pa namestitve ali offline načina. Za preizkus uporabi alpha domeno z
+veljavnim TLS-potrdilom; dostop lahko ostane omejen z Nginx Proxy Manager Access
+List oziroma samo na domače omrežje.
+
+Android:
+
+1. v Chromu odpri alpha domeno prek HTTPS in se prijavi;
+2. izberi `Namesti aplikacijo` oziroma meni `Namesti aplikacijo`;
+3. zaženi nameščeno aplikacijo in odpri aktivni sked.
+
+iPhone oziroma iPad:
+
+1. v Safariju odpri alpha domeno prek HTTPS;
+2. izberi `Deli` in `Dodaj na začetni zaslon`;
+3. zaženi ikono S50TTT, se v aplikaciji prijavi in odpri aktivni sked.
+
+Offline preizkus:
+
+1. ko je aktivni sked odprt, na telefonu vključi letalski način;
+2. ponovno odpri aplikacijo ter dodaj udeleženca, spremeni zapisnik in po potrebi
+   odstrani udeleženca;
+3. izključi letalski način in ponovno odpri aplikacijo;
+4. počakaj na obvestilo o končani sinhronizaciji ter preveri podatke in revizijo
+   v spletnem portalu.
+
+Zaključevanje skeda je namenoma onemogočeno brez povezave. Ob odjavi ali izbiri
+`Odstrani lokalne podatke` se shranjeni sked in neposlane spremembe izbrišejo iz
+naprave.
 
 ## Pomembno
 

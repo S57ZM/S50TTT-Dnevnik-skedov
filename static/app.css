@@ -270,6 +270,43 @@ tr:last-child td { border-bottom: 0; }
 .metric-card progress::-webkit-progress-value { background: var(--blue); border-radius: 999px; }
 .metric-card progress::-moz-progress-bar { background: var(--blue); border-radius: 999px; }
 .public-hero { text-align: center; max-width: 760px; margin-left: auto; margin-right: auto; }
+.pwa-status {
+  position: sticky;
+  top: 0;
+  z-index: 1200;
+  padding: 9px 14px;
+  text-align: center;
+  color: #173346;
+  background: #dceefb;
+  border-bottom: 1px solid #b6d9f1;
+  font-size: .9rem;
+  font-weight: 750;
+}
+.pwa-status.success { color: #075f34; background: #dff5e9; border-bottom-color: #aedfc4; }
+.pwa-status.warning { color: #704b00; background: #fff1c7; border-bottom-color: #ead48c; }
+.pwa-status.danger { color: #8f1d14; background: #fee4e2; border-bottom-color: #efb7b3; }
+.footer-install {
+  margin-left: 8px;
+  border: 0;
+  padding: 4px 8px;
+  color: var(--blue2);
+  background: transparent;
+  font: inherit;
+  font-weight: 750;
+  text-decoration: underline;
+  cursor: pointer;
+}
+.footer-install-hint { display: inline-block; margin-left: 8px; color: var(--muted); }
+.offline-nav { justify-content: space-between; }
+.offline-badge { color: #704b00; background: #fff1c7; }
+.offline-pending-count { align-self: flex-start; padding: 7px 10px; border-radius: 999px; color: #704b00; background: #fff1c7; font-size: .86rem; font-weight: 750; }
+.offline-pending { background: #fff9e8; }
+.offline-pending td:first-child::after { content: " · čaka"; color: #8a6200; font-size: .72rem; }
+.offline-callsign { font-weight: 800; }
+.offline-privacy { border: 1px dashed #c6d3dc; }
+.is-disabled { opacity: .55; pointer-events: none; }
+body[data-offline-page] { padding-bottom: env(safe-area-inset-bottom); }
+body[data-offline-page] main { max-width: 980px; }
 
 @media (min-width: 701px) {
   .nav-account-group {
@@ -381,6 +418,9 @@ tr:last-child td { border-bottom: 0; }
   .bar-row > small { display: none; }
   .report-filters { grid-template-columns: 1fr; }
   .live-entry { align-items: center; }
+  .offline-nav .brand { width: auto; }
+  .offline-pending-count { width: 100%; text-align: center; }
+  .footer-install, .footer-install-hint { display: block; margin: 7px auto 0; }
 }
 
 @keyframes menu-in {
