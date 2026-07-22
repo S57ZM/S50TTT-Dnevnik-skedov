@@ -2,7 +2,7 @@
 
 Ločen spletni portal Radiokluba Sevnica S50TTT za vodenje skedov.
 
-Trenutna alpha različica: **1.24.0-alpha**
+Trenutna alpha različica: **1.25.0-alpha**
 
 ## Funkcije
 
@@ -44,8 +44,8 @@ Trenutna alpha različica: **1.24.0-alpha**
   po datumu, vrsti in statusu;
 - tiskanje dnevnika oziroma shranjevanje v PDF prek brskalnika;
 - mobilnim napravam prilagojen prikaz;
-- namestljiva PWA za Android in iPhone z offline pregledom odprtega skeda,
-  vpisom in odstranitvijo udeležencev ter urejanjem zapisnika;
+- namestljiva PWA za Android in iPhone z offline odpiranjem rednega ali
+  izrednega skeda, vpisom in odstranitvijo udeležencev ter urejanjem zapisnika;
 - zložljiv mobilni meni;
 - javni urnik brez osebnih podatkov in naročnina na koledar `.ics`;
 - administratorska stran `Sistem` s temperaturo Raspberry Pija, prostorom na
@@ -57,13 +57,14 @@ Trenutna alpha različica: **1.24.0-alpha**
 
 ## Mobilna offline aplikacija (alpha)
 
-Portal je v različici `1.24.0-alpha` mogoče namestiti kot PWA. Android prikaže
+Portal je v različici `1.25.0-alpha` mogoče namestiti kot PWA. Android prikaže
 gumb `Namesti aplikacijo`; na iPhonu se v Safariju uporabi `Deli` in nato
 `Dodaj na začetni zaslon`.
 
 Za pripravo offline podatkov se je treba v nameščeni aplikaciji prijaviti in
-vsaj enkrat odpreti aktivni sked. Brez povezave so nato na voljo:
+vsaj enkrat obiskati domačo stran portala. Brez povezave so nato na voljo:
 
+- odprtje shranjenega rednega termina ali izrednega skeda z ročnim datumom in uro;
 - pregled zadnjega odprtega skeda in prijavljenih;
 - dodajanje in odstranjevanje udeležencev;
 - urejanje zapisnika oziroma opomb;
@@ -72,8 +73,9 @@ vsaj enkrat odpreti aktivni sked. Brez povezave so nato na voljo:
 Spremembe dobijo enolične identifikatorje in se ob ponovni povezavi samodejno
 pošljejo na strežnik. Ponovljen poskus zato ne ustvari dvojnega vnosa. Če je bil
 sked medtem zaključen ali je nekdo na drugi napravi spremenil zapisnik, portal
-prikaže konflikt in ne prepiše strežniških podatkov. Odpiranje in zaključevanje
-skeda ostajata namenoma samo spletni funkciji.
+prikaže konflikt in ne prepiše strežniških podatkov. Če isti redni sked medtem
+odpre druga naprava, se ne ustvari dvojnik. Zaključevanje skeda ostaja namenoma
+samo spletna funkcija.
 
 Service worker in namestitev PWA na telefonu zahtevata **HTTPS**. Lokalni naslov
 oblike `http://192.168.1.57:8024` zato zadostuje za običajni portal, ne pa za

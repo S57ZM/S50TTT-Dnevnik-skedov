@@ -96,7 +96,8 @@
 
   function saveSnapshot(snapshot) {
     if (!snapshot || !snapshot.net || !snapshot.net.id) return Promise.resolve();
-    snapshot.net_id = Number(snapshot.net.id);
+    const rawNetId = String(snapshot.net.id);
+    snapshot.net_id = rawNetId.startsWith("local:") ? rawNetId : Number(rawNetId);
     snapshot.local_saved_at = new Date().toISOString();
     return putRecord(SNAPSHOTS, snapshot)
       .then(function () { return setMeta("current_net_id", snapshot.net_id); });
@@ -104,7 +105,7 @@
 
   function currentSnapshot() {
     return getMeta("current_net_id").then(function (netId) {
-      if (netId !== null) return getRecord(SNAPSHOTS, Number(netId));
+      if (netId !== null) return getRecord(SNAPSHOTS, netId);
       return getAllRecords(SNAPSHOTS).then(function (snapshots) {
         snapshots.sort(function (left, right) {
           return String(right.local_saved_at || "").localeCompare(String(left.local_saved_at || ""));
@@ -123,9 +124,10 @@
   }
 
   function queueOperation(netId, action, data, id) {
+    const rawNetId = String(netId);
     const operation = {
       operation_id: id || operationId(),
-      net_id: Number(netId),
+      net_id: rawNetId.startsWith("local:") ? rawNetId : Number(rawNetId),
       action: action,
       data: data,
       created_at: new Date().toISOString()
@@ -136,7 +138,7 @@
   function pendingOperations(netId) {
     return getAllRecords(OPERATIONS).then(function (operations) {
       return operations.filter(function (operation) {
-        return netId === undefined || Number(operation.net_id) === Number(netId);
+        return netId === undefined || String(operation.net_id) === String(netId);
       }).sort(function (left, right) {
         return String(left.created_at).localeCompare(String(right.created_at));
       });
@@ -242,8 +244,154 @@
     }
   }
 
+  function captureOfflineBootstrap() {
+    const script = document.getElementById("offline-bootstrap");
+    if (!script) return Promise.resolve(null);
+    try {
+      const bootstrap = JSON.parse(script.textContent);
+      return setMeta("offline_bootstrap", bootstrap).then(function () { return bootstrap; });
+    } catch (_error) {
+      return Promise.resolve(null);
+    }
+  }
+
   function normaliseCallsign(value) {
     return String(value || "").trim().toUpperCase().replace(/\s+/g, "");
+  }
+
+  function applyOfflineOpenSelection(bootstrap) {
+    const select = document.getElementById("offline-net-kind");
+    const title = document.getElementById("offline-net-title");
+    const netDate = document.getElementById("offline-net-date");
+    const startedTime = document.getElementById("offline-net-time");
+    if (!select || !title || !netDate || !startedTime || !bootstrap) return;
+    const regularMatch = String(select.value).match(/^regular:(\d+)$/);
+    const regular = regularMatch ? (bootstrap.regular_nets || [])[Number(regularMatch[1])] : null;
+    if (regular) {
+      title.value = regular.label || regular.title || "Redni sked";
+      netDate.value = regular.net_date;
+      startedTime.value = regular.started_time;
+      title.readOnly = true;
+      netDate.readOnly = true;
+      startedTime.readOnly = true;
+    } else {
+      title.readOnly = false;
+      netDate.readOnly = false;
+      startedTime.readOnly = false;
+      title.value = "";
+      netDate.value = (bootstrap.extra_defaults || {}).net_date || "";
+      startedTime.value = (bootstrap.extra_defaults || {}).started_time || "";
+    }
+  }
+
+  function localIsoDate() {
+    const now = new Date();
+    return now.getFullYear() + "-" + String(now.getMonth() + 1).padStart(2, "0") + "-" + String(now.getDate()).padStart(2, "0");
+  }
+
+  function regularAvailableOffline(regular) {
+    return Boolean(
+      regular
+      && !regular.existing_id
+      && regular.exception_action !== "canceled"
+      && (regular.can_open || (regular.open_date && localIsoDate() >= regular.open_date))
+    );
+  }
+
+  function prepareOfflineOpenForm(bootstrap) {
+    const form = document.querySelector("form[data-offline-create]");
+    const select = document.getElementById("offline-net-kind");
+    const help = document.querySelector("[data-offline-open-help]");
+    if (!form || !select) return;
+    select.replaceChildren();
+    const extra = document.createElement("option");
+    extra.value = "extra";
+    extra.textContent = "Drug ali izredni sked";
+    select.appendChild(extra);
+    if (!bootstrap || !bootstrap.user) {
+      form.querySelectorAll("input, select, button").forEach(function (control) { control.disabled = true; });
+      text(help, "Za offline odprtje se najprej prijavi in enkrat obišči domačo stran portala, ko je povezava na voljo.");
+      return;
+    }
+    form.querySelectorAll("input, select, button").forEach(function (control) { control.disabled = false; });
+    (bootstrap.regular_nets || []).forEach(function (regular, index) {
+      if (!regularAvailableOffline(regular)) return;
+      const option = document.createElement("option");
+      option.value = "regular:" + index;
+      option.textContent = (regular.label || "Redni sked") + " · " + formatDate(regular.net_date) + " ob " + regular.started_time;
+      select.appendChild(option);
+    });
+    text(help, "Izberi shranjeni redni termin ali odpri izredni sked. Ob vrnitvi povezave se dnevnik samodejno ustvari na strežniku.");
+    applyOfflineOpenSelection(bootstrap);
+  }
+
+  function createOfflineNet(form) {
+    return getMeta("offline_bootstrap").then(function (bootstrap) {
+      if (!bootstrap || !bootstrap.user) {
+        showStatus("Za offline odprtje najprej obišči portal s povezavo.", "warning");
+        return false;
+      }
+      const data = new FormData(form);
+      const kind = String(data.get("net_kind") || "extra");
+      const regularMatch = kind.match(/^regular:(\d+)$/);
+      const regular = regularMatch ? (bootstrap.regular_nets || [])[Number(regularMatch[1])] : null;
+      let createData;
+      let displayTitle;
+      let repeater = null;
+      let controlCallsign = null;
+      if (regular) {
+        if (!regularAvailableOffline(regular)) {
+          showStatus("Ta redni termin ni na voljo za offline odprtje.", "warning");
+          return false;
+        }
+        createData = {
+          schedule_type: regular.schedule_type,
+          scheduled_date: regular.scheduled_date,
+          net_date: regular.net_date,
+          started_time: regular.started_time
+        };
+        displayTitle = regular.label || regular.title;
+        repeater = regular.repeater || null;
+        controlCallsign = regular.control_callsign || null;
+      } else {
+        const netDate = String(data.get("net_date") || "");
+        const startedTime = String(data.get("started_time") || "");
+        const title = String(data.get("title") || "").trim().slice(0, 120);
+        if (!/^\d{4}-\d{2}-\d{2}$/.test(netDate) || !/^\d{2}:\d{2}$/.test(startedTime)) {
+          showStatus("Vnesi veljaven datum in začetno uro.", "danger");
+          return false;
+        }
+        createData = { title: title, net_date: netDate, started_time: startedTime };
+        displayTitle = title || "Sked " + formatDate(netDate);
+      }
+      const id = operationId();
+      const localNetId = "local:" + id;
+      const snapshot = {
+        schema_version: 1,
+        saved_at: new Date().toISOString(),
+        net: {
+          id: localNetId,
+          title: displayTitle,
+          net_date: createData.net_date,
+          started_at: createData.net_date + " " + createData.started_time + ":00",
+          status: "open",
+          leader_name: bootstrap.user.full_name,
+          leader_callsign: bootstrap.user.callsign,
+          repeater: repeater,
+          control_callsign: controlCallsign,
+          notes: "",
+          can_sync: true,
+          pending_create: true
+        },
+        participants: [],
+        directory: (bootstrap.directory || []).map(function (entry) {
+          return { callsign: entry.callsign, full_name: entry.full_name };
+        })
+      };
+      return queueOperation(localNetId, "create_net", createData, id)
+        .then(function () { return saveSnapshot(snapshot); })
+        .then(function () { form.reset(); return true; });
+    });
   }
 
   function queueAddParticipant(form, snapshot) {
@@ -305,8 +453,9 @@
   }
 
   function queueFormOperation(form) {
-    const netId = Number(form.dataset.netId || 0);
-    return (netId ? getRecord(SNAPSHOTS, netId) : currentSnapshot()).then(function (snapshot) {
+    const netId = String(form.dataset.netId || "");
+    const lookupId = netId.startsWith("local:") ? netId : Number(netId || 0);
+    return (lookupId ? getRecord(SNAPSHOTS, lookupId) : currentSnapshot()).then(function (snapshot) {
       if (!snapshot || !snapshot.net.can_sync) {
         showStatus("Ta sked ni pripravljen za spreminjanje brez povezave.", "danger");
         return false;
@@ -316,6 +465,106 @@
       if (form.dataset.offlineAction === "delete-participant") return queueDeleteParticipant(form, snapshot);
       if (form.dataset.offlineAction === "update-notes") return queueNotes(form, snapshot);
       return false;
+    });
+  }
+
+  function postOfflineJson(path, body, csrfToken) {
+    return window.fetch(path, {
+      method: "POST",
+      credentials: "same-origin",
+      headers: {
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "X-CSRF-Token": csrfToken
+      },
+      body: JSON.stringify(body)
+    }).then(function (response) {
+      return response.json().catch(function () { return {}; }).then(function (payload) {
+        if (response.status === 401) {
+          const authError = new Error("auth");
+          authError.code = "auth";
+          throw authError;
+        }
+        if (!response.ok) {
+          const requestError = new Error(payload.message || "Sinhronizacija ni uspela.");
+          requestError.code = payload.error || "sync";
+          throw requestError;
+        }
+        return payload;
+      });
+    });
+  }
+
+  function applyOfflineSyncPayload(payload, state) {
+    const removals = (payload.results || []).map(function (result) {
+      if (result.status === "conflict" || result.status === "invalid") {
+        state.conflicts += 1;
+        state.notices.push(result.message);
+      }
+      if (result.operation_id) state.synced += 1;
+      return result.operation_id ? deleteRecord(OPERATIONS, result.operation_id) : Promise.resolve();
+    });
+    return Promise.all(removals).then(function () {
+      return payload.snapshot ? saveSnapshot(payload.snapshot) : null;
+    });
+  }
+
+  function syncExistingNet(netId, operations, csrfToken, state) {
+    if (!operations.length) return Promise.resolve();
+    return postOfflineJson(
+      "/api/offline/sync",
+      { net_id: Number(netId), operations: operations },
+      csrfToken
+    ).then(function (payload) { return applyOfflineSyncPayload(payload, state); });
+  }
+
+  function syncLocalNet(localNetId, operations, csrfToken, state) {
+    const createOperation = operations.find(function (operation) { return operation.action === "create_net"; });
+    if (!createOperation) {
+      const missing = new Error("Manjka podatek za ustvarjanje offline skeda.");
+      missing.code = "missing_create";
+      return Promise.reject(missing);
+    }
+    return postOfflineJson(
+      "/api/offline/nets",
+      { operation_id: createOperation.operation_id, data: createOperation.data },
+      csrfToken
+    ).then(function (payload) {
+      const realNetId = Number(payload.result && payload.result.net_id);
+      if (!realNetId || !payload.snapshot) {
+        const invalid = new Error("Strežnik ni vrnil ustvarjenega skeda.");
+        invalid.code = "invalid_create_response";
+        throw invalid;
+      }
+      const remaining = operations.filter(function (operation) {
+        return operation.operation_id !== createOperation.operation_id;
+      });
+      state.synced += 1;
+      return getRecord(SNAPSHOTS, localNetId).then(function (localSnapshot) {
+        const mappedSnapshot = payload.snapshot;
+        if (localSnapshot) {
+          mappedSnapshot.net.notes = localSnapshot.net.notes || "";
+          const combinedParticipants = (mappedSnapshot.participants || []).slice();
+          (localSnapshot.participants || []).forEach(function (participant) {
+            if (!combinedParticipants.some(function (existing) {
+              return normaliseCallsign(existing.callsign) === normaliseCallsign(participant.callsign);
+            })) combinedParticipants.push(participant);
+          });
+          mappedSnapshot.participants = combinedParticipants;
+          mappedSnapshot.directory = localSnapshot.directory || mappedSnapshot.directory;
+        }
+        mappedSnapshot.net.pending_create = false;
+        return deleteRecord(OPERATIONS, createOperation.operation_id)
+          .then(function () {
+            return Promise.all(remaining.map(function (operation) {
+              operation.net_id = realNetId;
+              return putRecord(OPERATIONS, operation);
+            }));
+          })
+          .then(function () { return deleteRecord(SNAPSHOTS, localNetId); })
+          .then(function () { return saveSnapshot(mappedSnapshot); })
+          .then(function () { return syncExistingNet(realNetId, remaining, csrfToken, state); });
+      });
     });
   }
 
@@ -335,57 +584,36 @@
         if (!groups[key]) groups[key] = [];
         groups[key].push(operation);
       });
-      let synced = 0;
-      let conflicts = 0;
-      const notices = [];
+      const state = { synced: 0, conflicts: 0, notices: [] };
       let chain = Promise.resolve();
       Object.keys(groups).forEach(function (netId) {
         chain = chain.then(function () {
-          return window.fetch("/api/offline/sync", {
-            method: "POST",
-            credentials: "same-origin",
-            headers: {
-              "Accept": "application/json",
-              "Content-Type": "application/json",
-              "X-CSRF-Token": csrfToken
-            },
-            body: JSON.stringify({ net_id: Number(netId), operations: groups[netId] })
-          }).then(function (response) {
-            if (response.status === 401) {
-              throw new Error("auth");
-            }
-            if (!response.ok) throw new Error("sync");
-            return response.json();
-          }).then(function (payload) {
-            const removals = (payload.results || []).map(function (result) {
-              if (result.status === "conflict" || result.status === "invalid") {
-                conflicts += 1;
-                notices.push(result.message);
-              }
-              if (result.operation_id) synced += 1;
-              return result.operation_id ? deleteRecord(OPERATIONS, result.operation_id) : Promise.resolve();
-            });
-            return Promise.all(removals).then(function () {
-              return payload.snapshot ? saveSnapshot(payload.snapshot) : null;
-            });
+          if (netId.startsWith("local:")) {
+            return syncLocalNet(netId, groups[netId], csrfToken, state);
+          }
+          const regularOperations = groups[netId].filter(function (operation) {
+            return operation.action !== "create_net";
           });
+          return syncExistingNet(netId, regularOperations, csrfToken, state);
         });
       });
       return chain.then(function () {
-        const message = conflicts
-          ? "Sinhronizacija končana z opozorili: " + notices.join(" ")
+        const message = state.conflicts
+          ? "Sinhronizacija končana z opozorili: " + state.notices.join(" ")
           : "Sinhronizacija je končana.";
         return setMeta("last_sync_notice", message).then(function () {
-          showStatus(message, conflicts ? "warning" : "success");
-          return { synced: synced, conflicts: conflicts };
+          showStatus(message, state.conflicts ? "warning" : "success");
+          return { synced: state.synced, conflicts: state.conflicts };
         });
       }).catch(function (error) {
-        if (error.message === "auth") {
+        if (error.code === "auth") {
           showStatus("Za sinhronizacijo se ponovno prijavi v portal.", "warning");
+        } else if (error.message) {
+          showStatus(error.message + " Offline podatki so ostali v napravi.", "warning");
         } else {
           showStatus("Sinhronizacija trenutno ni uspela; spremembe ostajajo v napravi.", "warning");
         }
-        return { synced: 0, conflicts: 0 };
+        return { synced: 0, conflicts: state.conflicts + 1 };
       });
     });
   }
@@ -409,14 +637,16 @@
 
   function renderOfflinePage() {
     if (!document.body.hasAttribute("data-offline-page")) return Promise.resolve();
-    return Promise.all([currentSnapshot(), pendingOperations()]).then(function (values) {
+    return Promise.all([currentSnapshot(), pendingOperations(), getMeta("offline_bootstrap")]).then(function (values) {
       const snapshot = values[0];
       const operations = values[1];
+      const bootstrap = values[2];
       const empty = document.querySelector("[data-offline-empty]");
       const content = document.querySelector("[data-offline-content]");
       if (!snapshot) {
         empty.hidden = false;
         content.hidden = true;
+        prepareOfflineOpenForm(bootstrap);
         return;
       }
       empty.hidden = true;
@@ -427,9 +657,9 @@
         + " · operater " + net.leader_name + " (" + net.leader_callsign + ")";
       text(document.querySelector("[data-offline-net-details]"), details);
       const status = document.querySelector("[data-offline-net-status]");
-      text(status, net.status === "open" ? "Odprt" : "Zaključen");
-      status.className = "badge " + (net.status === "open" ? "open" : "closed");
-      const netOperations = operations.filter(function (operation) { return Number(operation.net_id) === Number(net.id); });
+      text(status, net.pending_create ? "Čaka na prenos" : (net.status === "open" ? "Odprt" : "Zaključen"));
+      status.className = "badge " + (net.pending_create ? "postponed" : (net.status === "open" ? "open" : "closed"));
+      const netOperations = operations.filter(function (operation) { return String(operation.net_id) === String(net.id); });
       text(document.querySelector("[data-offline-pending-count]"), netOperations.length ? netOperations.length + " neposlanih sprememb" : "Vse je sinhronizirano");
 
       document.querySelectorAll("[data-offline-action]").forEach(function (form) {
@@ -482,7 +712,9 @@
       });
       text(document.querySelector("[data-offline-participant-count]"), snapshot.participants.length);
       document.querySelector("[data-offline-no-participants]").hidden = snapshot.participants.length > 0;
-      document.querySelector("[data-open-online]").href = "/nets/" + net.id;
+      const openOnline = document.querySelector("[data-open-online]");
+      openOnline.hidden = String(net.id).startsWith("local:");
+      openOnline.href = openOnline.hidden ? "/" : "/nets/" + net.id;
     });
   }
 
@@ -497,6 +729,31 @@
         return normaliseCallsign(item.value) === callsign.value;
       });
       if (option && !fullName.value) fullName.value = option.dataset.fullName || "";
+    });
+  }
+
+  function setupOfflineOpenForm() {
+    const form = document.querySelector("form[data-offline-create]");
+    const select = document.getElementById("offline-net-kind");
+    if (!form || !select) return;
+    select.addEventListener("change", function () {
+      getMeta("offline_bootstrap").then(applyOfflineOpenSelection);
+    });
+    form.addEventListener("submit", function (event) {
+      event.preventDefault();
+      currentSnapshot().then(function (snapshot) {
+        if (snapshot) {
+          showStatus("Na tej napravi je že pripravljen odprt sked.", "warning");
+          return false;
+        }
+        return createOfflineNet(form);
+      }).then(function (created) {
+        if (!created) return null;
+        showStatus("Sked je odprt v napravi. Lahko začneš z vpisovanjem.", "success");
+        return renderOfflinePage().then(function () { return syncAll(); }).then(renderOfflinePage);
+      }).catch(function () {
+        showStatus("Offline skeda ni bilo mogoče odpreti v tej napravi.", "danger");
+      });
     });
   }
 
@@ -571,8 +828,10 @@
     setupFormInterception();
     setupOfflineButtons();
     setupOfflineAutofill();
+    setupOfflineOpenForm();
     rememberCurrentUser()
       .then(rememberCurrentCsrf)
+      .then(captureOfflineBootstrap)
       .then(captureOnlineSnapshot)
       .then(function () { return renderOfflinePage(); })
       .then(function () { return getMeta("last_sync_notice"); })

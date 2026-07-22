@@ -304,6 +304,8 @@ tr:last-child td { border-bottom: 0; }
 .offline-pending td:first-child::after { content: " · čaka"; color: #8a6200; font-size: .72rem; }
 .offline-callsign { font-weight: 800; }
 .offline-privacy { border: 1px dashed #c6d3dc; }
+[data-offline-create] input[readonly] { background: #eef3f6; color: #4e606d; }
+[data-offline-create] :disabled { cursor: not-allowed; opacity: .6; }
 .is-disabled { opacity: .55; pointer-events: none; }
 body[data-offline-page] { padding-bottom: env(safe-area-inset-bottom); }
 body[data-offline-page] main { max-width: 980px; }

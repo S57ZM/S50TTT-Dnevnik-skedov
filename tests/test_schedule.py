@@ -184,6 +184,172 @@ class ScheduleTests(unittest.TestCase):
         self.assertIn('rel="manifest"', html)
         self.assertIn("Offline preizkus", html)
 
+    def test_dashboard_prepares_offline_opening_bootstrap(self):
+        _, admin_id = self.create_open_net("Bootstrap preizkus")
+        client = self.authenticated_client(admin_id)
+
+        response = client.get("/")
+        html = response.get_data(as_text=True)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn('id="offline-bootstrap"', html)
+        self.assertIn('"regular_nets"', html)
+        self.assertIn('"extra_defaults"', html)
+
+    def test_offline_create_extra_net_is_idempotent_and_audited(self):
+        _, admin_id = self.create_open_net("Vodja za offline odprtje")
+        client = self.authenticated_client(admin_id)
+        payload = {
+            "operation_id": "offlinecreatenetextra001",
+            "data": {
+                "title": "Izredni offline sked",
+                "net_date": "2030-03-12",
+                "started_time": "18:45",
+            },
+        }
+
+        first = client.post(
+            "/api/offline/nets",
+            json=payload,
+            headers={"X-CSRF-Token": "test-csrf-token"},
+        )
+        second = client.post(
+            "/api/offline/nets",
+            json=payload,
+            headers={"X-CSRF-Token": "test-csrf-token"},
+        )
+
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(first.get_json()["result"]["status"], "applied")
+        self.assertEqual(second.status_code, 200)
+        self.assertTrue(second.get_json()["result"]["replayed"])
+        net_id = first.get_json()["result"]["net_id"]
+        self.assertEqual(second.get_json()["result"]["net_id"], net_id)
+        with flask_app.app_context():
+            db = get_db()
+            self.assertEqual(
+                db.execute(
+                    "SELECT COUNT(*) AS n FROM nets WHERE title='Izredni offline sked'"
+                ).fetchone()["n"],
+                1,
+            )
+            self.assertEqual(
+                db.execute(
+                    "SELECT COUNT(*) AS n FROM offline_operations WHERE operation_id=? AND action='create_net'",
+                    (payload["operation_id"],),
+                ).fetchone()["n"],
+                1,
+            )
+            self.assertEqual(
+                db.execute(
+                    "SELECT COUNT(*) AS n FROM audit_log WHERE action='offline_create' AND entity_type='net' AND entity_id=?",
+                    (net_id,),
+                ).fetchone()["n"],
+                1,
+            )
+
+    def test_offline_create_regular_net_uses_existing_open_net(self):
+        _, admin_id = self.create_open_net("Vodja rednega skeda")
+        scheduled_date = date(2030, 1, 5)
+        scheduled = scheduled_net_for_date(SCHEDULE_SATURDAY, scheduled_date)
+        with flask_app.app_context():
+            db = get_db()
+            existing = db.execute(
+                """INSERT INTO nets
+                   (title, net_date, scheduled_date, started_at, status, leader_id,
+                    schedule_type, repeater, control_callsign, created_at)
+                   VALUES (?, ?, ?, ?, 'open', ?, ?, ?, ?, ?)""",
+                (
+                    scheduled["title"],
+                    scheduled["date"],
+                    scheduled["date"],
+                    f"{scheduled['date']} {scheduled['time']}:00",
+                    admin_id,
+                    SCHEDULE_SATURDAY,
+                    scheduled["repeater"],
+                    scheduled["control_callsign"],
+                    now_db(),
+                ),
+            )
+            existing_id = existing.lastrowid
+            db.commit()
+        client = self.authenticated_client(admin_id)
+        payload = {
+            "operation_id": "offlinecreateregular001",
+            "data": {
+                "schedule_type": SCHEDULE_SATURDAY,
+                "scheduled_date": scheduled["date"],
+                "net_date": scheduled["date"],
+                "started_time": scheduled["time"],
+            },
+        }
+
+        with patch("app.now_local", return_value=datetime(2030, 1, 5, 20, 0)):
+            response = client.post(
+                "/api/offline/nets",
+                json=payload,
+                headers={"X-CSRF-Token": "test-csrf-token"},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()["result"]["status"], "existing")
+        self.assertEqual(response.get_json()["result"]["net_id"], existing_id)
+        with flask_app.app_context():
+            self.assertEqual(
+                get_db().execute(
+                    """SELECT COUNT(*) AS n FROM nets WHERE schedule_type=?
+                       AND COALESCE(scheduled_date,net_date)=?""",
+                    (SCHEDULE_SATURDAY, scheduled["date"]),
+                ).fetchone()["n"],
+                1,
+            )
+
+    def test_offline_create_regular_net_respects_friday_lock(self):
+        _, admin_id = self.create_open_net("Vodja zaklenjenega skeda")
+        scheduled_date = date(2030, 1, 5)
+        scheduled = scheduled_net_for_date(SCHEDULE_SATURDAY, scheduled_date)
+        client = self.authenticated_client(admin_id)
+
+        with patch("app.now_local", return_value=datetime(2030, 1, 3, 12, 0)):
+            response = client.post(
+                "/api/offline/nets",
+                json={
+                    "operation_id": "offlinecreatetooearly001",
+                    "data": {
+                        "schedule_type": SCHEDULE_SATURDAY,
+                        "scheduled_date": scheduled["date"],
+                        "net_date": scheduled["date"],
+                        "started_time": scheduled["time"],
+                    },
+                },
+                headers={"X-CSRF-Token": "test-csrf-token"},
+            )
+
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.get_json()["error"], "regular_net_too_early")
+        with flask_app.app_context():
+            self.assertEqual(
+                get_db().execute(
+                    """SELECT COUNT(*) AS n FROM nets WHERE schedule_type=?
+                       AND COALESCE(scheduled_date,net_date)=?""",
+                    (SCHEDULE_SATURDAY, scheduled["date"]),
+                ).fetchone()["n"],
+                0,
+            )
+
+    def test_offline_create_net_requires_authenticated_session(self):
+        response = flask_app.test_client().post(
+            "/api/offline/nets",
+            json={
+                "operation_id": "offlinecreateunauth001",
+                "data": {"net_date": "2030-01-05", "started_time": "20:00"},
+            },
+            headers={"X-CSRF-Token": "stale-token"},
+        )
+
+        self.assertEqual(response.status_code, 401)
+        self.assertEqual(response.get_json()["error"], "authentication_required")
+
     def test_offline_sync_add_is_idempotent_and_audited(self):
         net_id, admin_id = self.create_open_net("Idempotentni offline vnos")
         client = self.authenticated_client(admin_id)

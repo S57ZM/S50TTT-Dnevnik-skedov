@@ -1,5 +1,15 @@
 # Zgodovina različic
 
+## 1.25.0-alpha
+
+- offline odprtje shranjenega rednega termina ali izrednega skeda;
+- takojšen offline vpis udeležencev in zapisnika še pred nastankom dnevnika na
+  strežniku;
+- samodejna preslikava lokalnega skeda na strežniški dnevnik ob ponovni povezavi;
+- strežniško preverjanje urnika, petkove omejitve, prestavitev in odpovedi;
+- zaščita pred podvojenim rednim skedom ter idempotentno ponovno pošiljanje;
+- 60 avtomatiziranih testov.
+
 ## 1.24.0-alpha
 
 - namestljiva PWA za Android in iPhone z lastno ikono ter samostojnim prikazom;

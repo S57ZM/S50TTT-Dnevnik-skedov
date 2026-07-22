@@ -37,7 +37,7 @@ from migrations import LATEST_SCHEMA_VERSION, run_migrations, schema_version
 
 
 APP_NAME = "S50TTT Dnevnik skedov"
-BASE_VERSION = "1.24.0"
+BASE_VERSION = "1.25.0"
 RELEASE_CHANNEL = os.environ.get("RELEASE_CHANNEL", "stable").strip().lower()
 if RELEASE_CHANNEL not in {"stable", "alpha"}:
     RELEASE_CHANNEL = "stable"
@@ -959,7 +959,7 @@ def load_user_and_csrf():
         session["csrf_token"] = secrets.token_urlsafe(32)
 
     if request.method == "POST":
-        if request.endpoint == "offline_sync" and g.user is None:
+        if request.endpoint in {"offline_sync", "offline_create_net"} and g.user is None:
             return None
         submitted = request.form.get("csrf_token", "") or request.headers.get(
             "X-CSRF-Token", ""
@@ -1357,11 +1357,51 @@ def dashboard():
            LEFT JOIN participants p ON p.net_id=n.id
            WHERE n.status='closed' GROUP BY n.id ORDER BY n.started_at DESC LIMIT 15"""
     ).fetchall()
+    directory = db.execute(
+        """SELECT callsign, full_name FROM callsign_directory
+           WHERE active=1 ORDER BY callsign"""
+    ).fetchall()
+    offline_bootstrap = {
+        "schema_version": 1,
+        "saved_at": now_local().isoformat(timespec="seconds"),
+        "user": {
+            "id": g.user["id"],
+            "full_name": g.user["full_name"],
+            "callsign": g.user["callsign"],
+        },
+        "regular_nets": [
+            {
+                "schedule_type": scheduled["schedule_type"],
+                "scheduled_date": scheduled["original_date"],
+                "net_date": scheduled["date"],
+                "started_time": scheduled["time"],
+                "label": scheduled["label"],
+                "title": scheduled["title"],
+                "repeater": scheduled["repeater"],
+                "control_callsign": scheduled["control_callsign"],
+                "exception_action": scheduled["exception_action"],
+                "existing_id": scheduled["existing_id"],
+                "existing_status": scheduled["existing_status"],
+                "open_date": scheduled["open_date"],
+                "can_open": scheduled["can_open"],
+            }
+            for scheduled in scheduled_nets
+        ],
+        "directory": [
+            {"callsign": entry["callsign"], "full_name": entry["full_name"]}
+            for entry in directory
+        ],
+        "extra_defaults": {
+            "net_date": now_local().date().isoformat(),
+            "started_time": now_local().strftime("%H:%M"),
+        },
+    }
     return render_template(
         "dashboard_v2.html",
         open_nets=open_nets,
         recent=recent,
         scheduled_nets=scheduled_nets,
+        offline_bootstrap=offline_bootstrap,
     )
 
 
@@ -1761,6 +1801,253 @@ def insert_offline_audit(db, action, entity_type, entity_id, details):
            (user_id, action, entity_type, entity_id, details, created_at)
            VALUES (?, ?, ?, ?, ?, ?)""",
         (g.user["id"], action, entity_type, entity_id, details, now_db()),
+    )
+
+
+def offline_json_error(error, message, status):
+    return jsonify(error=error, message=message, version=APP_VERSION), status
+
+
+def existing_regular_net_for_offline(db, schedule_type, scheduled_date):
+    return db.execute(
+        """SELECT * FROM nets WHERE schedule_type=?
+           AND COALESCE(scheduled_date,net_date)=?""",
+        (schedule_type, scheduled_date),
+    ).fetchone()
+
+
+def offline_existing_net_binding(db, existing):
+    if existing is None:
+        return None
+    if existing["status"] != "open":
+        return offline_json_error(
+            "regular_net_closed",
+            "Dnevnik za ta redni sked že obstaja in je zaključen.",
+            409,
+        )
+    if g.user["role"] != "admin" and existing["leader_id"] != g.user["id"]:
+        return offline_json_error(
+            "regular_net_owned_by_other_user",
+            "Ta redni sked je medtem odprl drug operater.",
+            409,
+        )
+    return existing
+
+
+@app.post("/api/offline/nets")
+def offline_create_net():
+    if g.user is None:
+        return jsonify(error="authentication_required"), 401
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        return offline_json_error("invalid_payload", "Neveljavni podatki.", 400)
+    operation_id = str(payload.get("operation_id", ""))
+    data = payload.get("data")
+    if not OFFLINE_OPERATION_PATTERN.fullmatch(operation_id):
+        return offline_json_error(
+            "invalid_operation", "ID offline odprtja ni veljaven.", 400
+        )
+    if not isinstance(data, dict):
+        return offline_json_error("invalid_payload", "Neveljavni podatki skeda.", 400)
+
+    net_date = str(data.get("net_date", "")).strip()
+    started_time = str(data.get("started_time", "")).strip()
+    try:
+        parsed_start = datetime.strptime(
+            f"{net_date} {started_time}", "%Y-%m-%d %H:%M"
+        )
+    except ValueError:
+        return offline_json_error(
+            "invalid_start", "Datum ali ura skeda nista veljavna.", 400
+        )
+
+    schedule_type = str(data.get("schedule_type", "")).strip() or None
+    scheduled_date = None
+    repeater = None
+    control_callsign = None
+    if schedule_type:
+        if schedule_type not in SCHEDULE_TYPES:
+            return offline_json_error(
+                "invalid_schedule", "Vrsta rednega skeda ni veljavna.", 400
+            )
+        scheduled_date = str(data.get("scheduled_date", "")).strip()
+        try:
+            original_date = date.fromisoformat(scheduled_date)
+        except ValueError:
+            return offline_json_error(
+                "invalid_schedule", "Prvotni datum rednega skeda ni veljaven.", 400
+            )
+        scheduled_info = scheduled_net_for_date(schedule_type, original_date)
+        if scheduled_info is None:
+            return offline_json_error(
+                "invalid_schedule", "Datum ne ustreza izbranemu rednemu skedu.", 400
+            )
+        effective_info = apply_schedule_exception(scheduled_info)
+        if effective_info["exception_action"] == "canceled":
+            return offline_json_error(
+                "regular_net_canceled",
+                "Ta redni sked je bil odpovedan in ga ni mogoče odpreti.",
+                409,
+            )
+        if net_date != effective_info["date"] or started_time != effective_info["time"]:
+            return offline_json_error(
+                "schedule_changed",
+                "Termin rednega skeda se je medtem spremenil. Podatki so ostali v napravi.",
+                409,
+            )
+        if now_local().date() < regular_net_open_date(parsed_start.date()):
+            return offline_json_error(
+                "regular_net_too_early",
+                "Redni sked še ni na voljo za odprtje.",
+                409,
+            )
+        title = scheduled_info["title"]
+        if effective_info["exception_action"] == "postponed":
+            title += f" (prestavljen na {parsed_start.strftime('%d. %m. %Y')})"
+        repeater = scheduled_info["repeater"]
+        control_callsign = scheduled_info["control_callsign"]
+    else:
+        title = str(data.get("title", "")).strip()
+        if not title:
+            title = f"Sked {parsed_start.strftime('%d. %m. %Y')}"
+
+    db = get_db()
+    try:
+        db.execute("BEGIN IMMEDIATE")
+        if schedule_type:
+            locked_schedule = scheduled_net_for_date(schedule_type, original_date)
+            locked_effective = apply_schedule_exception(locked_schedule, db)
+            if locked_effective["exception_action"] == "canceled":
+                db.rollback()
+                return offline_json_error(
+                    "regular_net_canceled",
+                    "Ta redni sked je bil odpovedan in ga ni mogoče odpreti.",
+                    409,
+                )
+            if (
+                net_date != locked_effective["date"]
+                or started_time != locked_effective["time"]
+            ):
+                db.rollback()
+                return offline_json_error(
+                    "schedule_changed",
+                    "Termin rednega skeda se je medtem spremenil. Podatki so ostali v napravi.",
+                    409,
+                )
+        previous = db.execute(
+            """SELECT user_id, net_id, action, result_json FROM offline_operations
+               WHERE operation_id=?""",
+            (operation_id,),
+        ).fetchone()
+        if previous:
+            if previous["user_id"] != g.user["id"] or previous["action"] != "create_net":
+                db.rollback()
+                return offline_json_error(
+                    "operation_reused", "ID offline odprtja je že uporabljen.", 409
+                )
+            result = json.loads(previous["result_json"])
+            result["replayed"] = True
+            net_id = previous["net_id"]
+            db.commit()
+            return jsonify(
+                result=result,
+                snapshot=offline_net_snapshot(net_id, db),
+                version=APP_VERSION,
+            )
+
+        existing = None
+        if schedule_type:
+            existing = existing_regular_net_for_offline(
+                db, schedule_type, scheduled_date
+            )
+            binding = offline_existing_net_binding(db, existing)
+            if isinstance(binding, tuple):
+                db.rollback()
+                return binding
+
+        if existing:
+            net_id = existing["id"]
+            result = offline_operation_result(
+                operation_id,
+                "existing",
+                "Uporabljen je že odprti dnevnik tega rednega skeda.",
+                net_id=net_id,
+            )
+        else:
+            cursor = db.execute(
+                """INSERT INTO nets
+                   (title, net_date, scheduled_date, started_at, status, leader_id,
+                    schedule_type, repeater, control_callsign, created_at)
+                   VALUES (?, ?, ?, ?, 'open', ?, ?, ?, ?, ?)""",
+                (
+                    title[:120],
+                    net_date,
+                    scheduled_date,
+                    f"{net_date} {started_time}:00",
+                    g.user["id"],
+                    schedule_type,
+                    repeater,
+                    control_callsign,
+                    now_db(),
+                ),
+            )
+            net_id = cursor.lastrowid
+            result = offline_operation_result(
+                operation_id,
+                "applied",
+                "Offline sked je ustvarjen na strežniku.",
+                net_id=net_id,
+            )
+            insert_offline_audit(
+                db,
+                "offline_create",
+                "net",
+                net_id,
+                f"{title[:120]} · operacija {operation_id}",
+            )
+        db.execute(
+            """INSERT INTO offline_operations
+               (operation_id, user_id, net_id, action, result_json, created_at)
+               VALUES (?, ?, ?, 'create_net', ?, ?)""",
+            (
+                operation_id,
+                g.user["id"],
+                net_id,
+                json.dumps(result, ensure_ascii=False),
+                now_db(),
+            ),
+        )
+        db.execute(
+            """DELETE FROM offline_operations WHERE id NOT IN
+               (SELECT id FROM offline_operations ORDER BY id DESC LIMIT 5000)"""
+        )
+        db.commit()
+    except sqlite3.IntegrityError:
+        db.rollback()
+        if schedule_type:
+            existing = existing_regular_net_for_offline(
+                db, schedule_type, scheduled_date
+            )
+            binding = offline_existing_net_binding(db, existing)
+            if existing and not isinstance(binding, tuple):
+                return offline_json_error(
+                    "regular_net_race",
+                    "Redni sked je pravkar odprla druga zahteva. Poskusi sinhronizacijo še enkrat.",
+                    409,
+                )
+        return offline_json_error(
+            "database_conflict", "Skeda trenutno ni bilo mogoče ustvariti.", 409
+        )
+    except sqlite3.Error:
+        db.rollback()
+        return offline_json_error(
+            "database_unavailable", "Podatkovna baza trenutno ni na voljo.", 503
+        )
+
+    return jsonify(
+        result=result,
+        snapshot=offline_net_snapshot(net_id, db),
+        version=APP_VERSION,
     )
 
 

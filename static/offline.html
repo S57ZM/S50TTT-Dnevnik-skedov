@@ -32,9 +32,33 @@
 
   <main>
     <div class="card" data-offline-empty hidden>
-      <h1>Ni shranjenega odprtega skeda</h1>
-      <p class="muted">Ko bo povezava na voljo, odpri aktivni sked. Aplikacija ga bo nato pripravila za delo brez povezave.</p>
-      <a class="btn btn-primary" href="/">Odpri portal</a>
+      <h1>Odpri sked brez povezave</h1>
+      <p class="muted" data-offline-open-help>Izberi shranjeni redni termin ali odpri izredni sked. Ob vrnitvi povezave se dnevnik samodejno ustvari na strežniku.</p>
+      <form data-offline-create>
+        <div class="field">
+          <label for="offline-net-kind">Vrsta skeda</label>
+          <select id="offline-net-kind" name="net_kind" required>
+            <option value="extra">Drug ali izredni sked</option>
+          </select>
+        </div>
+        <div class="grid">
+          <div class="field">
+            <label for="offline-net-title">Naslov (neobvezno)</label>
+            <input id="offline-net-title" name="title" maxlength="120" placeholder="Samodejno: Sked DD. MM. LLLL">
+          </div>
+          <div class="field">
+            <label for="offline-net-date">Datum</label>
+            <input id="offline-net-date" type="date" name="net_date" required>
+          </div>
+          <div class="field">
+            <label for="offline-net-time">Začetna ura</label>
+            <input id="offline-net-time" type="time" name="started_time" required>
+          </div>
+        </div>
+        <button class="btn btn-primary" type="submit" data-offline-create-button>＋ Odpri offline dnevnik</button>
+      </form>
+      <p class="muted">Na tej napravi je lahko naenkrat pripravljen en odprt offline sked.</p>
+      <a class="btn btn-secondary" href="/">Odpri portal</a>
     </div>
 
     <div data-offline-content hidden>

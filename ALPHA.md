@@ -9,7 +9,7 @@ veja alpha ──> s50ttt-skedi-alpha  ──> port 8024 ──> data-alpha/sked
 ```
 
 Alpha na vsaki strani prikaže rumeno opozorilo in različico, na primer
-`1.24.0-alpha`. Vpisani testni podatki nikoli ne končajo v produkcijski bazi.
+`1.25.0-alpha`. Vpisani testni podatki nikoli ne končajo v produkcijski bazi.
 
 Trenutne alpha funkcije vključujejo lokalni imenik klicnih znakov,
 administratorsko odpoved ali prestavitev rednega skeda, statistiko, CSV/PDF
@@ -84,7 +84,7 @@ curl -s http://127.0.0.1:8024/health
 Pričakovani odgovor vsebuje kanal `alpha`:
 
 ```json
-{"channel":"alpha","database":"ok","schema_latest":3,"schema_version":3,"status":"ok","version":"1.24.0-alpha"}
+{"channel":"alpha","database":"ok","schema_latest":3,"schema_version":3,"status":"ok","version":"1.25.0-alpha"}
 ```
 
 Alpha varnostne kopije se shranjujejo v `backups-alpha/`. Obnovitev izbrane
@@ -135,19 +135,21 @@ Android:
 
 1. v Chromu odpri alpha domeno prek HTTPS in se prijavi;
 2. izberi `Namesti aplikacijo` oziroma meni `Namesti aplikacijo`;
-3. zaženi nameščeno aplikacijo in odpri aktivni sked.
+3. zaženi nameščeno aplikacijo, se prijavi in obišči domačo stran, da se shranita
+   urnik in imenik.
 
 iPhone oziroma iPad:
 
 1. v Safariju odpri alpha domeno prek HTTPS;
 2. izberi `Deli` in `Dodaj na začetni zaslon`;
-3. zaženi ikono S50TTT, se v aplikaciji prijavi in odpri aktivni sked.
+3. zaženi ikono S50TTT, se prijavi in obišči domačo stran, da se shranita urnik
+   in imenik.
 
 Offline preizkus:
 
-1. ko je aktivni sked odprt, na telefonu vključi letalski način;
-2. ponovno odpri aplikacijo ter dodaj udeleženca, spremeni zapisnik in po potrebi
-   odstrani udeleženca;
+1. po obisku domače strani na telefonu vključi letalski način;
+2. ponovno odpri aplikacijo, odpri shranjeni redni termin ali izredni sked ter
+   dodaj udeleženca in zapisnik;
 3. izključi letalski način in ponovno odpri aplikacijo;
 4. počakaj na obvestilo o končani sinhronizaciji ter preveri podatke in revizijo
    v spletnem portalu.
