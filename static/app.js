@@ -114,11 +114,18 @@
         const value = callsign.value.trim().toUpperCase().replace(/\s+/g, "");
         callsign.value = value;
         const knownName = directory[value];
-        if (knownName && (!fullName.value || fullName.value === lastAutofill)) {
+        const nameWasAutofilled = Boolean(lastAutofill) && fullName.value === lastAutofill;
+        if (knownName && (!fullName.value || nameWasAutofilled)) {
           fullName.value = knownName;
           lastAutofill = knownName;
+        } else if (!knownName && nameWasAutofilled) {
+          fullName.value = "";
+          lastAutofill = "";
         }
       }
+      fullName.addEventListener("input", function () {
+        if (fullName.value !== lastAutofill) lastAutofill = "";
+      });
       callsign.addEventListener("input", suggest);
       callsign.addEventListener("change", suggest);
     });

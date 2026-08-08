@@ -36,7 +36,7 @@ from migrations import LATEST_SCHEMA_VERSION, run_migrations, schema_version
 
 
 APP_NAME = "S50TTT Dnevnik skedov"
-BASE_VERSION = "1.25.0"
+BASE_VERSION = "1.25.1"
 RELEASE_CHANNEL = os.environ.get("RELEASE_CHANNEL", "stable").strip().lower()
 if RELEASE_CHANNEL not in {"stable", "alpha"}:
     RELEASE_CHANNEL = "stable"

@@ -1,5 +1,13 @@
 # Zgodovina različic
 
+## 1.25.1-alpha
+
+- manj lažnih opozoril pri kratkih klicnih znakih;
+- ob spremembi znanega klicnega znaka v nov znak se zastarelo samodejno
+  izpolnjeno ime počisti;
+- ročno popravljeno ime ostane ohranjeno;
+- osvežen PWA-predpomnilnik za takojšen prevzem popravka.
+
 ## 1.25.0-alpha
 
 - offline odprtje shranjenega rednega termina ali izrednega skeda;

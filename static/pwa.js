@@ -723,12 +723,23 @@
     const fullName = document.getElementById("offline-full-name");
     const root = document.getElementById("offline-callsign-options");
     if (!callsign || !fullName || !root) return;
+    let lastAutofill = "";
     callsign.addEventListener("input", function () {
       callsign.value = normaliseCallsign(callsign.value);
       const option = Array.from(root.options).find(function (item) {
         return normaliseCallsign(item.value) === callsign.value;
       });
-      if (option && !fullName.value) fullName.value = option.dataset.fullName || "";
+      const nameWasAutofilled = Boolean(lastAutofill) && fullName.value === lastAutofill;
+      if (option && (!fullName.value || nameWasAutofilled)) {
+        fullName.value = option.dataset.fullName || "";
+        lastAutofill = fullName.value;
+      } else if (!option && nameWasAutofilled) {
+        fullName.value = "";
+        lastAutofill = "";
+      }
+    });
+    fullName.addEventListener("input", function () {
+      if (fullName.value !== lastAutofill) lastAutofill = "";
     });
   }
 

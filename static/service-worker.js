@@ -1,6 +1,6 @@
 "use strict";
 
-const CACHE_NAME = "s50ttt-pwa-1.25.0";
+const CACHE_NAME = "s50ttt-pwa-1.25.1";
 const APP_SHELL = [
   "/static/app.css",
   "/static/app.js",
