@@ -2193,6 +2193,32 @@ class ScheduleTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertIn("podoben je S57ZM", response.get_data(as_text=True))
 
+    def test_short_callsigns_do_not_produce_false_similarity_warning(self):
+        net_id, admin_id = self.create_open_net("Kratki klicni znaki")
+        with flask_app.app_context():
+            db = get_db()
+            db.execute(
+                """INSERT INTO callsign_directory
+                   (callsign, full_name, active, use_count, created_by, created_at)
+                   VALUES ('S51Z', 'Znani Operater', 1, 0, ?, ?)""",
+                (admin_id, now_db()),
+            )
+            db.commit()
+        response = self.authenticated_client(admin_id).post(
+            f"/nets/{net_id}/participants",
+            data={
+                "csrf_token": "test-csrf-token",
+                "callsign": "S59Z",
+                "full_name": "Drug Operater",
+                "checkin_time": "20:10",
+            },
+            follow_redirects=True,
+        )
+        html = response.get_data(as_text=True)
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("Dodan: S59Z", html)
+        self.assertNotIn("podoben je S51Z", html)
+
     def test_health_and_security_headers_report_real_state(self):
         response = flask_app.test_client().get("/health")
         payload = response.get_json()

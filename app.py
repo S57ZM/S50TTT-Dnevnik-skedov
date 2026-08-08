@@ -1,5 +1,4 @@
 import csv
-import difflib
 import hmac
 import ipaddress
 import io
@@ -915,18 +914,25 @@ def refresh_callsign_usage(db, callsign):
 
 
 def similar_callsigns(callsign, limit=3):
-    callsign = callsign.strip().upper()
-    if not callsign:
+    callsign = normalize_callsign(callsign)
+    # Pri kratkih posebnih znakih (npr. S51Z in S59Z) ena sama razlika
+    # pomeni visoko odstotno podobnost, čeprav gre za veljavna različna
+    # klicna znaka. Opozori samo pri daljših znakih, kjer je natanko en
+    # znak verjetneje tipkarska napaka.
+    if len(callsign) < 5:
         return []
-    known = [
-        row["callsign"]
-        for row in get_db().execute(
-            "SELECT callsign FROM callsign_directory WHERE active=1"
-        ).fetchall()
-    ]
-    if callsign in {value.upper() for value in known}:
-        return []
-    return difflib.get_close_matches(callsign, known, n=limit, cutoff=0.72)
+    matches = []
+    for row in get_db().execute(
+        "SELECT callsign FROM callsign_directory WHERE active=1"
+    ).fetchall():
+        known = normalize_callsign(row["callsign"])
+        if len(known) != len(callsign) or known == callsign:
+            continue
+        if sum(left != right for left, right in zip(callsign, known)) == 1:
+            matches.append(known)
+            if len(matches) == limit:
+                break
+    return matches
 
 
 @app.before_request
