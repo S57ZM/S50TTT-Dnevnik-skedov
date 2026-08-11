@@ -1,5 +1,12 @@
 # Zgodovina različic
 
+## 1.25.2-alpha
+
+- predlogi iz imenika se prikažejo že med tipkanjem klicnega znaka;
+- ime se samodejno izpolni samo pri natančnem zadetku v imeniku;
+- ob nadaljevanju vnosa v neznan klicni znak se prejšnje samodejno ime počisti;
+- dodan regresijski preizkus za spletni in offline vnos ter osvežen PWA-predpomnilnik.
+
 ## 1.25.1-alpha
 
 - manj lažnih opozoril pri kratkih klicnih znakih;

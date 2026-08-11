@@ -76,7 +76,7 @@
             <datalist id="callsign-options">
               {% for entry in directory_entries %}<option value="{{ entry['callsign'] }}" data-full-name="{{ entry['full_name'] }}">{{ entry['full_name'] }}</option>{% endfor %}
             </datalist>
-            <small class="muted">Znani klicni znak samodejno izpolni ime.</small>
+            <small class="muted">Začni tipkati za predloge; ime se izpolni le pri natančnem zadetku v imeniku.</small>
           </div>
           <div class="field"><label for="participant-full-name">Ime in priimek</label><input id="participant-full-name" name="full_name" required autocomplete="off"></div>
           <div class="field"><label>Ura prijave</label><input type="time" name="checkin_time" value="{{ now.strftime('%H:%M') }}" required></div>

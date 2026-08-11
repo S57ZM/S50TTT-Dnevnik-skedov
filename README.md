@@ -2,7 +2,7 @@
 
 Ločen spletni portal Radiokluba Sevnica S50TTT za vodenje skedov.
 
-Trenutna alpha različica: **1.25.1-alpha**
+Trenutna alpha različica: **1.25.2-alpha**
 
 ## Funkcije
 
@@ -57,7 +57,7 @@ Trenutna alpha različica: **1.25.1-alpha**
 
 ## Mobilna offline aplikacija (alpha)
 
-Portal je v različici `1.25.1-alpha` mogoče namestiti kot PWA. Android prikaže
+Portal je v različici `1.25.2-alpha` mogoče namestiti kot PWA. Android prikaže
 gumb `Namesti aplikacijo`; na iPhonu se v Safariju uporabi `Deli` in nato
 `Dodaj na začetni zaslon`.
 

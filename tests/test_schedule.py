@@ -170,6 +170,22 @@ class ScheduleTests(unittest.TestCase):
         worker_response.close()
         offline_response.close()
 
+    def test_callsign_autofill_clears_only_a_previous_directory_name(self):
+        client = flask_app.test_client()
+
+        online_script = client.get("/static/app.js").get_data(as_text=True)
+        offline_script = client.get("/static/pwa.js").get_data(as_text=True)
+
+        for script in (online_script, offline_script):
+            self.assertIn("nameWasAutofilled", script)
+            self.assertIn('fullName.value = ""', script)
+            self.assertIn('fullName.addEventListener("input"', script)
+        self.assertIn("!knownName && nameWasAutofilled", online_script)
+        self.assertIn("!option && nameWasAutofilled", offline_script)
+
+        worker = client.get("/service-worker.js").get_data(as_text=True)
+        self.assertIn("s50ttt-pwa-1.25.2", worker)
+
     def test_open_net_page_prepares_offline_snapshot_and_forms(self):
         net_id, admin_id = self.create_open_net("Offline preizkus")
         client = self.authenticated_client(admin_id)
