@@ -1,0 +1,21 @@
+{% extends "base.html" %}
+{% block title %}Predogled CSV-uvoza · {{ app_name }}{% endblock %}
+{% block content %}
+<div class="card">
+  <span class="badge postponed">Predogled – baza še ni spremenjena</span>
+  <h1>Predogled CSV-uvoza</h1>
+  <p><b>{{ batch['filename'] }}</b><br>{{ parsed['net_count'] }} skedov · {{ parsed['participant_count'] }} prijavljenih · {{ parsed['input_row_count'] }} vrstic CSV</p>
+  <div class="flash warning">Ob potrditvi se najprej samodejno izdela preverjena varnostna kopija. Nato se celoten uvoz izvede naenkrat.</div>
+  <div class="actions">
+    <form method="post" action="{{ url_for('confirm_csv_import',import_id=batch['id']) }}" data-confirm="Uvozim vse prikazane skede in prijavljene?"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="btn btn-success">Potrdi celoten uvoz</button></form>
+    <form method="post" action="{{ url_for('cancel_csv_import',import_id=batch['id']) }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="btn btn-secondary">Prekliči</button></form>
+  </div>
+</div>
+{% for net in parsed['nets'] %}
+<div class="card">
+  <div class="actions"><div><span class="badge leader">{{ 'Sobotni' if net['schedule_type']=='saturday' else ('Mesečni' if net['schedule_type']=='monthly' else 'Izredni') }}</span><h2>{{ net['title'] }}</h2><p>{{ net['net_date']|date_si }} · {{ net['started_at']|time_si }}{% if net['ended_at'] %}–{{ net['ended_at']|time_si }}{% endif %}<br>Operater: <b>{{ net['leader_label'] }}</b></p></div><span class="big-number right">{{ net['participants']|length }}</span></div>
+  {% if net['notes'] %}<div class="net-notes muted">{{ net['notes'] }}</div>{% endif %}
+  {% if net['participants'] %}<div class="table-wrap"><table><thead><tr><th>Vrstica</th><th>Prijava</th><th>Klicni znak</th><th>Ime</th></tr></thead><tbody>{% for participant in net['participants'] %}<tr><td>{{ participant['line'] }}</td><td>{{ participant['checkin_at']|time_si }}</td><td><b>{{ participant['callsign'] }}</b></td><td>{{ participant['full_name'] }}</td></tr>{% endfor %}</tbody></table></div>{% else %}<p class="empty">Brez prijavljenih.</p>{% endif %}
+</div>
+{% endfor %}
+{% endblock %}

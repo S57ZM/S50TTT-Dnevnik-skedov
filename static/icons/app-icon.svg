@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="S50TTT Skedi">
+  <rect width="512" height="512" rx="112" fill="#145da0"/>
+  <circle cx="256" cy="235" r="174" fill="#0f4f8a"/>
+  <path d="M166 155h180c22 0 40 18 40 40v150c0 22-18 40-40 40H166c-22 0-40-18-40-40V195c0-22 18-40 40-40Z" fill="#f2a900"/>
+  <path d="M153 219h206v133H153z" fill="#17384f"/>
+  <path d="M176 247h94v78h-94z" fill="#dcecf6"/>
+  <circle cx="319" cy="270" r="25" fill="#e8f3fa"/>
+  <circle cx="319" cy="327" r="12" fill="#e8f3fa"/>
+  <path d="M195 155 261 70" fill="none" stroke="#f2a900" stroke-width="18" stroke-linecap="round"/>
+  <path d="M279 90c40 7 72 28 94 58M290 54c56 10 103 39 135 82" fill="none" stroke="#dcecf6" stroke-width="15" stroke-linecap="round"/>
+  <text x="256" y="456" fill="#fff" font-family="Arial,Helvetica,sans-serif" font-size="52" font-weight="800" text-anchor="middle">S50TTT</text>
+</svg>

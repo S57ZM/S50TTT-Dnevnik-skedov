@@ -1,0 +1,47 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="card form-wide">
+  <h1>Uredi zaključeni sked</h1>
+  <p class="muted">Vsak popravek se zabeleži v revizijsko sled podatkovne baze.</p>
+  <form method="post">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <div class="field"><label>Naslov skeda</label><input name="title" value="{{ net['title'] }}" required></div>
+    <div class="grid">
+      <div class="field"><label>Datum</label><input type="date" name="net_date" value="{{ net['net_date'] }}" required></div>
+      <div class="field"><label>Začetna ura</label><input type="time" name="started_time" value="{{ net['started_at']|time_si }}" required></div>
+      <div class="field"><label>Končna ura</label><input type="time" name="ended_time" value="{{ net['ended_at']|time_si }}" required></div>
+    </div>
+    <div class="field"><label>Operater</label><select name="leader_id" required>{% for user in users %}<option value="{{ user['id'] }}" {% if user['id']==net['leader_id'] %}selected{% endif %}>{{ user['full_name'] }} ({{ user['callsign'] }}){% if not user['active'] %} – neaktiven{% endif %}</option>{% endfor %}</select></div>
+    <div class="field"><label>Zapisnik / opombe skeda</label><textarea name="notes" maxlength="5000" placeholder="Obvestila kluba, tehnične težave, posebnosti skeda …">{{ net['notes'] or '' }}</textarea><small class="muted">Opomba ostane vidna v arhivu in na natisnjenem dnevniku.</small></div>
+    <div class="actions"><button class="btn btn-primary">Shrani popravke</button><a class="btn btn-secondary" href="{{ url_for('net_detail',net_id=net['id']) }}">Prekliči</a></div>
+  </form>
+
+  <div class="edit-section">
+    <h2>Dodaj prijavljenega</h2>
+    <form method="post" action="{{ url_for('add_participant',net_id=net['id']) }}">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="return_to" value="net_edit">
+      <div class="grid">
+        <div class="field"><label>Klicni znak</label><input id="edit-participant-callsign" name="callsign" list="edit-callsign-options" required autocomplete="off" class="callsign-input"><datalist id="edit-callsign-options">{% for entry in directory_entries %}<option value="{{ entry['callsign'] }}" data-full-name="{{ entry['full_name'] }}">{{ entry['full_name'] }}</option>{% endfor %}</datalist></div>
+        <div class="field"><label>Ime in priimek</label><input id="edit-participant-full-name" name="full_name" required autocomplete="off"></div>
+        <div class="field"><label>Ura prijave</label><input type="time" name="checkin_time" value="{{ net['started_at']|time_si }}" required></div>
+      </div>
+      <button class="btn btn-primary">＋ Dodaj prijavljenega</button>
+    </form>
+  </div>
+
+  <div class="edit-section">
+    <h2>Prijavljeni: {{ participants|length }}</h2>
+    {% if participants %}<div class="table-wrap"><table><thead><tr><th>Ura</th><th>Klicni znak</th><th>Ime in priimek</th><th></th></tr></thead><tbody>{% for p in participants %}<tr><td>{{ p['checkin_at']|time_si }}</td><td><b>{{ p['callsign'] }}</b></td><td>{{ p['full_name'] }}</td><td><div class="actions"><a class="btn btn-secondary btn-small" href="{{ url_for('edit_participant',participant_id=p['id'],return_to='net_edit') }}">Uredi</a><form method="post" action="{{ url_for('delete_participant',participant_id=p['id']) }}" data-confirm="Izbrišem {{ p['callsign'] }} iz zaključenega skeda?"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="return_to" value="net_edit"><button class="btn btn-danger btn-small">Izbriši</button></form></div></td></tr>{% endfor %}</tbody></table></div>{% else %}<p class="empty">V skedu ni prijavljenih.</p>{% endif %}
+  </div>
+
+  <div class="danger-zone">
+    <h2>Izbris skeda</h2>
+    <p class="muted">Izbris je dovoljen samo z navedenim razlogom. Kopija skeda in vseh prijav ostane shranjena v revizijski tabeli.</p>
+    <form method="post" action="{{ url_for('delete_closed_net',net_id=net['id']) }}" data-confirm="Res trajno izbrišem ta zaključeni sked?">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <div class="field"><label>Razlog brisanja</label><textarea name="reason" minlength="10" maxlength="1000" required placeholder="Na primer: podvojen dnevnik, odprt za napačen datum …"></textarea><small class="muted">Najmanj 10 znakov.</small></div>
+      <button class="btn btn-danger">Trajno izbriši sked</button>
+    </form>
+  </div>
+</div>
+{% endblock %}
